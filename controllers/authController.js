@@ -7,6 +7,8 @@ const { sendVerificationEmail } = require("../utils/nodeMailer.js");
 const determineRole = require("../utils/determinUserType.js");
 // const { default: axios } = require("axios");
 const jwt = require('jsonwebtoken');
+const { sendEmailReminder } = require("../utils/sendEmailReminder.js");
+const Notification = require("../models/notifications.js");
 
 const verificationCode = generateVerificationCode();
 
@@ -53,6 +55,11 @@ const authControllers = {
 
       await newUser.save();
 
+      if (role === 'tutor') {
+        newUser.organizationName = req.body.organizationName;
+        await newUser.save()
+      }
+
       // await axios.post(`${process.env.PEOPLES_POWER_API}/api/v5/auth/sync`, {
       //   email,
       //   name: fullname,
@@ -71,11 +78,6 @@ const authControllers = {
     }
   },
 
-<<<<<<< HEAD
-  
-
-=======
->>>>>>> 2c0a93e8adebad1bc06e271262e681d7fb2f29dd
   sync: async (req, res) => {
     try {
       const {
@@ -159,6 +161,7 @@ const authControllers = {
         assignedCourse: user.assignedCourse,
         profilePicture: user.image,
         otherCourse: user.otherCourse,
+        organizationName: user.organizationName
       },
     });
 
@@ -324,13 +327,21 @@ const authControllers = {
       }
 
       // Add the team member to both the tutor's and owner's records
-      const newMember = { privileges, ownerId, tutorId };
+      const newMember = { privileges, ownerId, tutorId, status: "pending" };
 
       owner.teamMembers.push(newMember);
       tutor.teamMembers.push(newMember);
 
       await owner.save();
       await tutor.save();
+
+      await sendEmailReminder(tutor.email, `You have been added to ${tutor?.organizationName || tutor.fullname}'s team. \nGo to your team page to accept or reject`, `Team Invitation`);
+
+      await Notification.create({
+        title: "Team Invitation",
+        userId: tutorId,
+        content: `${owner.fullname} added you as a team member`,
+      })
 
       res.status(201).json({
         success: true,

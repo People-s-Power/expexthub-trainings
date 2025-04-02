@@ -5,7 +5,8 @@ const { addCourse } = require("./courseController.js");
 const dayjs = require("dayjs");
 const Course = require("../models/courses.js");
 const { default: mongoose } = require("mongoose");
-
+const { create } = require("../models/category.js");
+const { sendEmailReminder } = require("../utils/sendEmailReminder.js");
 
 const userControllers = {
 
@@ -674,6 +675,13 @@ const userControllers = {
       // Save the updated tutor and owner
       await tutor.save();
       await owner.save();
+      await sendEmailReminder(tutor.email, `You have been removed from ${tutor?.organizationName || tutor.fullname}'s team`, "Team Member Removal");
+
+      await Notification.create({
+        title: "Team Member Removal",
+        content: `${tutor?.organizationName || tutor.fullname} has removed you from their team.`,
+        userId: tutorId,
+      });
 
       return res.status(200).json({
         success: true,
@@ -683,7 +691,77 @@ const userControllers = {
       console.error('Error deleting team member:', error);
       return res.status(500).json({ message: 'Unexpected error occurred!' });
     }
+  },
+
+  updateTeamMemberStatus: async (req, res) => {
+    try {
+      const { tutorId, ownerId } = req.params;
+
+      const { status } = req.body;
+
+      if (!["accepted", "rejected"].includes(status)) {
+        return res.status(400).json({ message: "Invalid status" });
+      }
+
+      const tutor = await User.findById(tutorId);
+      if (!tutor) {
+        return res.status(400).json({ message: "Tutor not found" });
+      }
+
+      const owner = await User.findById(ownerId);
+      if (!owner) {
+        return res.status(404).json({ message: "Owner not found" });
+      }
+
+      if (status === "rejected") {
+        // Remove from both users' teamMembers arrays
+        tutor.teamMembers = tutor.teamMembers.filter(
+          (member) => member.ownerId.toString() !== ownerId
+        );
+  
+        owner.teamMembers = owner.teamMembers.filter(
+          (member) => member.tutorId.toString() !== tutorId
+        );
+
+        await owner.save();
+        await tutor.save();
+
+        await Notification.create({
+          title: "Team Invitation Rejected",
+          userId: ownerId,
+          content: `${tutor.fullname} has rejected your team invitation`,
+        });
+
+        return res.json({ success: true, message: "Invitation rejected and removed" });
+      }
+
+      // If accepted, just update the status
+      let teamMember = tutor.teamMembers.find(
+        (member) => member.ownerId.toString() === ownerId.toString()
+      );
+
+      if (!teamMember) {
+        return res.status(400).json({ message: "No invitation found" });
+      }
+
+      teamMember.status = status;
+
+      await tutor.save();
+      await owner.save();
+
+      await Notification.create({
+        title: "Team Invitation Accepted",
+        userId: ownerId,
+        content: `${tutor.fullname} has accepted your team invitation`,
+      });
+
+      res.json({ success: true, message: `Invitation ${status} successfully` });
+    } catch (error) {
+      console.error("Error updating invitation status:", error);
+      res.status(500).json({ message: "Unexpected error occurred" });
+    }
   }
+
 };
 
 
