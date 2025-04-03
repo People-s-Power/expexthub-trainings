@@ -695,9 +695,8 @@ const userControllers = {
 
   updateTeamMemberStatus: async (req, res) => {
     try {
-      const { tutorId, ownerId } = req.params;
+      const { tutorId, ownerId, status } = req.params;
 
-      const { status } = req.body;
 
       if (!["accepted", "rejected"].includes(status)) {
         return res.status(400).json({ message: "Invalid status" });

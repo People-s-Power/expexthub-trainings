@@ -7,7 +7,7 @@ const { sendVerificationEmail } = require("../utils/nodeMailer.js");
 const determineRole = require("../utils/determinUserType.js");
 // const { default: axios } = require("axios");
 const jwt = require('jsonwebtoken');
-const { sendEmailReminder } = require("../utils/sendEmailReminder.js");
+const { sendTeamInvitation } = require("../utils/TeamInviteEmail.js");
 const Notification = require("../models/notifications.js");
 
 const verificationCode = generateVerificationCode();
@@ -335,12 +335,12 @@ const authControllers = {
       await owner.save();
       await tutor.save();
 
-      await sendEmailReminder(tutor.email, `You have been added to ${tutor?.organizationName || tutor.fullname}'s team. \nGo to your team page to accept or reject`, `Team Invitation`);
+      await sendTeamInvitation(tutor.email, owner.organizationName || owner.fullname, tutorId, ownerId, tutor.fullname);
 
       await Notification.create({
         title: "Team Invitation",
         userId: tutorId,
-        content: `${owner.fullname} added you as a team member`,
+        content: `${owner.fullname} sent you an invitation to be added as a team member`,
       })
 
       res.status(201).json({
