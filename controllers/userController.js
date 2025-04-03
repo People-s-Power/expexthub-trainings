@@ -743,7 +743,7 @@ const userControllers = {
           content: `${tutor.fullname} has rejected your team invitation`,
         });
 
-        return res.json({ success: true, message: "Invitation rejected and removed", redirect: "https://trainings.experthubllc.com/tutor" });
+        return res.json({ success: true, message: "Invitation rejected and removed" });
       }
 
       // If accepted, just update the status
@@ -766,7 +766,7 @@ const userControllers = {
         content: `${tutor.fullname} has accepted your team invitation`,
       });
 
-      res.json({ success: true, message: `Invitation ${status} successfully`, redirect: "https://trainings.experthubllc.com/tutor" });
+      res.json({ success: true, message: `Invitation ${status} successfully` });
     } catch (error) {
       console.error("Error updating invitation status:", error);
       res.status(500).json({ message: "Unexpected error occurred" });
