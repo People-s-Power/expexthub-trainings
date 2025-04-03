@@ -705,7 +705,6 @@ const userControllers = {
     }
   },
 
-
   updateTeamMemberStatus: async (req, res) => {
     try {
       const { tutorId, ownerId, status } = req.params;
@@ -744,7 +743,7 @@ const userControllers = {
           content: `${tutor.fullname} has rejected your team invitation`,
         });
 
-        return res.json({ success: true, message: "Invitation rejected and removed" });
+        return res.json({ success: true, message: "Invitation rejected and removed", redirect: "https://trainings.experthubllc.com/tutor" });
       }
 
       // If accepted, just update the status
@@ -767,7 +766,7 @@ const userControllers = {
         content: `${tutor.fullname} has accepted your team invitation`,
       });
 
-      res.json({ success: true, message: `Invitation ${status} successfully` });
+      res.json({ success: true, message: `Invitation ${status} successfully`, redirect: "https://trainings.experthubllc.com/tutor" });
     } catch (error) {
       console.error("Error updating invitation status:", error);
       res.status(500).json({ message: "Unexpected error occurred" });

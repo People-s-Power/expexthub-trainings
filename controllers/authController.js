@@ -371,10 +371,10 @@ const authControllers = {
 
       // Check if the tutor is a team member of the owner
       const tutorMember = tutor.teamMembers.find(
-        (member) => member.ownerId.toString() === ownerId.toString()
+        (member) => member?.ownerId?.toString() === ownerId.toString()
       );
       const ownerMember = owner.teamMembers.find(
-        (member) => member.tutorId.toString() === tutorId.toString()
+        (member) => member?.tutorId?.toString() === tutorId.toString()
       );
 
       if (!tutorMember || !ownerMember) {
