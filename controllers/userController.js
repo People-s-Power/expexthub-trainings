@@ -636,47 +636,59 @@ const userControllers = {
     try {
       const { tutorId, ownerId } = req.params;
 
-      // Find the tutor by ID and ensure they exist with the correct role
-      const tutor = await User.findById(tutorId).populate('teamMembers');
-      const owner = await User.findById(ownerId).populate('teamMembers');
+      // Fetch the tutor and owner
+      const tutor = await User.findById(tutorId).populate("teamMembers");
+      const owner = await User.findById(ownerId).populate("teamMembers");
 
-      if (!tutor || tutor.role !== 'tutor') {
-        return res.status(404).json({ message: 'Tutor not found or invalid role' });
+      if (!tutor || tutor.role !== "tutor") {
+        return res.status(404).json({ message: "Tutor not found or invalid role" });
       }
 
       if (!owner) {
-        return res.status(404).json({ message: 'Owner not found' });
+        return res.status(404).json({ message: "Owner not found" });
+      }
+
+      // Ensure teamMembers exists before checking its content
+      if (!Array.isArray(tutor.teamMembers) || !Array.isArray(owner.teamMembers)) {
+        return res.status(404).json({ message: "Team member data is missing or invalid" });
       }
 
       // Check if the team member exists in both tutor and owner
-      const teamMemberInTutor = tutor.teamMembers.some(
-        (member) => member.ownerId.toString() === ownerId
+      const teamMemberInTutor = tutor.teamMembers.some((member) =>
+        member?.ownerId?.toString() === ownerId.toString()
       );
 
-      const teamMemberInOwner = owner.teamMembers.some(
-        (member) => member.tutorId.toString() === tutorId
+      const teamMemberInOwner = owner.teamMembers.some((member) =>
+        member?.tutorId?.toString() === tutorId.toString()
       );
 
       if (!teamMemberInTutor || !teamMemberInOwner) {
         return res.status(404).json({
-          message: 'Team member not found in either tutor or owner teamMembers list',
+          message: "Team member not found in either tutor or owner teamMembers list",
         });
       }
 
       // Remove the team member from both tutor and owner
       tutor.teamMembers = tutor.teamMembers.filter(
-        (member) => member.ownerId.toString() !== ownerId
+        (member) => member?.ownerId?.toString() !== ownerId.toString()
       );
 
       owner.teamMembers = owner.teamMembers.filter(
-        (member) => member.tutorId.toString() !== tutorId
+        (member) => member?.tutorId?.toString() !== tutorId.toString()
       );
 
       // Save the updated tutor and owner
       await tutor.save();
       await owner.save();
-      await sendEmailReminder(tutor.email, `You have been removed from ${tutor?.organizationName || tutor.fullname}'s team`, "Team Member Removal");
 
+      // Send email notification
+      await sendEmailReminder(
+        tutor.email,
+        `You have been removed from ${tutor?.organizationName || tutor.fullname}'s team`,
+        "Team Member Removal"
+      );
+
+      // Create a notification
       await Notification.create({
         title: "Team Member Removal",
         content: `${tutor?.organizationName || tutor.fullname} has removed you from their team.`,
@@ -685,13 +697,14 @@ const userControllers = {
 
       return res.status(200).json({
         success: true,
-        message: 'Team member successfully deleted from both tutor and owner',
+        message: "Team member successfully deleted from both tutor and owner",
       });
     } catch (error) {
-      console.error('Error deleting team member:', error);
-      return res.status(500).json({ message: 'Unexpected error occurred!' });
+      console.error("Error deleting team member:", error);
+      return res.status(500).json({ message: "Unexpected error occurred!" });
     }
   },
+
 
   updateTeamMemberStatus: async (req, res) => {
     try {
@@ -717,7 +730,7 @@ const userControllers = {
         tutor.teamMembers = tutor.teamMembers.filter(
           (member) => member.ownerId.toString() !== ownerId
         );
-  
+
         owner.teamMembers = owner.teamMembers.filter(
           (member) => member.tutorId.toString() !== tutorId
         );
