@@ -727,11 +727,11 @@ const userControllers = {
       if (status === "rejected") {
         // Remove from both users' teamMembers arrays
         tutor.teamMembers = tutor.teamMembers.filter(
-          (member) => member.ownerId.toString() !== ownerId
+          (member) => member?.ownerId?.toString() !== ownerId
         );
 
         owner.teamMembers = owner.teamMembers.filter(
-          (member) => member.tutorId.toString() !== tutorId
+          (member) => member?.tutorId?.toString() !== tutorId
         );
 
         await owner.save();
@@ -748,7 +748,7 @@ const userControllers = {
 
       // If accepted, just update the status
       let teamMember = tutor.teamMembers.find(
-        (member) => member.ownerId.toString() === ownerId.toString()
+        (member) => member?.ownerId?.toString() === ownerId.toString()
       );
 
       if (!teamMember) {
