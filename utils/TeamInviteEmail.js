@@ -28,27 +28,26 @@ const sendTeamInvitation = async (to, senderName, tutorId, ownerId, tutorName) =
         <div style="margin: 20px 0;">
           <a href="${acceptLink}">
           <button
-              style="border: none; background-color: #28a745; color: white; padding: 15px; border-radius: 10px; margin-bottom: 10px; width: 100%;">
+              style="border: none; background-color: #28a745; color: white; padding: 10px; border-radius: 10px; margin-bottom: 10px; width: 100%;">
               ✅ Accept Invitation
             </button>
           </a>
           
           <a href="${rejectLink}">
                       <button
-              style="border: none; background-color: #dc3545; color: white; padding: 15px; border-radius: 10px; margin-bottom: 10px; width: 100%;">
+              style="border: none; background-color: #dc3545; color: white; padding: 10px; border-radius: 10px; margin-bottom: 10px; width: 100%;">
               ❌ Reject Invitation
             </button>
           </a>
 
-          <a href="https://trainings.experthubllc.com/tutor">
-            <button
-              style="border: none; background-color: #FDC332; color: white; padding: 15px; border-radius: 10px; margin-bottom: 10px; width: 100%;">Go
-              to Experthub Institute
-            </button>
-          </a>
+         
         </div>
         <p>Best regards,</p>
         <p><strong>The ExpertHub Team</strong></p>
+         <a href="https://trainings.experthubllc.com/tutor">
+           Go
+              to Experthub Institute
+          </a>
       </div>
     </div>
   `;
