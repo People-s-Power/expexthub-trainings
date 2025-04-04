@@ -13,7 +13,7 @@ const transporter = nodemailer.createTransport({
 const sendTeamInvitation = async (to, senderName, tutorId, ownerId, tutorName) => {
 
   const acceptLink = `https://trainings.experthubllc.com/tutor/team/user?tutorId=${tutorId}&ownerId=${ownerId}&status=accepted`;
-  const rejectLink = `https://trainings.experthubllc.com/tutor/team/user?tutorId=${tutorId}&ownerId${ownerId}&status=rejected`;
+  const rejectLink = `https://trainings.experthubllc.com/tutor/team/user?tutorId=${tutorId}&ownerId=${ownerId}&status=rejected`;
 
   const htmlMessage = `
     <div style="font-family: Arial, sans-serif; padding: 20px; background-color: #f4f4f4;">
