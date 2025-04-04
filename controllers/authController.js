@@ -345,7 +345,7 @@ const authControllers = {
 
       res.status(201).json({
         success: true,
-        message: "Team member added successfully",
+        message: "Invitation for team member sent successfully!",
       });
     } catch (error) {
       console.error("Error adding team member:", error);

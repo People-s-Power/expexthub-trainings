@@ -26,8 +26,26 @@ const sendTeamInvitation = async (to, senderName, tutorId, ownerId, tutorName) =
         <p><strong>${senderName}</strong> has invited you to join the team.</p>
         <p>Please click below to accept or decline the invitation:</p>
         <div style="margin: 20px 0;">
-          <a href="${acceptLink}" style="background: #28a745; color: #ffffff; width: 100%; padding: 12px 20px; text-decoration: none; border-radius: 5px; font-size: 16px; margin-right: 10px;">✅ Accept Invitation</a> <br /> <br/br>
-          <a href="${rejectLink}" style="background: #dc3545; color: #ffffff; width: 100%; padding: 12px 20px; text-decoration: none; border-radius: 5px; font-size: 16px;">❌ Reject Invitation</a>
+          <a href="${acceptLink}">
+          <button
+              style="border: none; background-color: #28a745; color: white; padding: 15px; border-radius: 10px; margin-bottom: 10px; width: 100%;">
+              ✅ Accept Invitation
+            </button>
+          </a>
+          
+          <a href="${rejectLink}">
+                      <button
+              style="border: none; background-color: #dc3545; color: white; padding: 15px; border-radius: 10px; margin-bottom: 10px; width: 100%;">
+              ❌ Reject Invitation
+            </button>
+          </a>
+
+          <a href="https://trainings.experthubllc.com/tutor">
+            <button
+              style="border: none; background-color: #FDC332; color: white; padding: 15px; border-radius: 10px; margin-bottom: 10px; width: 100%;">Go
+              to Experthub Institute
+            </button>
+          </a>
         </div>
         <p>Best regards,</p>
         <p><strong>The ExpertHub Team</strong></p>
