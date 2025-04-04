@@ -1,5 +1,4 @@
 const nodemailer = require('nodemailer');
-const invitations = {}; // Temporary store for invitation tokens
 
 const transporter = nodemailer.createTransport({
   host: 'mail.privateemail.com',
@@ -12,11 +11,9 @@ const transporter = nodemailer.createTransport({
 
 
 const sendTeamInvitation = async (to, senderName, tutorId, ownerId, tutorName) => {
-  const token = Math.random().toString(36).substr(2, 10);
-  invitations[token] = { tutorId, ownerId };
 
-  const acceptLink = `https://seashell-app-nejbh.ondigitalocean.app/user/team/${tutorId}/${ownerId}/accepted`;
-  const rejectLink = `https://seashell-app-nejbh.ondigitalocean.app/user/team/${tutorId}/${ownerId}/rejected`;
+  const acceptLink = `https://trainings.experthubllc.com/tutor/team/user?tutorId=${tutorId}&ownerId=${ownerId}&status=accepted`;
+  const rejectLink = `https://trainings.experthubllc.com/tutor/team/user?tutorId=${tutorId}&ownerId${ownerId}&status=rejected`;
 
   const htmlMessage = `
     <div style="font-family: Arial, sans-serif; padding: 20px; background-color: #f4f4f4;">
@@ -38,11 +35,6 @@ const sendTeamInvitation = async (to, senderName, tutorId, ownerId, tutorName) =
               ❌ Reject Invitation
             </button>
           </a>
-          <div style="text-align: center;">
-             <a href="https://trainings.experthubllc.com/tutor">
-              Go to Experthub Institute
-            </a>
-          </div>
          
         </div>
         <p>Best regards,</p>
