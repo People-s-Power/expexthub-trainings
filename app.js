@@ -68,6 +68,16 @@ app.use(fileUpload({
 // Connect to database
 connect();
 
+
+app.get("/", async (req, res) => {
+  const user = await User.findOne({ email: "admin123@gmail.com" })
+  user.isGoogleLinked = false
+  user.googleId = null,
+    user.googleRefreshToken = null,
+    user.googleAccessToken = null,
+    await user.save()
+  res.status(200).json({ message: "DOne" })
+})
 // Routes
 app.use('/auth', authRoute);
 app.use('/user', userRouter);

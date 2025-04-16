@@ -20,6 +20,12 @@ const courseSchema = new mongoose.Schema({
     meetingId: String,
     meetingPassword: String,
     zakToken: String,
+    meetingLink: String,
+    meetingMode: {
+        type: String,
+        enum: ["zoom", "google"],
+    },
+    calendarEventId: String,
     privacy: {
         student: String,
     },

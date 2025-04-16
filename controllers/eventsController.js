@@ -8,10 +8,12 @@ const Notification = require("../models/notifications.js");
 const cloudinaryVidUpload = require("../config/cloudinary.js");
 const { sendEmailReminder } = require("../utils/sendEmailReminder.js");
 const dayjs = require("dayjs");
+const { createGoogleMeet } = require("../utils/createGoogleMeeting.js");
 
 const eventsController = {
   createEvent: async (req, res) => {
-    const { title, about, duration, type, startDate, endDate, startTime, endTime, category, mode, fee, strikedFee, days, videoUrl, timeframe, scholarship, meetingPassword, target } = req.body;
+    const { title, about, duration, type, startDate, endDate, startTime, endTime, category, mode, fee, strikedFee, days, videoUrl, timeframe, scholarship, meetingPassword, target, meetingType } = req.body;
+    console.log("hmmer");
 
     const userId = req.params.userId;
     // Query the user database to get the user's role
@@ -67,13 +69,13 @@ const eventsController = {
           type: req.body.asset.type,
           url: cloudFile
         },
-        timeframe
+        timeframe,
+        meetingMode: meetingType
       };
       if (type === 'online') {
-        if (parseInt(duration) > parseInt(process.env.NEXT_PUBLIC_MEETING_DURATION)) {
-          return res.status(400).json({ message: `Live courses have a limit of ${process.env.NEXT_PUBLIC_MEETING_DURATION} minutes` });
+        if ((meetingType === "zoom") && (parseInt(duration) > parseInt(process.env.NEXT_PUBLIC_MEETING_DURATION))) {
+          return res.status(400).json({ message: `Live events have a limit of ${process.env.NEXT_PUBLIC_MEETING_DURATION} minutes` });
         }
-
       }
       const event = await LearningEvent.create(newEvent);
 
@@ -85,13 +87,32 @@ const eventsController = {
 
       if (newEvent.type === "online") {
         //....Args -- course topic, course duration, scheduled date of the course, zoom password for course,
-        const meetingData = await createZoomMeeting(event.title, parseInt(event.duration), startDate, endDate, null, meetingPassword)
-        if (meetingData.success) {
-          event.meetingId = meetingData.meetingId
-          event.meetingPassword = meetingData.meetingPassword
-          event.zakToken = meetingData.zakToken
-          await event.save()
+        if (meetingType === "google") {
+          const meetingData = await createGoogleMeet(user, {
+            title: event.title,
+            about: event.about,
+            startDate,
+            endDate,
+            days,
+          });
+          if (meetingData.success) {
+            event.meetingLink = meetingData.meetLink;
+            event.calendarEventId = meetingData.calendarEventId;
+            await event.save()
+
+          } else {
+            return res.status(500).json({ message: meetingData.message });
+          }
+        } else {
+          const meetingData = await createZoomMeeting(event.title, parseInt(event.duration), startDate, endDate, null, meetingPassword)
+          if (meetingData.success) {
+            event.meetingId = meetingData.meetingId
+            event.meetingPassword = meetingData.meetingPassword
+            event.zakToken = meetingData.zakToken
+            await event.save()
+          }
         }
+
       }
       const adminUsers = await User.find({ role: { $in: ["admin", "super-admin"] } });
       adminUsers.forEach(async (adminUser) => {

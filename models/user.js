@@ -103,6 +103,12 @@ const userSchema = new mongoose.Schema({
   location: String,
   room: String,
   signature: String,
+  googleId: String,
+  gMail: String,
+
+  googleAccessToken: String,
+  googleRefreshToken: String,
+  isGoogleLinked: { type: Boolean, default: false },
 });
 
 const User = new mongoose.model("User", userSchema);

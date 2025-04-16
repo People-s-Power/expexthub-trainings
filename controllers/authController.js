@@ -1,6 +1,7 @@
 const passport = require("passport");
 const bcrypt = require("bcryptjs");
 const User = require("../models/user.js");
+const GoogleStrategy = require("passport-google-oauth20").Strategy
 const {
   generateVerificationCode,
 } = require("../utils/verficationCodeGenerator.js");
@@ -8,8 +9,111 @@ const { sendVerificationEmail } = require("../utils/nodeMailer.js");
 const determineRole = require("../utils/determinUserType.js");
 const { default: axios } = require("axios");
 const jwt = require('jsonwebtoken');
+const { logger } = require("handlebars");
 
 const verificationCode = generateVerificationCode();
+
+
+
+// Configure Google OAuth Strategy
+passport.use(
+  new GoogleStrategy(
+    {
+      clientID: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      callbackURL: "https://trainings.experthubllc.com/auth/google/callback", // Match exactly what's in Google Console
+      passReqToCallback: true,
+      scope: [
+        "profile",
+        "email",
+        "https://www.googleapis.com/auth/calendar",
+        "https://www.googleapis.com/auth/calendar.events",
+      ],
+    },
+    async (req, accessToken, refreshToken, profile, done) => {
+      try {
+
+        const decodedState = JSON.parse(Buffer.from(req.query.state, "base64").toString("utf8"));
+        const { role = "student", link, } = decodedState;
+
+        const email = profile.emails?.[0]?.value?.toLowerCase();
+        if (!email) return done(new Error("No email from Google"), null);
+
+        let user = await User.findOne({ googleId: profile.id });
+        console.log(link);
+
+        // 🟡 If linking, find by session user (local user linking Google)
+        if (link) {
+          user = await User.findById(link);
+          if (user) {
+            user.googleId = profile.id;
+            user.gMail = profile.emails?.[0]?.value;
+            user.googleAccessToken = accessToken;
+            user.googleRefreshToken = refreshToken || user.googleRefreshToken;
+            user.isGoogleLinked = true;
+            await user.save();
+            return done(null, user);
+          }
+        }
+
+        // 🟠 If GoogleId not found, try email
+        if (!user) {
+          user = await User.findOne({ email });
+        }
+
+        if (user) {
+          // If user already exists, update tokens and info
+          user.googleId = profile.id;
+          user.googleAccessToken = accessToken;
+          user.gMail = profile.emails?.[0]?.value;
+          user.googleRefreshToken = refreshToken || user.googleRefreshToken;
+          user.isGoogleLinked = true;
+          if (!user.signInType) user.signInType = "google";
+          if (!user.fullname && profile.displayName) user.fullname = profile.displayName;
+          await user.save();
+        } else {
+          // 🔵 New user registration
+          user = new User({
+            username: email,
+            email,
+            fullname: profile.displayName,
+            googleId: profile.id,
+            gMail: profile.emails?.[0]?.value,
+            googleAccessToken: accessToken,
+            googleRefreshToken: refreshToken,
+            signInType: "google",
+            isVerified: true,
+            role,
+            isGoogleLinked: true,
+          });
+          await user.save();
+        }
+
+        return done(null, user);
+      } catch (err) {
+        console.log(err);
+
+        return done(err, null);
+      }
+    },
+
+  ),
+)
+
+// Serialize user - store only the user ID in the session
+passport.serializeUser((user, done) => {
+  done(null, user.id)
+})
+
+// Deserialize user - retrieve full user object from the database
+passport.deserializeUser(async (id, done) => {
+  try {
+    const user = await User.findById(id)
+    done(null, user)
+  } catch (error) {
+    done(error, null)
+  }
+})
 
 const authControllers = {
   register: async (req, res) => {
@@ -102,6 +206,77 @@ const authControllers = {
       return res.status(500).json({ message: "Unexpected error during sync" });
     }
   },
+  loginWithGoogle: (req, res, next) => {
+    const redirectUrl = req.query.redirectUrl || "/";
+    const role = req.query.role || "student";
+    const link = req.query.link || false;
+
+    const stateObj = {
+      redirectUrl,
+      role,
+      link,
+    };
+
+    const stateString = Buffer.from(JSON.stringify(stateObj)).toString("base64");
+
+    passport.authenticate("google", {
+      accessType: "offline",
+      prompt: "consent",
+      state: stateString,
+      scope: [
+        "profile",
+        "email",
+        "https://www.googleapis.com/auth/calendar",
+        "https://www.googleapis.com/auth/calendar.readonly",
+        "https://www.googleapis.com/auth/calendar.events",
+      ]
+    })(req, res, next);
+  },
+
+  // Google OAuth callback
+  googleCallback: (req, res, next) => {
+    passport.authenticate("google", { session: false }, async (err, user, info) => {
+      if (err || !user) {
+        console.error("Google auth error:", err || "No user");
+        return res.redirect(`${process.env.TRAINING_URL}/auth/login?error=Google auth failed, Try again`);
+      }
+
+      try {
+        // Decode the state from the request
+        const decodedState = JSON.parse(Buffer.from(req.query.state, "base64").toString("utf-8"));
+        const { redirectUrl, link } = decodedState;
+
+        const payload = {
+          user: {
+            fullName: user.fullname,
+            id: user._id,
+            email: user.email,
+            role: user.role,
+            emailVerification: user.isVerified,
+            assignedCourse: user.assignedCourse,
+            profilePicture: user.profilePicture,
+            otherCourse: user.otherCourse,
+            isGoogleLinked: user.isGoogleLinked || false,
+          },
+          accessToken: user.googleAccessToken,
+          success: true,
+        };
+
+        const encodedUserData = jwt.sign(payload, process.env.JWT_SECRET, {
+          expiresIn: "2m", // short-lived token
+        });
+
+        if (link) {
+          return res.redirect(`https://trainings.experthubllc.com/${redirectUrl}?data=${encodeURIComponent(encodedUserData)}`);
+        }
+
+        return res.redirect(`https://trainings.experthubllc.com/auth/login?data=${encodeURIComponent(encodedUserData)}`);
+      } catch (error) {
+        console.error("Error in Google callback:", error);
+        return res.redirect(`${process.env.TRAINING_URL}/auth/login?error=Server Error`);
+      }
+    })(req, res, next);
+  },
 
   login: async (req, res) => {
     const { email, password } = req.body;
@@ -131,6 +306,7 @@ const authControllers = {
     // generate jwt
     const payload = {
       fullName: user.fullname,
+
       id: user._id, // Use tutorId for team_member
       email: user.email,
       role: user.role,
@@ -154,6 +330,7 @@ const authControllers = {
         assignedCourse: user.assignedCourse,
         profilePicture: user.image,
         otherCourse: user.otherCourse,
+        isGoogleLinked: user.isGoogleLinked,
       },
     });
 

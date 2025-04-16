@@ -13,6 +13,8 @@ router.post('/register/sync', authControllers.sync);
 
 router.post('/login', authControllers.login);
 router.post('/login-with-token', authControllers.loginWithToken);
+router.get("/google", authControllers.loginWithGoogle)
+router.get("/google/callback", authControllers.googleCallback)
 
 router.post('/verify/:userId', authControllers.verify);
 

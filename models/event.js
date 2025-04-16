@@ -17,6 +17,12 @@ const eventSchema = new mongoose.Schema({
   meetingId: String,
   meetingPassword: String,
   zakToken: String,
+  meetingLink: String,
+  meetingMode: {
+    type: String,
+    enum: ["zoom", "google"],
+  },
+  calendarEventId: String,
   about: String,
   author: String,
   authorId: String,

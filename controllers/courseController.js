@@ -13,6 +13,7 @@ const dayjs = require("dayjs");
 const isBetween = require("dayjs/plugin/isBetween.js");
 const isSameOrAfter = require("dayjs/plugin/isSameOrAfter.js");
 const LearningEvent = require("../models/event.js");
+const { createGoogleMeet } = require("../utils/createGoogleMeeting.js");
 
 dayjs.extend(isBetween)
 dayjs.extend(isSameOrAfter)
@@ -135,7 +136,6 @@ const courseController = {
 
     getAllCourses: async (req, res) => {
         try {
-            console.log(("hmm na ehere"));
 
             const courses = await Course.find({
                 approved: true,
@@ -145,7 +145,6 @@ const courseController = {
                 select: "profilePicture fullname _id"
             }).lean();
 
-            console.log(courses);
 
             return res.status(200).json({ courses: courses });
 
@@ -185,16 +184,18 @@ const courseController = {
 
     addCourse: async (req, res) => {
 
-        const { title, about, duration, type, startDate, endDate, startTime, endTime, category, privacy, days, fee, strikedFee, scholarship, meetingPassword, target, modules, benefits, timeframe, audience } = req.body;
+        const { title, about, duration, type, startDate, endDate, startTime, endTime, category, privacy, days, fee, strikedFee, scholarship, meetingPassword, target, modules, benefits, timeframe, audience, meetingType } = req.body;
 
         // Get user ID from the request headers
         const userId = req.params.userId;
+
 
         // Query the user database to get the user's role
         const user = await User.findById(userId);
         let coursesByUser = await Course.find({
             instructorId: userId,
         });
+        console.log("hmmm na me oo i no know");
 
         coursesByUser = [...coursesByUser, ...(await LearningEvent.find({
             authorId: userId,
@@ -250,14 +251,13 @@ const courseController = {
                     type: req.body.asset.type,
                     url: cloudFile
                 },
-                timeframe
+                timeframe,
+                meetingMode: meetingType,
             };
             if (type === 'online') {
-                if (parseInt(duration) > parseInt(process.env.NEXT_PUBLIC_MEETING_DURATION)) {
+                if ((meetingType === "zoom") && (parseInt(duration) > parseInt(process.env.NEXT_PUBLIC_MEETING_DURATION))) {
                     return res.status(400).json({ message: `Live courses have a limit of ${process.env.NEXT_PUBLIC_MEETING_DURATION} minutes` });
                 }
-
-
             }
 
             // Save the new course
@@ -283,13 +283,12 @@ const courseController = {
 
 
             if (newCourse.type === 'video') {
-                const videos = req.body.videos
-                videos.map(async video => {
-                    course.videos = [...course.videos, {
+                for (const video of req.body.videos) {
+                    course.videos.push({
                         title: video.title,
-                        videoUrl: video.videoUrl
-                    }]
-                })
+                        videoUrl: video.videoUrl,
+                    });
+                }
                 await course.save()
             }
 
@@ -303,21 +302,40 @@ const courseController = {
                     "Friday": 5,
                     "Saturday": 6
                 };
-                const getZoomWeeklyDaysFormat = (days) => {
-                    return days
-                        .filter(day => day.checked)
-                        .map(day => dayMap[day.day])
-                        .join(',');
-                };
-                const weeks = getZoomWeeklyDaysFormat(days)
+
+                if (newCourse.meetingType === "zoom") {
+                    const getZoomWeeklyDaysFormat = (days) => {
+                        return days
+                            .filter(day => day.checked)
+                            .map(day => dayMap[day.day])
+                            .join(',');
+                    };
+                    const weeks = getZoomWeeklyDaysFormat(days)
+                    const meetingData = await createZoomMeeting(course.title, parseInt(course.duration), startDate, endDate, weeks, meetingPassword)
+                    if (meetingData.success) {
+                        course.meetingId = meetingData.meetingId
+                        course.meetingPassword = meetingData.meetingPassword
+                        course.zakToken = meetingData.zakToken
+                    }
+
+                } else {
 
 
-                const meetingData = await createZoomMeeting(course.title, parseInt(course.duration), startDate, endDate, weeks, meetingPassword)
-                if (meetingData.success) {
-                    course.meetingId = meetingData.meetingId
-                    course.meetingPassword = meetingData.meetingPassword
-                    course.zakToken = meetingData.zakToken
-                    await course.save()
+                    const meetingData = await createGoogleMeet(user, {
+                        title: course.title,
+                        about: course.about,
+                        startDate,
+                        endDate,
+                        days,
+                        audience,
+                    });
+
+                    if (meetingData.success) {
+                        course.meetingLink = meetingData.meetLink;
+                        course.calendarEventId = meetingData.calendarEventId;
+                    } else {
+                        return res.status(500).json({ message: meetingData.message });
+                    }
                 }
 
                 //just for now
