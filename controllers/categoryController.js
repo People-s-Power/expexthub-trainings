@@ -15,6 +15,7 @@ const categoryController = {
       return res.status(500).json({ message: 'Unexpected error during category creation' });
     }
   },
+  
   getAllCategory: async (req, res) => {
     try {
       const category = await Category.find()

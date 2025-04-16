@@ -2,9 +2,14 @@ const mongoose = require('mongoose');
 
 const userSchema = new mongoose.Schema({
   username: String,
+  organizationName: {
+    type: String,
+    required: false,
+  },
   email: String,
   fullname: String,
   name: String,
+  companyName: String,
   gender: String,
   age: String,
   premiumPlan: {
@@ -34,8 +39,11 @@ const userSchema = new mongoose.Schema({
   profilePicture: String,
   image: String,
 
-  assignedCourse: String,
+  assignedWorkspace: String,
   otherCourse: [{
+    type: String
+  }],
+  otherWorkspace: [{
     type: String
   }],
   accountNumber: String,
@@ -95,6 +103,7 @@ const userSchema = new mongoose.Schema({
   teamMembers: [{
     ownerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     tutorId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    status: String,
     privileges: [{
       checked: Boolean,
       value: String,
