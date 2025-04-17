@@ -21,7 +21,7 @@ passport.use(
     {
       clientID: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-      callbackURL: "http://localhost:3002/auth/google/callback", // Match exactly what's in Google Console
+      callbackURL: `${process.env.SERVER_URL}auth/google/callback`, // Match exactly what's in Google Console
       passReqToCallback: true,
       scope: [
         "profile",
