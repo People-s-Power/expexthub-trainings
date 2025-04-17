@@ -1,3 +1,4 @@
+const passport = require("passport");
 const bcrypt = require("bcryptjs");
 const User = require("../models/user.js");
 const GoogleStrategy = require("passport-google-oauth20").Strategy
@@ -6,11 +7,9 @@ const {
 } = require("../utils/verficationCodeGenerator.js");
 const { sendVerificationEmail } = require("../utils/nodeMailer.js");
 const determineRole = require("../utils/determinUserType.js");
-// const { default: axios } = require("axios");
+const { default: axios } = require("axios");
 const jwt = require('jsonwebtoken');
 const { logger } = require("handlebars");
-const { sendTeamInvitation } = require("../utils/TeamInviteEmail.js");
-const Notification = require("../models/notifications.js");
 
 const verificationCode = generateVerificationCode();
 
@@ -22,7 +21,7 @@ passport.use(
     {
       clientID: process.env.GOOGLE_CLIENT_ID,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-      callbackURL: "https://trainings.experthubllc.com/auth/google/callback", // Match exactly what's in Google Console
+      callbackURL: "http://localhost:3002/auth/google/callback", // Match exactly what's in Google Console
       passReqToCallback: true,
       scope: [
         "profile",
@@ -159,23 +158,17 @@ const authControllers = {
 
       await newUser.save();
 
-      if (role === 'tutor') {
-        newUser.organizationName = req.body.organizationName;
-        await newUser.save()
-      }
-
-      // await axios.post(`${process.env.PEOPLES_POWER_API}/api/v5/auth/sync`, {
-      //   email,
-      //   name: fullname,
-      //   country,
-      //   state,  
-      //   userType,
-      //   password: hashPassword
-      // });
+      await axios.post(`${process.env.PEOPLES_POWER_API}/api/v5/auth/sync`, {
+        email,
+        name: fullname,
+        country,
+        state,
+        userType,
+        password: hashPassword
+      });
 
       await sendVerificationEmail(newUser.email, verificationCode);
       res.status(200).json({ message: "Verification code sent to email", id: newUser._id });
-
     } catch (error) {
       console.error(error);
       return res.status(500).json({ message: "Unexpected error during registration" });
@@ -274,10 +267,10 @@ const authControllers = {
         });
 
         if (link) {
-          return res.redirect(`https://trainings.experthubllc.com/${redirectUrl}?data=${encodeURIComponent(encodedUserData)}`);
+          return res.redirect(`${process.env.TRAINING_URL}/${redirectUrl}?data=${encodeURIComponent(encodedUserData)}`);
         }
 
-        return res.redirect(`https://trainings.experthubllc.com/auth/login?data=${encodeURIComponent(encodedUserData)}`);
+        return res.redirect(`${process.env.TRAINING_URL}/auth/login?data=${encodeURIComponent(encodedUserData)}`);
       } catch (error) {
         console.error("Error in Google callback:", error);
         return res.redirect(`${process.env.TRAINING_URL}/auth/login?error=Server Error`);
@@ -337,11 +330,7 @@ const authControllers = {
         assignedCourse: user.assignedCourse,
         profilePicture: user.image,
         otherCourse: user.otherCourse,
-<<<<<<< HEAD
         isGoogleLinked: user.isGoogleLinked,
-=======
-        organizationName: user.organizationName
->>>>>>> 0255f070c4c7f28dc757549a6d6f743f2f11af8f
       },
     });
 
@@ -507,7 +496,7 @@ const authControllers = {
       }
 
       // Add the team member to both the tutor's and owner's records
-      const newMember = { privileges, ownerId, tutorId, status: "pending" };
+      const newMember = { privileges, ownerId, tutorId };
 
       owner.teamMembers.push(newMember);
       tutor.teamMembers.push(newMember);
@@ -515,17 +504,9 @@ const authControllers = {
       await owner.save();
       await tutor.save();
 
-      await sendTeamInvitation(tutor.email, owner.organizationName || owner.fullname, tutorId, ownerId, tutor.fullname);
-
-      await Notification.create({
-        title: "Team Invitation",
-        userId: tutorId,
-        content: `${owner.fullname} sent you an invitation to be added as a team member`,
-      })
-
       res.status(201).json({
         success: true,
-        message: "Invitation for team member sent successfully!",
+        message: "Team member added successfully",
       });
     } catch (error) {
       console.error("Error adding team member:", error);
@@ -551,10 +532,10 @@ const authControllers = {
 
       // Check if the tutor is a team member of the owner
       const tutorMember = tutor.teamMembers.find(
-        (member) => member?.ownerId?.toString() === ownerId.toString()
+        (member) => member.ownerId.toString() === ownerId.toString()
       );
       const ownerMember = owner.teamMembers.find(
-        (member) => member?.tutorId?.toString() === tutorId.toString()
+        (member) => member.tutorId.toString() === tutorId.toString()
       );
 
       if (!tutorMember || !ownerMember) {
