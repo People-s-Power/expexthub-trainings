@@ -21,6 +21,7 @@ const userControllers = {
         return res.status(404).json({ message: 'User not found' });
       }
 
+
       // Extract relevant profile information
       const userProfile = {
         profilePicture: existingUser.image,
@@ -36,7 +37,11 @@ const userControllers = {
         bankCode: existingUser.bankCode,
         premiumPlanExpires: existingUser.premiumPlanExpires,
         premiumPlan: existingUser.premiumPlan,
-        signature: existingUser.signature
+        signature: existingUser.signature,
+        isGoogleLinked: existingUser.isGoogleLinked,
+        gMail: existingUser.gMail,
+
+
 
       };
 

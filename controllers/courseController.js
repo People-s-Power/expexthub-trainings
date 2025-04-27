@@ -124,9 +124,10 @@ const courseController = {
             if (!course) {
                 return res.status(404).json({ message: 'Course not found' });
             }
-            console.log(course);
+            const instructor = await User.findById(course.instructorId);
 
-            return res.status(200).json({ course });
+
+            return res.status(200).json({ course, instructor });
         } catch (error) {
             console.error(error);
             return res.status(500).json({ message: 'Unexpected error while fetching the course' });

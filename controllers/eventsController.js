@@ -237,8 +237,10 @@ const eventsController = {
       if (!course) {
         return res.status(404).json({ message: 'Event not found' });
       }
+      const instructor = await User.findById(course.authorId);
+      return res.status(200).json({ course, instructor });
 
-      return res.status(200).json({ course });
+
     } catch (error) {
       console.error(error);
       return res.status(500).json({ message: 'Unexpected error while fetching the event' });

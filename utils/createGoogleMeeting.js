@@ -38,11 +38,11 @@ const createGoogleMeet = async (
   const checked = days.filter(d => d.checked);
   const { startTime, endTime } = checked?.[0] || {};
 
-  const start = !checked.length > 0
+  const start = !(checked.length > 0)
     ? new Date(startDate)
     : dayjs(`${dayjs(startDate).format("YYYY-MM-DD")}T${startTime}`);
 
-  const end = !checked.length > 0
+  const end = !(checked.length > 0)
     ? new Date(endDate)
     : dayjs(`${dayjs(endDate).format("YYYY-MM-DD")}T${endTime}`);
 

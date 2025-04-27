@@ -78,6 +78,8 @@ passport.use(
             email,
             fullname: profile.displayName,
             googleId: profile.id,
+            profilePicture: profile.photos?.[0]?.value,
+            image: profile.photos?.[0]?.value,
             gMail: profile.emails?.[0]?.value,
             googleAccessToken: accessToken,
             googleRefreshToken: refreshToken,
