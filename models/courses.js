@@ -78,6 +78,10 @@ const courseSchema = new mongoose.Schema({
     videos: [{
         title: String,
         videoUrl: String,
+        submodules: [{
+            title: String,
+            videoUrl: String,
+        }],
     }],
     approved: {
         type: Boolean,

@@ -187,8 +187,8 @@ const assessmentControllers = {
   survey: async (req, res) => {
     try {
       const {
-        computerAccess,
-        internetAccess,
+        // computerAccess,
+        // internetAccess,
         gender,
         employmentStatus,
         trainingHours,
@@ -213,8 +213,8 @@ const assessmentControllers = {
 
         // Update the survey data in the user document
         foundUser.survey = {
-          computerAccess,
-          internetAccess,
+          // computerAccess,
+          // internetAccess,
           gender,
           employmentStatus,
           trainingHours,

@@ -8,12 +8,16 @@ cloudinary.config({
 
 
 
-const upload = async (file) => {
+const upload = async (file, type) => {
   const image = await cloudinary.uploader.upload(
     file,
+    {
+      resource_type: type,
+
+    },
     (result) => result
   );
-  return image;
+  return image.secure_url;
 };
 
 const getSignature = async () => {

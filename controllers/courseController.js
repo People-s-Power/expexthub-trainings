@@ -146,6 +146,7 @@ const courseController = {
                 select: "profilePicture fullname _id"
             }).lean();
 
+            console.log(courses.filter(course => course.type === "video"), "yes oo");
 
             return res.status(200).json({ courses: courses });
 
@@ -214,11 +215,11 @@ const courseController = {
         try {
             let cloudFile
             if (req.body.asset.type === 'image') {
-                const file = await upload(req.body.asset.url);
+                const file = await upload(req.body.asset.url, req.body.asset.type);
                 cloudFile = file.url
             } else {
                 try {
-                    const video = await upload.cloudinaryVidUpload(req.body.asset.url)
+                    const video = await upload(req.body.asset.url, req.body.asset.type)
                     cloudFile = video
                 } catch (e) {
                     console.log(e)
@@ -267,7 +268,7 @@ const courseController = {
                 // const { pdf } = req.files;
                 const cloudFile = await upload(req.body.pdf);
                 // const cloudFile = await upload(pdf.tempFilePath);
-                course.file = cloudFile.secure_url
+                course.file = cloudFile
                 await course.save()
             }
 
@@ -288,10 +289,17 @@ const courseController = {
                     course.videos.push({
                         title: video.title,
                         videoUrl: video.videoUrl,
+                        submodules: video.submodules.map(submodule => {
+                            return {
+                                title: submodule.title,
+                                videoUrl: submodule.videoUrl
+                            }
+                        })
                     });
                 }
-                await course.save()
             }
+
+
 
             if (newCourse.type === "online") {
                 const dayMap = {
@@ -339,12 +347,15 @@ const courseController = {
                     }
                 }
 
-                //just for now
-                course.approved = true;
-                await course.save()
+
 
 
             }
+            //just for now
+            course.approved = true;
+            await course.save()
+
+
             const adminUsers = await User.find({ role: { $in: ["admin", "super-admin"] } });
             adminUsers.forEach(async (adminUser) => {
                 try {
@@ -664,10 +675,26 @@ const courseController = {
 
     editCourse: async (req, res) => {
         try {
+
+            let videos = req.body.videos.map(video => {
+                return {
+                    title: video.title,
+                    videoUrl: video.videoUrl,
+                    submodules: video.submodules.map(submodule => {
+                        return {
+                            title: submodule.title,
+                            videoUrl: submodule.videoUrl
+                        }
+                    })
+                }
+            })
+            console.log(videos, req.body.videos, "yes oo");
+
             const course = await Course.updateOne({
                 _id: req.params.id
             }, {
-                ...req.body
+                ...req.body,
+                videos
             }, {
                 new: true
             })

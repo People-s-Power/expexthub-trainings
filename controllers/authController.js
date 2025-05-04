@@ -149,8 +149,8 @@ const authControllers = {
         email: email.toLowerCase(),
         fullname,
         phone,
-        country,
-        state,
+        // country,
+        // state,
         address,
         role,
         verificationCode,
@@ -160,14 +160,14 @@ const authControllers = {
 
       await newUser.save();
 
-      await axios.post(`${process.env.PEOPLES_POWER_API}/api/v5/auth/sync`, {
-        email,
-        name: fullname,
-        country,
-        state,
-        userType,
-        password: hashPassword
-      });
+      // await axios.post(`${process.env.PEOPLES_POWER_API}/api/v5/auth/sync`, {
+      //   email,
+      //   name: fullname,
+      //   country,
+      //   state,
+      //   userType,
+      //   password: hashPassword
+      // });
 
       await sendVerificationEmail(newUser.email, verificationCode);
       res.status(200).json({ message: "Verification code sent to email", id: newUser._id });
@@ -268,11 +268,8 @@ const authControllers = {
           expiresIn: "2m", // short-lived token
         });
 
-        if (link) {
-          return res.redirect(`${process.env.TRAINING_URL}/${redirectUrl}?data=${encodeURIComponent(encodedUserData)}`);
-        }
+        return res.redirect(`${process.env.TRAINING_URL}/${redirectUrl}?data=${encodeURIComponent(encodedUserData)}`);
 
-        return res.redirect(`${process.env.TRAINING_URL}/auth/login?data=${encodeURIComponent(encodedUserData)}`);
       } catch (error) {
         console.error("Error in Google callback:", error);
         return res.redirect(`${process.env.TRAINING_URL}/auth/login?error=Server Error`);

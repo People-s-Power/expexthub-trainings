@@ -51,8 +51,8 @@ const userSchema = new mongoose.Schema({
     type: [String], // Array to store user's assessment answers
   },
   survey: {
-    computerAccess: Boolean,
-    internetAccess: Boolean,
+    // computerAccess: Boolean,
+    // internetAccess: Boolean,
     gender: String,
     employmentStatus: String,
     trainingHours: String,
