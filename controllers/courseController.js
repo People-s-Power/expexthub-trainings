@@ -216,7 +216,7 @@ const courseController = {
             let cloudFile
             if (req.body.asset.type === 'image') {
                 const file = await upload(req.body.asset.url, req.body.asset.type);
-                cloudFile = file.url
+                cloudFile = file
             } else {
                 try {
                     const video = await upload(req.body.asset.url, req.body.asset.type)
@@ -289,10 +289,12 @@ const courseController = {
                     course.videos.push({
                         title: video.title,
                         videoUrl: video.videoUrl,
+                        duration: video.duration,
                         submodules: video.submodules.map(submodule => {
                             return {
                                 title: submodule.title,
-                                videoUrl: submodule.videoUrl
+                                videoUrl: submodule.videoUrl,
+                                duration: submodule.duration
                             }
                         })
                     });
@@ -680,10 +682,13 @@ const courseController = {
                 return {
                     title: video.title,
                     videoUrl: video.videoUrl,
+                    duration: video.duration,
                     submodules: video.submodules.map(submodule => {
                         return {
                             title: submodule.title,
-                            videoUrl: submodule.videoUrl
+                            videoUrl: submodule.videoUrl,
+                            duration: submodule.duration,
+
                         }
                     })
                 }

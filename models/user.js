@@ -6,6 +6,9 @@ const userSchema = new mongoose.Schema({
     type: String,
     required: false,
   },
+  orgUrl: {
+    type: String,
+  },
   email: String,
   fullname: String,
   name: String,
@@ -16,8 +19,19 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: "basic"
   },
+  flutterwaveSubscriptionId: {
+    type: String,
+    required: false
+  },
+  isYearly: {
+    type: String,
+    required: false
+
+  },
   premiumPlanExpires: {
-    type: Date
+    type: Date,
+    required: false
+
   },
   phone: {
     type: String,

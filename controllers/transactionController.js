@@ -75,6 +75,70 @@ const transactionController = {
     }
   },
 
+  cancelPremiumPlan: async (req, res) => {
+    const userId = req.params.userId
+
+    try {
+
+      const user = await User.findById(userId)
+      console.log(user.flutterwaveSubscriptionId);
+
+      if (!user) {
+        return res.status(404).json({ message: "User not found" })
+      }
+
+      if (!user.premiumPlan || user.premiumPlan === "basic") {
+        return res.status(400).json({ message: "No active premium plan to cancel" })
+      }
+
+
+      user.premiumPlan = "basic"
+
+      try {
+        // Make API call to Flutterwave to cancel subscription
+        const response = await axios.put(
+          `${flutterwaveBaseURL}subscriptions/${user.flutterwaveSubscriptionId}/cancel`,
+          {},
+          {
+            headers: {
+              Authorization: `Bearer ${flutterwaveSecretKey}`,
+            },
+          },
+        )
+
+        console.log("Flutterwave cancellation response:", response.data)
+
+        // Clear the subscription ID
+        user.flutterwaveSubscriptionId = null
+      } catch (flwError) {
+        // Log the error but continue with local cancellation
+        console.error(
+          "Error canceling Flutterwave subscription:",
+          flwError.response ? flwError.response.data : flwError.message,
+        )
+      }
+
+
+      // Save the updated user
+      await user.save()
+
+      // Create a record in transaction history
+      await Transaction.create({
+        userId: user._id,
+        type: "subscription_cancellation",
+        amount: 0,
+      })
+
+      // Send success response
+      return res.status(200).json({
+        message:
+          "Your premium plan has been canceled successfully. You will have access until the end of your current billing period.",
+      })
+    } catch (error) {
+      console.error("Error canceling premium plan:", error)
+      return res.status(500).json({ message: "Internal server error" })
+    }
+  },
   createRecipient: async (req, res) => {
     const { userId, bankCode, accountNumber } = req.body;
 
@@ -199,7 +263,7 @@ const transactionController = {
         amount: amount,
         type: 'debit'
       })
-      
+
       return res.status(200).json({ message: 'Payment Made successfully' });
 
     } catch (error) {

@@ -7,6 +7,8 @@ const Course = require("../models/courses.js");
 const { default: mongoose } = require("mongoose");
 const { create } = require("../models/category.js");
 const { sendEmailReminder } = require("../utils/sendEmailReminder.js");
+const { default: axios } = require("axios");
+const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
 
 const userControllers = {
 
@@ -40,6 +42,9 @@ const userControllers = {
         signature: existingUser.signature,
         isGoogleLinked: existingUser.isGoogleLinked,
         gMail: existingUser.gMail,
+        isYearly: existingUser.isYearly,
+        orgUrl: existingUser.orgUrl
+
 
 
 
@@ -155,12 +160,15 @@ const userControllers = {
         });
 
       }
+      console.log(req.body);
 
       // Update user profile information
       existingUser.fullname = req.body.fullname || existingUser.fullname;
       existingUser.phone = req.body.phone || existingUser.phone;
       existingUser.gender = req.body.gender || existingUser.gender;
       existingUser.age = req.body.age || existingUser.age;
+      existingUser.orgUrl = req.body.orgUrl || existingUser.orgUrl;
+
       existingUser.skillLevel = req.body.skillLevel || existingUser.skillLevel;
       existingUser.country = req.body.country || existingUser.country;
       existingUser.state = req.body.state || existingUser.state;
@@ -507,10 +515,13 @@ const userControllers = {
         return res.status(404).json({ message: 'User not found' });
       }
       const { image } = req.files;
+
+      console.log(image);
+
       const cloudFile = await upload(image.tempFilePath);
 
-      isUser.profilePicture = cloudFile.url || isUser.profilePicture;
-      isUser.image = cloudFile.url || isUser.profilePicture;
+      isUser.profilePicture = cloudFile || isUser.profilePicture;
+      isUser.image = cloudFile || isUser.profilePicture;
 
 
       await isUser.save();
@@ -524,24 +535,68 @@ const userControllers = {
   },
   updateTutorLevel: async (req, res) => {
     try {
-      const userId = req.body.id;
-      const isUser = await User.findById(userId);
-      if (!isUser) {
+      const { id: userId, txId: transactionId, plan } = req.body;
+
+      const user = await User.findById(userId);
+      if (!user) {
         return res.status(404).json({ message: 'User not found' });
       }
 
+      // Step 1: Verify transaction
+      const verifyResponse = await axios.get(
+        `https://api.flutterwave.com/v3/transactions/${transactionId}/verify`,
+        {
+          headers: {
+            Authorization: `Bearer ${flutterwaveSecretKey}`,
+          },
+        }
+      );
 
-      isUser.premiumPlan = req.body.plan.toLowerCase()
-      if (req.body.isYearly) {
-        isUser.premiumPlanExpires = dayjs().add(1, 'year').add(2, 'month').toDate();
-      } else {
-        isUser.premiumPlanExpires = dayjs().add(30, 'day').toDate();
-      } await isUser.save();
+      const data = verifyResponse.data.data;
+      if (!data.status || data.status !== 'successful') {
+        return res.status(400).json({ message: 'Transaction not successful' });
+      }
 
-      return res.status(200).json({ message: 'Profile information updated successfully', user: isUser });
+      const customerEmail = data.customer?.email;
+      const planId = data.plan;
+
+      if (!customerEmail || !planId) {
+        return res.status(400).json({ message: 'Missing customer email or plan ID in transaction' });
+      }
+
+      // Step 2: Fetch subscriptions for this customer
+      const subscriptionsRes = await axios.get(
+        `https://api.flutterwave.com/v3/subscriptions?email=${customerEmail}`,
+        {
+          headers: {
+            Authorization: `Bearer ${flutterwaveSecretKey}`,
+          },
+        }
+      );
+
+      const subscriptions = subscriptionsRes.data.data;
+
+      const matchingSubscription = subscriptions.find(
+        (sub) => sub.plan === planId && sub.status === 'active'
+      );
+
+      if (!matchingSubscription) {
+        return res.status(400).json({ message: 'No matching subscription found' });
+      }
+
+      // Step 3: Update user data
+      user.premiumPlan = plan?.toLowerCase() || 'basic';
+      user.flutterwaveSubscriptionId = matchingSubscription.id;
+
+      await user.save();
+
+      return res.status(200).json({
+        message: 'Profile information updated successfully',
+        user,
+      });
 
     } catch (error) {
-      console.error(error);
+      console.error('Update Tutor Error:', error?.response?.data || error.message);
       return res.status(500).json({ message: 'Unexpected error' });
     }
   },

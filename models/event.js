@@ -25,7 +25,10 @@ const eventSchema = new mongoose.Schema({
   calendarEventId: String,
   about: String,
   author: String,
-  authorId: String,
+  authorId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+  },
   duration: Number,
   mode: String,
   videoUrl: String,

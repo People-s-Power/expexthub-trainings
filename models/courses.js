@@ -30,7 +30,10 @@ const courseSchema = new mongoose.Schema({
         student: String,
     },
     about: String,
-    instructorId: String,
+    instructorId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+    },
     duration: Number,
     type: String,
     startDate: String,
@@ -81,6 +84,7 @@ const courseSchema = new mongoose.Schema({
         submodules: [{
             title: String,
             videoUrl: String,
+            duration: Number,
         }],
     }],
     approved: {
