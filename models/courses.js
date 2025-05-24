@@ -25,6 +25,10 @@ const courseSchema = new mongoose.Schema({
         type: String,
         enum: ["zoom", "google"],
     },
+    primaryColor: {
+        type: String,
+        default: "#FDC332"
+    },
     calendarEventId: String,
     privacy: {
         student: String,

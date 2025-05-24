@@ -12,14 +12,14 @@ const { createGoogleMeet } = require("../utils/createGoogleMeeting.js");
 
 const eventsController = {
   createEvent: async (req, res) => {
-    const { title, about, duration, type, startDate, endDate, startTime, endTime, category, mode, fee, strikedFee, days, videoUrl, timeframe, scholarship, meetingPassword, target, meetingType } = req.body;
+    const { title, about, duration, type, startDate, endDate, startTime, endTime, category, mode, fee, strikedFee, days, videoUrl, timeframe, scholarship, meetingPassword, target, meetingType, primaryColor } = req.body;
     console.log("hmmer");
 
     const userId = req.params.userId;
     // Query the user database to get the user's role
     const user = await User.findById(userId);
     // Check if the user has the necessary role to add a course
-    const allowedRoles = ['tutor', 'admin', 'super admin'];
+    const allowedRoles = ['tutor', 'admin', 'sprimaryColoruper admin'];
     if (!user || !allowedRoles.includes(user.role)) {
       return res.status(403).json({ message: 'Permission denied. Only tutors and admins can add events' });
     }
@@ -60,6 +60,7 @@ const eventsController = {
         category,
         mode,
         fee,
+        primaryColor,
         videoUrl,
         days,
         target,

@@ -32,6 +32,10 @@ const eventSchema = new mongoose.Schema({
   duration: Number,
   mode: String,
   videoUrl: String,
+  primaryColor: {
+    type: String,
+    default: "#FDC332"
+  },
   days: [{
     checked: Boolean,
     day: String,
