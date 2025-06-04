@@ -26,7 +26,6 @@ const userSchema = new mongoose.Schema({
   isYearly: {
     type: String,
     required: false
-
   },
   premiumPlanExpires: {
     type: Date,

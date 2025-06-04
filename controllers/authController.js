@@ -6,6 +6,8 @@ const {
   generateVerificationCode,
 } = require("../utils/verficationCodeGenerator.js");
 const { sendVerificationEmail } = require("../utils/nodeMailer.js");
+const { sendTeamInvitation } = require("../utils/TeamInviteEmail.js");
+
 const determineRole = require("../utils/determinUserType.js");
 const { default: axios } = require("axios");
 const jwt = require('jsonwebtoken');
@@ -498,10 +500,13 @@ const authControllers = {
       const newMember = { privileges, ownerId, tutorId };
 
       owner.teamMembers.push(newMember);
-      tutor.teamMembers.push(newMember);
+      tutor.teamMembers.push({ ...newMember, status: "pending" });
 
       await owner.save();
       await tutor.save();
+
+      await sendTeamInvitation(tutor.email, owner.fullname, tutorId, ownerId, tutor.fullName);
+
 
       res.status(201).json({
         success: true,

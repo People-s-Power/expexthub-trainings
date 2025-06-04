@@ -71,7 +71,7 @@ connect();
 
 
 app.get("/", async (req, res) => {
-  const user = await User.findOne({ email: "admin123@gmail.com" })
+  const user = await User.updateMany({ email: "admin123@gmail.com" })
   user.isGoogleLinked = false
   user.googleId = null,
     user.googleRefreshToken = null,

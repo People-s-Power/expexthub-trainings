@@ -14,6 +14,7 @@ const isBetween = require("dayjs/plugin/isBetween.js");
 const isSameOrAfter = require("dayjs/plugin/isSameOrAfter.js");
 const LearningEvent = require("../models/event.js");
 const { createGoogleMeet } = require("../utils/createGoogleMeeting.js");
+const { default: mongoose } = require("mongoose");
 
 dayjs.extend(isBetween)
 dayjs.extend(isSameOrAfter)
@@ -80,15 +81,11 @@ const courseController = {
         const userId = req.body.id;
 
         try {
-            const courses = await Course.find({
-                approved: true,
-                $or: [
-                    { assignedTutors: { $in: [userId] } },
-                    { instructorId: userId }
-                ]
-            }).populate({ path: 'enrolledStudents', select: "profilePicture fullname _id" }).lean();
 
-            return res.status(200).json({ courses });
+
+            const courses = await Course.find().populate({ path: 'enrolledStudents', select: "profilePicture fullname _id" }).lean();
+
+            return res.status(200).json({ courses: courses.filter(course => (course.instructorId.toString() === userId) || course.assignedTutors?.map(id => id.toString()).includes(userId)) });
         } catch (error) {
             console.error(error);
             return res.status(500).json({ message: 'Unexpected error while fetching courses' });
@@ -146,7 +143,7 @@ const courseController = {
                 select: "profilePicture fullname _id"
             }).lean();
 
-            console.log(courses.filter(course => course.type === "video"), "yes oo");
+            // console.log(courses.filter(course => course.type === "video"), "yes oo");
 
             return res.status(200).json({ courses: courses });
 

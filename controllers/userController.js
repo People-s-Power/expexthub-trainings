@@ -666,8 +666,8 @@ const userControllers = {
     try {
       const { tutorId } = req.params;
 
-      // Find the tutor by ID and populate the teamMembers field
-      const tutor = await User.findById(tutorId).populate({
+
+      const tutor = await User.findById(tutorId).lean().populate({
         path: 'teamMembers.tutorId',
         select: 'fullname _id email profilePicture role assignedCourse otherCourse organizationName'
       })
@@ -699,6 +699,8 @@ const userControllers = {
       // Fetch the tutor and owner
       const tutor = await User.findById(tutorId).populate("teamMembers");
       const owner = await User.findById(ownerId).populate("teamMembers");
+
+
 
       if (!tutor || tutor.role !== "tutor") {
         return res.status(404).json({ message: "Tutor not found or invalid role" });
@@ -744,14 +746,14 @@ const userControllers = {
       // Send email notification
       await sendEmailReminder(
         tutor.email,
-        `You have been removed from ${tutor?.organizationName || tutor.fullname}'s team`,
+        `You have been removed from ${owner?.organizationName || owner.fullname}'s team`,
         "Team Member Removal"
       );
 
       // Create a notification
       await Notification.create({
         title: "Team Member Removal",
-        content: `${tutor?.organizationName || tutor.fullname} has removed you from their team.`,
+        content: `${owner?.organizationName || owner.fullname} has removed you from their team.`,
         userId: tutorId,
       });
 
