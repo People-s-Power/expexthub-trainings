@@ -1,38 +1,38 @@
-require('dotenv/config');
-const express = require('express');
-const cors = require('cors');
-const fileUpload = require('express-fileupload');
-const http = require('http');
+require("dotenv/config");
+const express = require("express");
+const cors = require("cors");
+const fileUpload = require("express-fileupload");
+const http = require("http");
 const { Server } = require("socket.io");
 const Notification = require("./models/notifications.js");
 
 const { upload } = require("./config/cloudinary.js");
 const { cloudinaryVidUpload } = require("./config/cloudinary.js");
 
-const authRoute = require('./routes/authRoute');
-const userRouter = require('./routes/userRoute');
-const courseRouter = require('./routes/courseRoute');
-const accessmentRouter = require('./routes/assessments');
-const notificationRouter = require('./routes/notification');
-const resourceRoute = require('./routes/resourceRouter');
-const eventRouter = require('./routes/eventRoute');
-const categoryRoute = require('./routes/categoryRoute');
-const noticeRouter = require('./routes/noticeRouter');
-const transactionRouter = require('./routes/transactionRoute');
-const appointmentRouter = require('./routes/appointmentRouter.js');
-const certificateRouter = require('./routes/certificateRouter.js');
-const startUpKitRouter = require('./routes/startupkit.js');
-const workspaceRouter = require('./routes/workspaceRoute.js')
+const authRoute = require("./routes/authRoute");
+const userRouter = require("./routes/userRoute");
+const courseRouter = require("./routes/courseRoute");
+const accessmentRouter = require("./routes/assessments");
+const notificationRouter = require("./routes/notification");
+const resourceRoute = require("./routes/resourceRouter");
+const eventRouter = require("./routes/eventRoute");
+const categoryRoute = require("./routes/categoryRoute");
+const noticeRouter = require("./routes/noticeRouter");
+const transactionRouter = require("./routes/transactionRoute");
+const appointmentRouter = require("./routes/appointmentRouter.js");
+const certificateRouter = require("./routes/certificateRouter.js");
+const startUpKitRouter = require("./routes/startupkit.js");
+const workspaceRouter = require("./routes/workspaceRoute.js");
 
-const Chat = require('./models/chat');
-const User = require('./models/user');
+const Chat = require("./models/chat");
+const User = require("./models/user");
 
-const { sendEmail } = require('./utils/sendEmail');
-const { startCronJobs } = require('./utils/ReminderSetupEmail');
+const { sendEmail } = require("./utils/sendEmail");
+const { startCronJobs } = require("./utils/ReminderSetupEmail");
 
-const bodyParser = require('body-parser');
-const { connect } = require('./config/connectionState');
-const { default: axios } = require('axios');
+const bodyParser = require("body-parser");
+const { connect } = require("./config/connectionState");
+const { default: axios } = require("axios");
 
 const app = express();
 const server = http.createServer(app);
@@ -40,64 +40,70 @@ const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"],
-  }
+  },
 });
 
 const PORT = process.env.PORT || 3002;
-startCronJobs()
+startCronJobs();
 // Middleware
-app.use(cors({
-  origin: "*",
-  allowedHeaders: ["*"],
-  methods: ["*"],
-  credentials: true,
-}));
+app.use(
+  cors({
+    origin: "*",
+    allowedHeaders: ["*"],
+    methods: ["*"],
+    credentials: true,
+  })
+);
 
 app.use(express.urlencoded({ extended: false }));
-app.use(bodyParser.json({ limit: '35mb' }));
+app.use(bodyParser.json({ limit: "35mb" }));
 app.use(bodyParser.urlencoded({ extended: false }));
-app.use(express.static('public'));
-app.set('view engine', 'ejs');
+app.use(express.static("public"));
+app.set("view engine", "ejs");
 app.use(express.json());
 
-
 // File upload middleware
-app.use(fileUpload({
-  useTempFiles: true,
-}));
+app.use(
+  fileUpload({
+    useTempFiles: true,
+  })
+);
 
 // Connect to database
 connect();
 
-
 app.get("/", async (req, res) => {
-  const user = await User.updateMany({ email: "admin123@gmail.com" })
-  user.isGoogleLinked = false
-  user.googleId = null,
-    user.googleRefreshToken = null,
-    user.googleAccessToken = null,
-    await user.save()
-  res.status(200).json({ message: "DOne" })
-})
+  try {
+    const user = await User.updateMany({ email: "admin123@gmail.com" });
+    user.isGoogleLinked = false;
+    (user.googleId = null),
+      (user.googleRefreshToken = null),
+      (user.googleAccessToken = null),
+      await user.save();
+    res.status(200).json({ message: "Done" });
+  } catch (error) {
+    console.log(error);
+    res.status(400).json({ message: "Bad request exception" });
+  }
+});
 // Routes
-app.use('/auth', authRoute);
-app.use('/user', userRouter);
-app.use('/courses', courseRouter);
-app.use('/events', eventRouter);
-app.use('/resources', resourceRoute);
-app.use('/assessment', accessmentRouter);
-app.use('/notifications', notificationRouter);
-app.use('/category', categoryRoute);
-app.use('/notice', noticeRouter);
-app.use('/transactions', transactionRouter);
-app.use('/appointment', appointmentRouter);
-app.use('/certificate', certificateRouter);
-app.use('/start-up-kit', startUpKitRouter);
-app.use('/workspace', workspaceRouter);
-
+app.use("/auth", authRoute);
+app.use("/user", userRouter);
+app.use("/courses", courseRouter);
+app.use("/events", eventRouter);
+app.use("/resources", resourceRoute);
+app.use("/assessment", accessmentRouter);
+app.use("/notifications", notificationRouter);
+app.use("/category", categoryRoute);
+app.use("/notice", noticeRouter);
+app.use("/transactions", transactionRouter);
+app.use("/appointment", appointmentRouter);
+app.use("/certificate", certificateRouter);
+app.use("/start-up-kit", startUpKitRouter);
+app.use("/workspace", workspaceRouter);
 
 // Socket.io logic
-io.on('connection', async (socket) => {
+io.on("connection", async (socket) => {
   const user_id = socket.handshake.query["user_id"];
 
   console.log(`User connected ${socket.id}`);
@@ -154,7 +160,9 @@ io.on('connection', async (socket) => {
 
   socket.on("get_messages", async (data, callback) => {
     try {
-      const { messages } = await Chat.findById(data.conversation_id).select("messages");
+      const { messages } = await Chat.findById(data.conversation_id).select(
+        "messages"
+      );
       callback(messages);
     } catch (error) {
       console.log(error);
@@ -169,14 +177,14 @@ io.on('connection', async (socket) => {
 
       const to_user = await User.findById(to);
       const from_user = await User.findById(from);
-      let cloudFile
-      if (type === 'Image' || type === 'Document') {
+      let cloudFile;
+      if (type === "Image" || type === "Document") {
         const image = await upload(file);
-        cloudFile = image.url
-      } else if (type === 'Video') {
-        const video = await cloudinaryVidUpload(file)
+        cloudFile = image.url;
+      } else if (type === "Video") {
+        const video = await cloudinaryVidUpload(file);
         console.log("Uploaded video info:", video);
-        cloudFile = video
+        cloudFile = video;
       }
 
       const new_message = {
@@ -185,7 +193,7 @@ io.on('connection', async (socket) => {
         type: type,
         created_at: Date.now(),
         text: text || null,
-        file: cloudFile
+        file: cloudFile,
       };
 
       const chat = await Chat.findById(conversation_id);
@@ -203,13 +211,12 @@ io.on('connection', async (socket) => {
         conversation_id,
         message: new_message,
       });
-
     } catch (e) {
-      console.error('Error blocking user:', e);
+      console.error("Error blocking user:", e);
     }
   });
 
-  socket.on('block_user', async (data) => {
+  socket.on("block_user", async (data) => {
     const { by, conversation_id } = data;
 
     try {
@@ -225,24 +232,24 @@ io.on('connection', async (socket) => {
       // Update the blocked field
       chat.blocked = {
         isBlocked: true,
-        by: by
+        by: by,
       };
 
       await chat.save();
 
       // Emit success message
-      socket.broadcast.emit('user_blocked', {
+      socket.broadcast.emit("user_blocked", {
         message: `User has been blocked successfully by ${by}.`,
       });
 
       console.log(`User blocked by ${by}`);
     } catch (error) {
-      console.error('Error blocking user:', error);
-      socket.emit('error', { message: 'Error blocking user' });
+      console.error("Error blocking user:", error);
+      socket.emit("error", { message: "Error blocking user" });
     }
   });
 
-  socket.on('unblock_user', async (data) => {
+  socket.on("unblock_user", async (data) => {
     const { by, conversation_id } = data;
 
     try {
@@ -250,94 +257,105 @@ io.on('connection', async (socket) => {
       const chat = await Chat.findById(conversation_id);
 
       if (!chat) {
-        return socket.emit('error', { message: 'Conversation not found' });
+        return socket.emit("error", { message: "Conversation not found" });
       }
 
       // Check if the conversation is currently blocked and if the 'by' user matches the blocker
       if (!chat.blocked.isBlocked || String(chat.blocked.by) !== String(by)) {
-        return socket.emit('error', { message: 'You are not authorized to unblock this conversation or it is not blocked.' });
+        return socket.emit("error", {
+          message:
+            "You are not authorized to unblock this conversation or it is not blocked.",
+        });
       }
 
       // Update the blocked field: Unblock the conversation
       chat.blocked = {
         isBlocked: false,
-        by: null // Set 'by' to null since there's no current blocker after unblocking
+        by: null, // Set 'by' to null since there's no current blocker after unblocking
       };
 
       await chat.save();
 
       // Emit success message after unblocking
-      socket.broadcast.emit('unblock_user', {
+      socket.broadcast.emit("unblock_user", {
         message: `Conversation ${conversation_id} has been unblocked successfully by user ${by}.`,
       });
 
       console.log(`Conversation ${conversation_id} unblocked by user ${by}`);
     } catch (error) {
-      console.error('Error unblocking user:', error);
-      socket.emit('error', { message: 'Error unblocking the conversation' });
+      console.error("Error unblocking user:", error);
+      socket.emit("error", { message: "Error unblocking the conversation" });
     }
   });
 
-  socket.on('delete_message', async (data) => {
+  socket.on("delete_message", async (data) => {
     const { conversation_id, message_id, user_id } = data;
 
     try {
       const chat = await Chat.findById(conversation_id);
 
       if (!chat) {
-        return socket.emit('error', { message: 'Conversation not found' });
+        return socket.emit("error", { message: "Conversation not found" });
       }
 
       // Find the message by ID
       const message = chat.messages.id(message_id);
 
       if (!message) {
-        return socket.emit('error', { message: 'Message not found' });
+        return socket.emit("error", { message: "Message not found" });
       }
 
       // Check if the user requesting the delete is the author of the message
       if (String(message.from) !== String(user_id)) {
-        return socket.emit('error', { message: 'You are not authorized to delete this message' });
+        return socket.emit("error", {
+          message: "You are not authorized to delete this message",
+        });
       }
 
       // Remove the message
-      chat.messages = chat.messages.filter((msg) => msg._id.toString() !== message_id);
+      chat.messages = chat.messages.filter(
+        (msg) => msg._id.toString() !== message_id
+      );
 
       await chat.save();
 
       // Emit success message
-      socket.emit('message_deleted', {
+      socket.emit("message_deleted", {
         conversation_id,
         message_id,
       });
 
       console.log(`Message ${message_id} deleted by user ${user_id}`);
     } catch (error) {
-      console.error('Error deleting message:', error);
-      socket.emit('error', { message: 'Error deleting message' });
+      console.error("Error deleting message:", error);
+      socket.emit("error", { message: "Error deleting message" });
     }
   });
 
-  socket.on('edit_message', async (data) => {
+  socket.on("edit_message", async (data) => {
     const { conversation_id, message_id, newText, user_id } = data;
 
     try {
       const chat = await Chat.findById(conversation_id);
 
       if (!chat) {
-        return socket.emit('error', { message: 'Conversation not found' });
+        return socket.emit("error", { message: "Conversation not found" });
       }
 
       // Find the message by ID
-      const message = chat.messages.find((msg) => msg._id.toString() === message_id);
+      const message = chat.messages.find(
+        (msg) => msg._id.toString() === message_id
+      );
 
       if (!message) {
-        return socket.emit('error', { message: 'Message not found' });
+        return socket.emit("error", { message: "Message not found" });
       }
 
       // Check if the user requesting the edit is the author of the message
       if (String(message.from) !== String(user_id)) {
-        return socket.emit('error', { message: 'You are not authorized to edit this message' });
+        return socket.emit("error", {
+          message: "You are not authorized to edit this message",
+        });
       }
 
       // Update the message text
@@ -346,7 +364,7 @@ io.on('connection', async (socket) => {
       await chat.save();
 
       // Emit success message
-      socket.emit('message_edited', {
+      socket.emit("message_edited", {
         conversation_id,
         message_id,
         newText,
@@ -354,29 +372,29 @@ io.on('connection', async (socket) => {
 
       console.log(`Message ${message_id} edited by user ${user_id}`);
     } catch (error) {
-      console.error('Error editing message:', error);
-      socket.emit('error', { message: 'Error editing message' });
+      console.error("Error editing message:", error);
+      socket.emit("error", { message: "Error editing message" });
     }
   });
 
   // Handle when a user starts typing
-  socket.on('typing', ({ conversation_id, user_fullname }) => {
+  socket.on("typing", ({ conversation_id, user_fullname }) => {
     // Broadcast to other users in the conversation that this user is typing
-    socket.broadcast.emit('user_typing', { conversation_id, user_fullname });
+    socket.broadcast.emit("user_typing", { conversation_id, user_fullname });
   });
 
-  socket.on('stop_typing', ({ conversation_id }) => {
-    socket.broadcast.emit('user_stopped_typing', { conversation_id });
+  socket.on("stop_typing", ({ conversation_id }) => {
+    socket.broadcast.emit("user_stopped_typing", { conversation_id });
   });
 
-  socket.on('mark_all_as_read', async ({ chat_id, user_id }) => {
+  socket.on("mark_all_as_read", async ({ chat_id, user_id }) => {
     try {
       // Update messages to mark them as read in the specific chat document
       const result = await Chat.updateMany(
-        { _id: chat_id, 'messages.to': user_id },
-        { $set: { 'messages.$[elem].read': true } },
+        { _id: chat_id, "messages.to": user_id },
+        { $set: { "messages.$[elem].read": true } },
         {
-          arrayFilters: [{ 'elem.to': user_id }],
+          arrayFilters: [{ "elem.to": user_id }],
         }
       );
 
@@ -384,9 +402,9 @@ io.on('connection', async (socket) => {
       // console.log('Messages marked as read:', result);
 
       // Notify other participants in the chat
-      socket.broadcast.emit('all_messages_read', { chat_id, user_id });
+      socket.broadcast.emit("all_messages_read", { chat_id, user_id });
     } catch (error) {
-      console.error('Error marking messages as read:', error);
+      console.error("Error marking messages as read:", error);
     }
   });
 
