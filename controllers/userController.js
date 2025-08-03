@@ -833,6 +833,131 @@ const userControllers = {
       console.error("Error updating invitation status:", error);
       res.status(500).json({ message: "Unexpected error occurred" });
     }
+  },
+
+  sendMail: async (req, res) => {
+    try {
+      const { emails, subject, content, senderId } = req.body;
+
+      // Validate required fields
+      if (!emails || !Array.isArray(emails) || emails.length === 0) {
+        return res.status(400).json({ message: 'Emails array is required and cannot be empty' });
+      }
+
+      if (!subject || !content || !senderId) {
+        return res.status(400).json({ message: 'Subject, content, and senderId are required' });
+      }
+
+      // Get sender information
+      const sender = await User.findById(senderId);
+      if (!sender) {
+        return res.status(404).json({ message: 'Sender not found' });
+      }
+
+      // Configure nodemailer transporter
+      const nodemailer = require('nodemailer');
+      const marked = require('marked');
+      
+      const transporter = nodemailer.createTransport({
+        host: 'mail.privateemail.com',
+        port: 465,
+        auth: {
+          user: 'trainings@experthubllc.com',
+          pass: process.env.NOTIFICATION_EMAIL_PASSWORD,
+        },
+      });
+
+      // Convert markdown content to HTML
+      const htmlContent = marked.parse(content);
+      
+      // Create plain text version by stripping HTML tags
+      const plainTextContent = content.replace(/[#*`_~\[\]()]/g, '').replace(/\n/g, ' ');
+
+      // Append sender name to subject
+      const fullSubject = `${subject} - From ${sender.fullname}`;
+
+      // Send emails to all recipients
+      const emailPromises = emails.map(async (email) => {
+        const mailOptions = {
+          from: 'trainings@experthubllc.com',
+          to: email,
+          subject: fullSubject,
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; line-height: 1.6;">
+              <h2 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px;">${fullSubject}</h2>
+              <div style="background-color: #f9f9f9; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #007bff;">
+                ${htmlContent}
+              </div>
+              <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+              <p style="color: #666; font-size: 12px; text-align: center;">
+                This email was sent by <strong>${sender.fullname}</strong> via ExperthubLLC Training Platform.
+              </p>
+            </div>
+            <style>
+              /* Email-safe CSS for markdown elements */
+              h1, h2, h3, h4, h5, h6 { color: #333; margin: 15px 0 10px 0; }
+              p { margin: 10px 0; }
+              ul, ol { margin: 10px 0; padding-left: 20px; }
+              li { margin: 5px 0; }
+              blockquote { 
+                border-left: 4px solid #ddd; 
+                margin: 15px 0; 
+                padding-left: 15px; 
+                color: #666; 
+                font-style: italic; 
+              }
+              code { 
+                background-color: #f4f4f4; 
+                padding: 2px 4px; 
+                border-radius: 3px; 
+                font-family: monospace; 
+              }
+              pre { 
+                background-color: #f4f4f4; 
+                padding: 10px; 
+                border-radius: 5px; 
+                overflow-x: auto; 
+              }
+              a { color: #007bff; text-decoration: none; }
+              a:hover { text-decoration: underline; }
+              strong { color: #333; }
+              em { color: #555; }
+            </style>
+          `,
+          text: `${plainTextContent}\n\n---\nThis email was sent by ${sender.fullname} via ExperthubLLC Training Platform.`
+        };
+
+        try {
+          await transporter.sendMail(mailOptions);
+          console.log(`Email sent successfully to ${email}`);
+          return { email, status: 'success' };
+        } catch (error) {
+          console.error(`Error sending email to ${email}:`, error);
+          return { email, status: 'failed', error: error.message };
+        }
+      });
+
+      // Wait for all emails to be processed
+      const results = await Promise.all(emailPromises);
+
+      // Count successful and failed emails
+      const successful = results.filter(result => result.status === 'success');
+      const failed = results.filter(result => result.status === 'failed');
+
+      return res.status(200).json({
+        message: 'Email sending completed',
+        summary: {
+          total: emails.length,
+          successful: successful.length,
+          failed: failed.length
+        },
+        results: results
+      });
+
+    } catch (error) {
+      console.error('Error in sendMail:', error);
+      return res.status(500).json({ message: 'Unexpected error during email sending' });
+    }
   }
 
 };

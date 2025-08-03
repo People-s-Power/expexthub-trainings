@@ -39,5 +39,7 @@ userRouter.get('/team/:tutorId', userControllers.getTeamMembers)
 userRouter.delete('/team/:tutorId/:ownerId', userControllers.deleteTeamMembers)
 userRouter.get('/team/:tutorId/:ownerId/:status', userControllers.updateTeamMemberStatus)
 
+userRouter.post('/send-mail', userControllers.sendMail);
+
 
 module.exports = userRouter;
