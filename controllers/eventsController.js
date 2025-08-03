@@ -1,11 +1,10 @@
 const User = require("../models/user.js");
-const { upload } = require("../config/cloudinary.js");
+const { upload, cloudinaryVidUpload } = require("../config/cloudinary.js");
 const createZoomMeeting = require("../utils/createZoomMeeting.js");
 const LearningEvent = require("../models/event.js");
 const Course = require("../models/courses.js");
 
 const Notification = require("../models/notifications.js");
-const cloudinaryVidUpload = require("../config/cloudinary.js");
 const { sendEmailReminder } = require("../utils/sendEmailReminder.js");
 const dayjs = require("dayjs");
 const { createGoogleMeet } = require("../utils/createGoogleMeeting.js");
@@ -35,17 +34,30 @@ const eventsController = {
     }
     try {
       let cloudFile
+      
+      // Validate that asset exists
+      if (!req.body.asset || !req.body.asset.url) {
+        return res.status(400).json({ message: 'Asset URL is required' });
+      }
+      
       if (req.body.asset.type === 'image') {
-        const file = await upload(req.body.asset.url);
-        cloudFile = file.url
+        const fileUrl = await upload(req.body.asset.url, 'image');
+        cloudFile = fileUrl
       } else {
         try {
-          const video = await upload.cloudinaryVidUpload(req.body.asset.url)
+          const video = await cloudinaryVidUpload(req.body.asset.url)
           cloudFile = video
         } catch (e) {
-          console.log(e)
+          console.log('Video upload error:', e)
+          return res.status(500).json({ message: 'Failed to upload video asset' });
         }
       }
+      
+      // Ensure cloudFile is not undefined
+      if (!cloudFile) {
+        return res.status(500).json({ message: 'Failed to upload asset file' });
+      }
+      
       const newEvent = {
         author: user.fullname,
         authorId: userId,
