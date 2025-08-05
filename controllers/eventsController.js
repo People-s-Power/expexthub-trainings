@@ -12,7 +12,6 @@ const { createGoogleMeet } = require("../utils/createGoogleMeeting.js");
 const eventsController = {
   createEvent: async (req, res) => {
     const { title, about, duration, type, startDate, endDate, startTime, endTime, category, mode, fee, strikedFee, days, videoUrl, timeframe, scholarship, meetingPassword, target, meetingType, primaryColor } = req.body;
-    console.log("hmmer");
 
     const userId = req.params.userId;
     // Query the user database to get the user's role

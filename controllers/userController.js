@@ -884,8 +884,8 @@ const userControllers = {
           subject: fullSubject,
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; line-height: 1.6;">
-              <h2 style="color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px;">${fullSubject}</h2>
-              <div style="background-color: #f9f9f9; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #007bff;">
+              <h2 style="color: #333; border-bottom: 2px solid #FDC332; padding-bottom: 10px;">${fullSubject}</h2>
+              <div style="background-color: #f9f9f9; padding: 10px; border-radius: 8px; margin: 20px 0;">
                 ${htmlContent}
               </div>
               <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
