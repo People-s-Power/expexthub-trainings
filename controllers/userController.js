@@ -857,7 +857,7 @@ const userControllers = {
       // Configure nodemailer transporter
       const nodemailer = require('nodemailer');
       const marked = require('marked');
-      
+
       const transporter = nodemailer.createTransport({
         host: 'mail.privateemail.com',
         port: 465,
@@ -869,7 +869,7 @@ const userControllers = {
 
       // Convert markdown content to HTML
       const htmlContent = marked.parse(content);
-      
+
       // Create plain text version by stripping HTML tags
       const plainTextContent = content.replace(/[#*`_~\[\]()]/g, '').replace(/\n/g, ' ');
 
@@ -881,6 +881,7 @@ const userControllers = {
         const mailOptions = {
           from: 'trainings@experthubllc.com',
           to: email,
+          replyTo: sender.email, // This is the key addition
           subject: fullSubject,
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; line-height: 1.6;">
