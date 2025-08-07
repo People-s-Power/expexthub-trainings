@@ -117,6 +117,114 @@ const noticeController = {
       console.error(error);
       return res.status(500).json({ message: 'Unexpected error!' });
     }
+  },
+
+  editNotice: async (req, res) => {
+    const noticeId = req.params.noticeId;
+    const updates = req.body;
+
+    try {
+      // Find the notice by ID
+      const notice = await Notice.findById(noticeId);
+
+      if (!notice) {
+        return res.status(404).json({ message: 'Notice not found' });
+      }
+
+      // Only update fields that are explicitly provided in the request
+      const fieldsToUpdate = ['title', 'body', 'role', 'category', 'country', 'state', 'link', 'page', 'action'];
+      
+      fieldsToUpdate.forEach(field => {
+        if (field in updates) {
+          notice[field] = updates[field];
+        }
+      });
+      
+      // Special handling for the cancel field (could be false)
+      if ('cancel' in updates) {
+        notice.cancel = updates.cancel;
+      }
+      
+      // Update recipient/receivers only if explicitly provided
+      if ('recipient' in updates) {
+        notice.receivers = updates.recipient;
+      } else if ('role' in updates) {
+        // Re-fetch users based on updated criteria if role is changed
+        let users = [];
+        const { role } = updates;
+        
+        if (role === 'all') {
+          users = await User.find();
+        } else {
+          // Only use filter criteria that are explicitly provided in the request
+          const filterCriteria = { role };
+          if ('category' in updates) filterCriteria.assignedCourse = updates.category;
+          if ('state' in updates) filterCriteria.state = updates.state;
+          if ('country' in updates) filterCriteria.country = updates.country;
+          
+          users = await User.find(filterCriteria);
+        }
+        
+        if (users.length > 0) {
+          notice.receivers = users;
+        }
+      }
+
+      // Handle asset update ONLY if explicitly provided
+      if (updates.asset) {
+        let cloudFile;
+        if (updates.asset.type === 'image') {
+          const file = await upload(updates.asset.url);
+          cloudFile = file;
+        } else {
+          try {
+            const video = await cloudinaryVidUpload(updates.asset.url);
+            cloudFile = video;
+          } catch (e) {
+            console.log('Video upload error:', e);
+            return res.status(500).json({ message: 'Failed to upload video asset' });
+          }
+        }
+
+        notice.thumbnail = {
+          type: updates.asset.type,
+          url: cloudFile
+        };
+      }
+
+      // Save the updated notice
+      await notice.save();
+
+      return res.status(200).json({
+        success: true,
+        message: 'Notice updated successfully',
+        notice,
+      });
+    } catch (error) {
+      console.error(error);
+      return res.status(500).json({ message: 'Unexpected error during notice update' });
+    }
+  },
+
+  deleteNotice: async (req, res) => {
+    const noticeId = req.params.noticeId;
+
+    try {
+      // Find and delete the notice
+      const result = await Notice.findByIdAndDelete(noticeId);
+
+      if (!result) {
+        return res.status(404).json({ message: 'Notice not found' });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: 'Notice deleted successfully'
+      });
+    } catch (error) {
+      console.error(error);
+      return res.status(500).json({ message: 'Unexpected error during notice deletion' });
+    }
   }
 }
 

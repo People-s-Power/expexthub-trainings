@@ -259,9 +259,9 @@ const userControllers = {
 
   getMyStudents: async (req, res) => {
     try {
-      const userId = req.body.id; // Assuming the tutor's ID is in `req.user.id`
+      const userId = req.body.id;
 
-      // Fetch the tutor's courses
+      // Fetch the tutor's courses with both enrollment types populated
       const courses = await Course.find({
         approved: true,
         $or: [
@@ -273,17 +273,21 @@ const userControllers = {
           path: 'enrollments.user',
           select: "profilePicture fullname email phone gender age skillLevel country state address graduate blocked contact"
         })
+        .populate({
+          path: 'enrolledStudents',
+          select: "profilePicture fullname email phone gender age skillLevel country state address graduate blocked contact"
+        })
         .lean();
 
       if (!courses || courses.length === 0) {
         return res.status(404).json({ message: 'No courses found for this tutor' });
       }
 
-      // Extract unique users from enrollments using a Map
+      // Extract unique users from both enrollments and enrolledStudents using a Map
       const uniqueUsersMap = new Map();
 
       courses.forEach(course => {
-        // Ensure `enrollments` exists and is an array
+        // Process enrollments array
         if (Array.isArray(course.enrollments)) {
           course.enrollments.forEach(enrollment => {
             const student = enrollment.user;
@@ -307,6 +311,32 @@ const userControllers = {
             }
           });
         }
+        
+        // Process enrolledStudents array
+        if (Array.isArray(course.enrolledStudents)) {
+          course.enrolledStudents.forEach(student => {
+            if (student && !uniqueUsersMap.has(student._id.toString())) {
+              uniqueUsersMap.set(student._id.toString(), {
+                _id: student._id,
+                fullname: student.fullname,
+                email: student.email,
+                phone: student.phone,
+                gender: student.gender,
+                age: student.age,
+                skillLevel: student.skillLevel,
+                country: student.country,
+                state: student.state,
+                address: student.address,
+                profilePicture: student.profilePicture,
+                graduate: student.graduate,
+                blocked: student.blocked,
+                contact: student.contact,
+                // Include course info if available
+                course: student.assignedCourse
+              });
+            }
+          });
+        }
       });
 
       // Convert unique users to an array
@@ -315,7 +345,7 @@ const userControllers = {
       if (uniqueUsers.length === 0) {
         return res.status(404).json({ message: 'No students enrolled in your courses' });
       }
-      console.log(uniqueUsers)
+
       // Return the unique users' data
       return res.status(200).json({
         message: 'Students retrieved successfully',
