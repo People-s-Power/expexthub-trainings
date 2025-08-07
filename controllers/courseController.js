@@ -210,17 +210,29 @@ const courseController = {
             return res.status(403).json({ message: 'Your have exceeded your plan limit for courses', showPop: true });
         }
         try {
-            let cloudFile
-            if (req.body.asset.type === 'image') {
-                const file = await upload(req.body.asset.url, req.body.asset.type);
-                cloudFile = file
-            } else {
-                try {
-                    const video = await upload(req.body.asset.url, req.body.asset.type)
-                    cloudFile = video
-                } catch (e) {
-                    console.log(e)
+            let cloudFile;
+            try {
+                if (req.body.asset.type === 'image') {
+                    // Upload image with timeout handling
+                    const file = await upload(req.body.asset.url, "image");
+                    cloudFile = file;
+                } else {
+                    // Upload video with specific video handling
+                    const video = await cloudinaryVidUpload(req.body.asset.url);
+                    cloudFile = video;
                 }
+                
+                if (!cloudFile) {
+                    return res.status(500).json({ 
+                        message: 'File upload failed. Please try with a smaller file or better connection.' 
+                    });
+                }
+            } catch (uploadError) {
+                console.error("Upload error:", uploadError);
+                return res.status(500).json({ 
+                    message: 'File upload failed: ' + (uploadError.message || 'Unexpected error during file upload'),
+                    details: uploadError.http_code === 499 ? 'Request timed out. Try with a smaller file or better connection.' : null
+                });
             }
 
             // Create a new course object
@@ -245,7 +257,7 @@ const courseController = {
                 strikedFee,
                 modules,
                 benefits,
-                enrolledStudents: scholarship,
+                enrolledStudents: scholarship ? scholarship : [],
                 audience,
                 thumbnail: {
                     type: req.body.asset.type,
@@ -262,6 +274,28 @@ const courseController = {
 
             // Save the new course
             const course = await Course.create(newCourse);
+            
+            // Handle scholarship students by adding them to the enrollments array as well
+            if (scholarship && Array.isArray(scholarship) && scholarship.length > 0) {
+                // Initialize enrollments array if it doesn't exist
+                if (!course.enrollments) {
+                    course.enrollments = [];
+                }
+                
+                // Add each scholarship student to enrollments array with proper metadata
+                scholarship.forEach(studentId => {
+                    course.enrollments.push({
+                        user: studentId,
+                        status: 'active',
+                        enrolledOn: new Date(),
+                        scholarship: true // Mark as scholarship student
+                    });
+                });
+                
+                // Save the updates
+                await course.save();
+            }
+            
             if (newCourse.type === "pdf") {
                 // const { pdf } = req.files;
                 const cloudFile = await upload(req.body.pdf);
