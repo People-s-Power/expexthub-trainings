@@ -52,4 +52,7 @@ courseRouter.get("/cloudinary/signed-url", courseController.getSignedURL)
 courseRouter.put('/update-status/:courseId', courseController.updateStatus)
 courseRouter.get('/renew/:courseId/:id', courseController.renewCourse)
 
+// Give scholarship to students
+courseRouter.post('/give-scholarship/:courseId', courseController.giveScholarship)
+
 module.exports = courseRouter;

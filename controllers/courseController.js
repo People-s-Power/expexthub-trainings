@@ -221,15 +221,15 @@ const courseController = {
                     const video = await cloudinaryVidUpload(req.body.asset.url);
                     cloudFile = video;
                 }
-                
+
                 if (!cloudFile) {
-                    return res.status(500).json({ 
-                        message: 'File upload failed. Please try with a smaller file or better connection.' 
+                    return res.status(500).json({
+                        message: 'File upload failed. Please try with a smaller file or better connection.'
                     });
                 }
             } catch (uploadError) {
                 console.error("Upload error:", uploadError);
-                return res.status(500).json({ 
+                return res.status(500).json({
                     message: 'File upload failed: ' + (uploadError.message || 'Unexpected error during file upload'),
                     details: uploadError.http_code === 499 ? 'Request timed out. Try with a smaller file or better connection.' : null
                 });
@@ -274,14 +274,14 @@ const courseController = {
 
             // Save the new course
             const course = await Course.create(newCourse);
-            
+
             // Handle scholarship students by adding them to the enrollments array as well
             if (scholarship && Array.isArray(scholarship) && scholarship.length > 0) {
                 // Initialize enrollments array if it doesn't exist
                 if (!course.enrollments) {
                     course.enrollments = [];
                 }
-                
+
                 // Add each scholarship student to enrollments array with proper metadata
                 scholarship.forEach(studentId => {
                     course.enrollments.push({
@@ -291,11 +291,11 @@ const courseController = {
                         scholarship: true // Mark as scholarship student
                     });
                 });
-                
+
                 // Save the updates
                 await course.save();
             }
-            
+
             if (newCourse.type === "pdf") {
                 // const { pdf } = req.files;
                 const cloudFile = await upload(req.body.pdf);
@@ -877,7 +877,128 @@ const courseController = {
             console.error(error);
             return res.status(500).json({ message: 'Unexpected error during renewal' });
         }
-    }
+    },
+
+    giveScholarship: async (req, res) => {
+        const courseId = req.params.courseId;
+        const { studentIds } = req.body; // Array of student IDs to give scholarships to
+
+        try {
+            const course = await Course.findById(courseId);
+
+            if (!course) {
+                return res.status(404).json({ message: 'Course not found' });
+            }
+
+            // Validate that studentIds is an array
+            if (!Array.isArray(studentIds) || studentIds.length === 0) {
+                return res.status(400).json({ message: 'Please provide an array of student IDs' });
+            }
+
+            // Validate that all student IDs exist
+            const students = await User.find({ _id: { $in: studentIds } });
+            if (students.length !== studentIds.length) {
+                return res.status(400).json({ message: 'One or more student IDs are invalid' });
+            }
+
+            const scholarshipResults = [];
+            const failedEnrollments = [];
+
+            for (const studentId of studentIds) {
+                try {
+                    // Check if student is already enrolled
+                    const isAlreadyEnrolled = course.enrolledStudents.includes(studentId) ||
+                        course.enrollments?.find(enrollment => enrollment.user.toString() === studentId);
+
+                    if (isAlreadyEnrolled) {
+                        failedEnrollments.push({
+                            studentId,
+                            reason: 'Student is already enrolled in this course'
+                        });
+                        continue;
+                    }
+
+                    // Add student to enrolledStudents array
+                    course.enrolledStudents.push(studentId);
+
+                    // Add to enrollments array with scholarship metadata
+                    course.enrollments.push({
+                        user: studentId,
+                        status: 'active',
+                        enrolledOn: new Date(),
+                        scholarship: true,
+                        grantedBy: req.user?.id || req.body.grantedBy // Track who granted the scholarship
+                    });
+
+                    // Get student details for notification
+                    const student = students.find(s => s._id.toString() === studentId);
+
+                    // Create notification for the student
+                    await Notification.create({
+                        title: "Scholarship Granted",
+                        content: `Congratulations! You have been granted a scholarship for the course "${course.title}"`,
+                        contentId: course._id,
+                        userId: studentId,
+                    });
+
+                    // Create notification for the course instructor
+                    await Notification.create({
+                        title: "Scholarship Granted",
+                        content: `A scholarship has been granted to ${student.fullname} for your course "${course.title}"`,
+                        contentId: course._id,
+                        userId: course.instructorId,
+                    });
+
+                    scholarshipResults.push({
+                        studentId,
+                        studentName: student.fullname,
+                        status: 'success'
+                    });
+
+                } catch (enrollmentError) {
+                    console.error(`Error enrolling student ${studentId}:`, enrollmentError);
+                    failedEnrollments.push({
+                        studentId,
+                        reason: 'Failed to enroll student due to server error'
+                    });
+                }
+            }
+
+            // Save the course with all new enrollments
+            await course.save();
+
+            // Prepare response
+            const response = {
+                success: true,
+                message: `Scholarships granted successfully to ${scholarshipResults.length} student(s)`,
+                results: {
+                    successful: scholarshipResults,
+                    failed: failedEnrollments
+                },
+                course: {
+                    id: course._id,
+                    title: course.title,
+                    totalEnrolledStudents: course.enrolledStudents.length
+                }
+            };
+
+            // If some enrollments failed, indicate partial success
+            if (failedEnrollments.length > 0) {
+                response.message = `Scholarships partially granted. ${scholarshipResults.length} successful, ${failedEnrollments.length} failed.`;
+            }
+
+            return res.status(200).json(response);
+
+        } catch (error) {
+            console.error('Error granting scholarships:', error);
+            return res.status(500).json({
+                message: 'Unexpected error while granting scholarships',
+                error: error.message
+            });
+        }
+    },
+
+
 };
 
 
