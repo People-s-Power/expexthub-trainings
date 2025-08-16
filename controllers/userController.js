@@ -359,11 +359,24 @@ const userControllers = {
 
   getMyMentees: async (req, res) => {
     try {
-      // Find all users with the role 'student'
-      const students = await User.find({ role: 'student', assignedCourse: req.body.course });
+      const tutorId = req.body.tutorId || req.body.id || req.params.id;
+      // Find all courses created by this tutor
+      const courses = await Course.find({ instructorId: tutorId }).select('_id');
+      const courseIds = courses.map(course => course._id);
+
+      // Find all students who are enrolled in any of these courses
+      const enrolledStudents = await Course.aggregate([
+        { $match: { instructorId: tutorId } },
+        { $unwind: '$enrolledStudents' },
+        { $group: { _id: '$enrolledStudents' } }
+      ]);
+      const studentIds = enrolledStudents.map(s => s._id);
+
+      // Get student details
+      const students = await User.find({ _id: { $in: studentIds }, role: 'student' });
 
       if (!students || students.length === 0) {
-        return res.status(404).json({ message: 'No students found' });
+        return res.status(404).json({ message: 'No enrolled students found for this tutor' });
       }
 
       // Extract relevant student information
@@ -385,7 +398,7 @@ const userControllers = {
         contact: student.contact
       }));
 
-      return res.status(200).json({ message: 'Students retrieved successfully', students: studentProfiles });
+      return res.status(200).json({ message: 'Enrolled students retrieved successfully', students: studentProfiles });
     } catch (error) {
       console.error(error);
       return res.status(500).json({ message: 'Unexpected error during student retrieval' });
