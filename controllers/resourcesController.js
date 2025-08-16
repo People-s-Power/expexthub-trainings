@@ -17,12 +17,12 @@ const resourceController = {
         file = await upload(pdf)
       }
       if (type === 'link') {
-        url = websiteUrl
+        file = websiteUrl
       }
       // Create a new resource
       const newResource = {
         title,
-        websiteUrl: file.url,
+        websiteUrl: file.url || file,
         aboutCourse,
         image: cloudFile.secure_url,
         assignedCourse,
