@@ -4,7 +4,7 @@ const { upload, cloudinaryVidUpload } = require("../config/cloudinary.js");
 
 const noticeController = {
   addNotice: async (req, res) => {
-    const { title, body, role, category, country, state, link, page, cancel, action, recipient } = req.body
+    const { title, body, role, category, country, state, link, page, cancel, action, recipient, triggerPage } = req.body
 
     if (role === 'all') {
       users = await User.find()
@@ -35,6 +35,7 @@ const noticeController = {
         body,
         role,
         category,
+        triggerPage,
         country,
         state,
         link,
@@ -133,18 +134,18 @@ const noticeController = {
 
       // Only update fields that are explicitly provided in the request
       const fieldsToUpdate = ['title', 'body', 'role', 'category', 'country', 'state', 'link', 'page', 'action'];
-      
+
       fieldsToUpdate.forEach(field => {
         if (field in updates) {
           notice[field] = updates[field];
         }
       });
-      
+
       // Special handling for the cancel field (could be false)
       if ('cancel' in updates) {
         notice.cancel = updates.cancel;
       }
-      
+
       // Update recipient/receivers only if explicitly provided
       if ('recipient' in updates) {
         notice.receivers = updates.recipient;
@@ -152,7 +153,7 @@ const noticeController = {
         // Re-fetch users based on updated criteria if role is changed
         let users = [];
         const { role } = updates;
-        
+
         if (role === 'all') {
           users = await User.find();
         } else {
@@ -161,10 +162,10 @@ const noticeController = {
           if ('category' in updates) filterCriteria.assignedCourse = updates.category;
           if ('state' in updates) filterCriteria.state = updates.state;
           if ('country' in updates) filterCriteria.country = updates.country;
-          
+
           users = await User.find(filterCriteria);
         }
-        
+
         if (users.length > 0) {
           notice.receivers = users;
         }

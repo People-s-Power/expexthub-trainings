@@ -12,6 +12,7 @@ const noticeSchema = new mongoose.Schema({
   page: String,
   cancel: Boolean,
   action: String,
+  triggerPage: String,
   thumbnail: {
     type: {
       type: String,
