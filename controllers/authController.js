@@ -34,9 +34,15 @@ passport.use(
     },
     async (req, accessToken, refreshToken, profile, done) => {
       try {
-
-        const decodedState = JSON.parse(Buffer.from(req.query.state, "base64").toString("utf8"));
-        const { role = "student", link, } = decodedState;
+        let decodedState = {};
+        if (req.query.state) {
+          try {
+            decodedState = JSON.parse(Buffer.from(req.query.state, "base64").toString("utf8"));
+          } catch (e) {
+            decodedState = {};
+          }
+        }
+        const { role = "student", link } = decodedState;
 
         const email = profile.emails?.[0]?.value?.toLowerCase();
         if (!email) return done(new Error("No email from Google"), null);
@@ -96,7 +102,6 @@ passport.use(
         return done(null, user);
       } catch (err) {
         console.log(err);
-
         return done(err, null);
       }
     },
@@ -247,7 +252,14 @@ const authControllers = {
 
       try {
         // Decode the state from the request
-        const decodedState = JSON.parse(Buffer.from(req.query.state, "base64").toString("utf-8"));
+        let decodedState = {};
+        if (req.query.state) {
+          try {
+            decodedState = JSON.parse(Buffer.from(req.query.state, "base64").toString("utf-8"));
+          } catch (e) {
+            decodedState = {};
+          }
+        }
         const { redirectUrl, link } = decodedState;
 
         const payload = {
@@ -270,7 +282,15 @@ const authControllers = {
           expiresIn: "2m", // short-lived token
         });
 
-        return res.redirect(`${process.env.TRAINING_URL}/${redirectUrl}?data=${encodeURIComponent(encodedUserData)}`);
+        // If redirectUrl is absolute, use it directly; otherwise, prepend base URL
+        let finalRedirect;
+        if (/^https?:\/\//i.test(redirectUrl)) {
+          finalRedirect = `${redirectUrl}?data=${encodeURIComponent(encodedUserData)}`;
+        } else {
+          finalRedirect = `${process.env.TRAINING_URL}/${redirectUrl}?data=${encodeURIComponent(encodedUserData)}`;
+        }
+
+        return res.redirect(finalRedirect);
 
       } catch (error) {
         console.error("Error in Google callback:", error);
