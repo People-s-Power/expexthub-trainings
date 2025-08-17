@@ -133,7 +133,7 @@ const noticeController = {
       }
 
       // Only update fields that are explicitly provided in the request
-      const fieldsToUpdate = ['title', 'body', 'role', 'category', 'country', 'state', 'link', 'page', 'action'];
+      const fieldsToUpdate = ['title', 'body', 'role', 'category', 'country', 'state', 'link', 'page', 'action', 'triggerPage'];
 
       fieldsToUpdate.forEach(field => {
         if (field in updates) {
