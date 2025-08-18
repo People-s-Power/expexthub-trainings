@@ -311,7 +311,7 @@ const userControllers = {
             }
           });
         }
-        
+
         // Process enrolledStudents array
         if (Array.isArray(course.enrolledStudents)) {
           course.enrolledStudents.forEach(student => {
@@ -705,6 +705,7 @@ const userControllers = {
       return res.status(500).json({ message: 'Unexpected error' });
     }
   },
+
   getTeamMembers: async (req, res) => {
     try {
       const { tutorId } = req.params;
@@ -724,10 +725,21 @@ const userControllers = {
         return res.status(404).json({ message: 'Tutor not found or invalid role' });
       }
 
-      // Return the team members
+      // Ensure each team member has a status field
+      const teamMembersWithStatus = Array.isArray(tutor.teamMembers)
+        ? tutor.teamMembers.map(member => {
+            // Create a proper object with the status preserved
+            const memberObj = member.toObject ? member.toObject() : member;
+            return {
+              ...memberObj,
+              status: memberObj.status || 'pending', // fallback to 'pending' if missing
+            };
+          })
+        : [];
+
       return res.status(200).json({
         success: true,
-        teamMembers: tutor.teamMembers,
+        teamMembers: teamMembersWithStatus,
       });
     } catch (error) {
       console.error('Error fetching team members:', error);
@@ -852,15 +864,20 @@ const userControllers = {
       }
 
       // If accepted, just update the status
-      let teamMember = tutor.teamMembers.find(
+      let tutorTeamMember = tutor.teamMembers.find(
         (member) => member?.ownerId?.toString() === ownerId.toString()
       );
 
-      if (!teamMember) {
+      let ownerTeamMember = owner.teamMembers.find(
+        (member) => member?.tutorId?.toString() === tutorId.toString()
+      );
+
+      if (!tutorTeamMember || !ownerTeamMember) {
         return res.status(400).json({ message: "No invitation found" });
       }
 
-      teamMember.status = status;
+      tutorTeamMember.status = "accepted";
+      ownerTeamMember.status = "accepted";
 
       await tutor.save();
       await owner.save();
@@ -871,7 +888,7 @@ const userControllers = {
         content: `${tutor.fullname} has accepted your team invitation`,
       });
 
-      res.json({ success: true, message: `Invitation ${status} successfully` });
+      res.json({ success: true, message: "Invitation accepted successfully" });
     } catch (error) {
       console.error("Error updating invitation status:", error);
       res.status(500).json({ message: "Unexpected error occurred" });

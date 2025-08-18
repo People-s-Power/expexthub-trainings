@@ -519,7 +519,7 @@ const authControllers = {
       // Add the team member to both the tutor's and owner's records
       const newMember = { privileges, ownerId, tutorId };
 
-      owner.teamMembers.push(newMember);
+      owner.teamMembers.push({ ...newMember, status: "pending" });
       tutor.teamMembers.push({ ...newMember, status: "pending" });
 
       await owner.save();
