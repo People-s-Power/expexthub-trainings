@@ -97,17 +97,26 @@ const resourceController = {
   },
 
   getTutorResources: async (req, res) => {
-    const tutorId = req.params.tutorId;
+    const userId = req.params.tutorId;
     try {
-      // Find all courses created by this tutor
-      const courses = await Course.find({ instructorId: tutorId }).select('_id');
-      
+      // Fetch all courses
+      const courses = await Course.find();
       if (!courses || courses.length === 0) {
+        return res.status(404).json({ message: 'No courses found' });
+      }
+
+      // Filter courses by instructorId or assignedTutors
+      const filteredCourses = courses.filter(course => (
+        course.instructorId?.toString() === userId ||
+        (Array.isArray(course.assignedTutors) && course.assignedTutors.map(id => id.toString()).includes(userId))
+      ));
+
+      if (filteredCourses.length === 0) {
         return res.status(404).json({ message: 'No courses found for this tutor' });
       }
 
       // Extract course IDs
-      const courseIds = courses.map(course => course._id.toString());
+      const courseIds = filteredCourses.map(course => course._id.toString());
 
       // Find all resources assigned to these courses
       const resources = await Resource.find({ assignedCourse: { $in: courseIds } });
@@ -115,15 +124,13 @@ const resourceController = {
       return res.status(200).json({ 
         message: 'Tutor resources retrieved successfully',
         resources,
-        totalResources: resources.length 
+        totalResources: resources.length
       });
     } catch (error) {
       console.error(error);
       return res.status(500).json({ message: 'Unexpected error during resource retrieval' });
     }
   },
-
-  
 }
 
 module.exports = resourceController;
