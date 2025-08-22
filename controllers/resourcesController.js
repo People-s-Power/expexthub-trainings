@@ -1,5 +1,6 @@
 const { upload } = require("../config/cloudinary.js");
 const Resource = require("../models/resources.js");
+const Course = require("../models/courses.js");
 const { cloudinaryVidUpload } = require("../config/cloudinary.js");
 
 const resourceController = {
@@ -94,6 +95,35 @@ const resourceController = {
       res.status(400).json(error);
     }
   },
+
+  getTutorResources: async (req, res) => {
+    const tutorId = req.params.tutorId;
+    try {
+      // Find all courses created by this tutor
+      const courses = await Course.find({ instructorId: tutorId }).select('_id');
+      
+      if (!courses || courses.length === 0) {
+        return res.status(404).json({ message: 'No courses found for this tutor' });
+      }
+
+      // Extract course IDs
+      const courseIds = courses.map(course => course._id.toString());
+
+      // Find all resources assigned to these courses
+      const resources = await Resource.find({ assignedCourse: { $in: courseIds } });
+
+      return res.status(200).json({ 
+        message: 'Tutor resources retrieved successfully',
+        resources,
+        totalResources: resources.length 
+      });
+    } catch (error) {
+      console.error(error);
+      return res.status(500).json({ message: 'Unexpected error during resource retrieval' });
+    }
+  },
+
+  
 }
 
 module.exports = resourceController;
