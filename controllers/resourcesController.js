@@ -47,9 +47,18 @@ const resourceController = {
 
   getResources: async (req, res) => {
     try {
-      const resource = await Resource.find();
+      const resources = await Resource.find();
+      const courses = await Course.find();
+      // Map each resource to its course title
+      const populatedResources = resources.map(resource => {
+        const matchedCourse = courses.find(course => course._id.toString() === resource.assignedCourse);
+        return {
+          ...resource.toObject(),
+          assignedCourseTitle: matchedCourse ? matchedCourse.title : null
+        };
+      });
 
-      return res.status(200).json({ resource });
+      return res.status(200).json({ resource: populatedResources });
     } catch (error) {
       console.error(error);
       res.status(400).json(error);
@@ -105,11 +114,11 @@ const resourceController = {
         return res.status(404).json({ message: 'No courses found' });
       }
 
-      // Filter courses by instructorId or assignedTutors
-      const filteredCourses = courses.filter(course => (
-        course.instructorId?.toString() === userId ||
-        (Array.isArray(course.assignedTutors) && course.assignedTutors.map(id => id.toString()).includes(userId))
-      ));
+        // Filter courses by instructorId or assignedTutors
+        const filteredCourses = courses.filter(course => (
+          course.instructorId?.toString() === userId ||
+          (Array.isArray(course.assignedTutors) && course.assignedTutors.map(id => id.toString()).includes(userId))
+        ));
 
       if (filteredCourses.length === 0) {
         return res.status(404).json({ message: 'No courses found for this tutor' });
@@ -120,10 +129,18 @@ const resourceController = {
 
       // Find all resources assigned to these courses
       const resources = await Resource.find({ assignedCourse: { $in: courseIds } });
+      // Map each resource to its course title
+      const populatedResources = resources.map(resource => {
+        const matchedCourse = filteredCourses.find(course => course._id.toString() === resource.assignedCourse);
+        return {
+          ...resource.toObject(),
+          assignedCourseTitle: matchedCourse ? matchedCourse.title : null
+        };
+      });
 
       return res.status(200).json({ 
         message: 'Tutor resources retrieved successfully',
-        resources,
+        resources: populatedResources,
         totalResources: resources.length
       });
     } catch (error) {
