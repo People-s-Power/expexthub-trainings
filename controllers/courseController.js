@@ -200,9 +200,18 @@ const courseController = {
             authorId: userId,
         }))]
         // Check if the user has the necessary role to add a course
-        const allowedRoles = ['tutor', 'admin', 'super admin'];
+        const allowedRoles = ['tutor', 'admin', 'super admin', 'super-admin'];
         if (!user || !allowedRoles.includes(user.role)) {
             return res.status(403).json({ message: 'Permission denied. Only tutors and admins can add courses' });
+        }
+
+        if (type === "online") {
+            const allowedMeetingModes = ["zoom", "google"];
+            if (!meetingType || !allowedMeetingModes.includes(meetingType)) {
+                return res.status(400).json({
+                    message: "Invalid meetingType. Please select either zoom or google.",
+                });
+            }
         }
 
 
@@ -346,7 +355,8 @@ const courseController = {
                     "Saturday": 6
                 };
 
-                if (newCourse.meetingType === "zoom") {
+                // meeting provider is stored as `meetingMode` on the course model
+                if (newCourse.meetingMode === "zoom") {
                     const getZoomWeeklyDaysFormat = (days) => {
                         return days
                             .filter(day => day.checked)
