@@ -214,6 +214,14 @@ const courseController = {
             }
         }
 
+        const scholarshipIds = Array.isArray(scholarship)
+            ? scholarship.filter((id) => mongoose.Types.ObjectId.isValid(id))
+            : [];
+
+        const audienceIds = Array.isArray(audience)
+            ? audience.filter((id) => mongoose.Types.ObjectId.isValid(id))
+            : [];
+
 
         if (user.role === "tutor" && ((user.premiumPlan === "basic" && coursesByUser.length >= 5) || user.premiumPlan === "standard" && coursesByUser.length >= 20)) {
             return res.status(403).json({ message: 'Your have exceeded your plan limit for courses', showPop: true });
@@ -266,8 +274,8 @@ const courseController = {
                 strikedFee,
                 modules,
                 benefits,
-                enrolledStudents: scholarship ? scholarship : [],
-                audience,
+                enrolledStudents: scholarshipIds,
+                audience: audienceIds,
                 thumbnail: {
                     type: req.body.asset.type,
                     url: cloudFile
@@ -285,14 +293,14 @@ const courseController = {
             const course = await Course.create(newCourse);
 
             // Handle scholarship students by adding them to the enrollments array as well
-            if (scholarship && Array.isArray(scholarship) && scholarship.length > 0) {
+            if (scholarshipIds.length > 0) {
                 // Initialize enrollments array if it doesn't exist
                 if (!course.enrollments) {
                     course.enrollments = [];
                 }
 
                 // Add each scholarship student to enrollments array with proper metadata
-                scholarship.forEach(studentId => {
+                scholarshipIds.forEach(studentId => {
                     course.enrollments.push({
                         user: studentId,
                         status: 'active',
