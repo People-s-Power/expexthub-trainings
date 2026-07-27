@@ -13,7 +13,6 @@ const { default: axios } = require("axios");
 const jwt = require('jsonwebtoken');
 const { logger } = require("handlebars");
 
-const verificationCode = generateVerificationCode();
 
 
 
@@ -139,6 +138,10 @@ const authControllers = {
         password,
       } = req.body;
 
+      if (!userType || !fullname || !email || !password) {
+        return res.status(400).json({ message: "Please fill all required fields" });
+      }
+
       const lowercasedUserType = userType.toLowerCase();
       const role = determineRole(lowercasedUserType);
 
@@ -150,14 +153,15 @@ const authControllers = {
         return res.status(400).json({ message: "User already registered" });
       }
 
+      // Generate a unique verification code per user
+      const verificationCode = generateVerificationCode();
+
       const hashPassword = bcrypt.hashSync(password, 10);
       const newUser = new User({
         username: email.toLowerCase(),
         email: email.toLowerCase(),
         fullname,
         phone,
-        // country,
-        // state,
         address,
         role,
         verificationCode,
@@ -166,15 +170,6 @@ const authControllers = {
       });
 
       await newUser.save();
-
-      // await axios.post(`${process.env.PEOPLES_POWER_API}/api/v5/auth/sync`, {
-      //   email,
-      //   name: fullname,
-      //   country,
-      //   state,
-      //   userType,
-      //   password: hashPassword
-      // });
 
       await sendVerificationEmail(newUser.email, verificationCode);
       res.status(200).json({ message: "Verification code sent to email", id: newUser._id });
@@ -300,61 +295,61 @@ const authControllers = {
   },
 
   login: async (req, res) => {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ message: "Missing fields" });
-    }
-    console.log(email);
+    try {
+      const { email, password } = req.body;
+      if (!email || !password) {
+        return res.status(400).json({ message: "Missing fields" });
+      }
 
-    const user = await User.findOne({ email: email.toLowerCase() });
-    // console.log(user);
+      const user = await User.findOne({ email: email.toLowerCase() });
 
-    if (!user) {
-      return res.status(401).json({ message: "Incorrect Email or Password!" });
-    }
+      if (!user) {
+        return res.status(401).json({ message: "Incorrect Email or Password!" });
+      }
 
-    if (user.blocked) {
-      return res.status(401).json({ message: "User Blocked!" });
-    }
+      if (user.blocked) {
+        return res.status(401).json({ message: "User Blocked!" });
+      }
 
-    // Password matching
-    const isMatch = bcrypt.compareSync(password, user.password ?? "");
+      // Password matching
+      const isMatch = bcrypt.compareSync(password, user.password ?? "");
 
-    if (!isMatch) {
-      return res.status(401).json({ message: "Incorrect Email or Password" });
-    }
+      if (!isMatch) {
+        return res.status(401).json({ message: "Incorrect Email or Password" });
+      }
 
-    // generate jwt
-    const payload = {
-      fullName: user.fullname,
-
-      id: user._id, // Use tutorId for team_member
-      email: user.email,
-      role: user.role,
-      emailVerification: user.isVerified,
-      profilePicture: user.profilePicture,
-    };
-    const accessToken = jwt.sign(payload, process.env.JWT_SECRET, {
-      expiresIn: "24h",
-    });
-
-
-    res.status(201).json({
-      message: "Successfully logged in",
-      accessToken,
-      user: {
+      // generate jwt
+      const payload = {
         fullName: user.fullname,
         id: user._id,
         email: user.email,
         role: user.role,
         emailVerification: user.isVerified,
-        assignedCourse: user.assignedCourse,
-        profilePicture: user.image,
-        otherCourse: user.otherCourse,
-        isGoogleLinked: user.isGoogleLinked,
-      },
-    });
+        profilePicture: user.profilePicture,
+      };
+      const accessToken = jwt.sign(payload, process.env.JWT_SECRET, {
+        expiresIn: "24h",
+      });
 
+      res.status(200).json({
+        message: "Successfully logged in",
+        accessToken,
+        user: {
+          fullName: user.fullname,
+          id: user._id,
+          email: user.email,
+          role: user.role,
+          emailVerification: user.isVerified,
+          assignedCourse: user.assignedCourse,
+          profilePicture: user.image,
+          otherCourse: user.otherCourse,
+          isGoogleLinked: user.isGoogleLinked,
+        },
+      });
+    } catch (error) {
+      console.error("Login error:", error);
+      return res.status(500).json({ message: "Unexpected error during login" });
+    }
   },
 
   loginWithToken: async (req, res) => {
@@ -434,16 +429,22 @@ const authControllers = {
   },
 
   forgotPassword: async (req, res) => {
-    const { email } = req.body;
-    const user = await User.findOne({ email });
-    if (!user)
-      return res.status(400).send({
-        message: "An account with " + req.body.email + " does not exist!",
-      });
-
     try {
+      const { email } = req.body;
+      if (!email) {
+        return res.status(400).json({ message: "Email is required" });
+      }
+
+      const user = await User.findOne({ email: email.toLowerCase() });
+      if (!user)
+        return res.status(400).send({
+          message: "An account with " + email + " does not exist!",
+        });
+
+      // Generate a fresh verification code per request
+      const verificationCode = generateVerificationCode();
+
       await sendVerificationEmail(user.email, verificationCode);
-      // console.log(verificationCode)
       user.verificationCode = verificationCode;
       await user.save();
 
@@ -454,7 +455,7 @@ const authControllers = {
       console.error(error);
       return res
         .status(500)
-        .json({ message: "Unexpected error during verification" });
+        .json({ message: "Unexpected error during password reset" });
     }
   },
 

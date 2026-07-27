@@ -72,19 +72,8 @@ app.use(
 // Connect to database
 connect();
 
-app.get("/", async (req, res) => {
-  try {
-    const user = await User.updateMany({ email: "admin123@gmail.com" });
-    user.isGoogleLinked = false;
-    (user.googleId = null),
-      (user.googleRefreshToken = null),
-      (user.googleAccessToken = null),
-      await user.save();
-    res.status(200).json({ message: "Done" });
-  } catch (error) {
-    console.log(error);
-    res.status(400).json({ message: "Bad request exception" });
-  }
+app.get("/", (req, res) => {
+  res.status(200).json({ message: "Experthub Trainings API is running" });
 });
 // Routes
 app.use("/auth", authRoute);

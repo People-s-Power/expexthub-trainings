@@ -528,7 +528,7 @@ const courseController = {
             course.enrolledStudents.push(id);
             course.enrollments.push({
                 user: id,
-                staus: 'active',
+                status: 'active',
                 enrolledOn: new Date()
             });
             await course.save();
@@ -858,31 +858,42 @@ const courseController = {
 
     renewCourse: async (req, res) => {
         const courseId = req.params.courseId;
-        const id = req.params.id
+        const id = req.params.id;
 
         try {
             const course = await Course.findById(courseId);
+            if (!course) {
+                return res.status(404).json({ message: 'Course not found' });
+            }
+
             const user = await User.findById(id);
+            if (!user) {
+                return res.status(404).json({ message: 'User not found' });
+            }
 
             const student = course.enrollments.find(student => student.user.toString() === id);
             if (!student) {
                 return res.status(400).json({ message: 'Student is not enrolled in this course' });
             }
 
-            student.status = 'active'
-            student.enrolledOn = new Date()
+            student.status = 'active';
+            student.enrolledOn = new Date();
             await course.save();
 
             if (course.fee > 0) {
-                await Transaction.create({
-                    userId: course.instructorId,
-                    amount: course.fee,
-                    type: 'credit'
-                })
-                const amountToAdd = course.fee * 0.95;
-                author.balance += amountToAdd
-                await author.save();
+                const author = await User.findById(course.instructorId);
+                if (author) {
+                    await Transaction.create({
+                        userId: author._id,
+                        amount: course.fee,
+                        type: 'credit'
+                    });
+                    const amountToAdd = course.fee * 0.95;
+                    author.balance += amountToAdd;
+                    await author.save();
+                }
             }
+
             await Notification.create({
                 title: "Course enrollment renewal",
                 content: `${user.fullname} Just renewed enrollment for your Course ${course.title}`,
