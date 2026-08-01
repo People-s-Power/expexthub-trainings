@@ -501,7 +501,7 @@ const courseController = {
     enrollCourse: async (req, res) => {
         const courseId = req.params.courseId;
 
-        const { id } = req.body
+        const id = req.user?.id || req.body.id
 
         try {
 

@@ -412,6 +412,13 @@ const authControllers = {
       // Return information to populate dashboard
       return res.status(201).json({
         message: "Successfully Registered a Student",
+        accessToken: jwt.sign({
+          fullName: user.fullname,
+          id: user._id,
+          email: user.email,
+          role: user.role,
+          emailVerification: true,
+        }, process.env.JWT_SECRET, { expiresIn: "24h" }),
         user: {
           fullName: user.fullname,
           id: user._id,

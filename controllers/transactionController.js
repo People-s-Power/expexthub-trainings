@@ -2,11 +2,105 @@ const { log } = require("handlebars");
 const Transaction = require("../models/transactions.js");
 const User = require("../models/user.js");
 const axios = require("axios");
+const Course = require("../models/courses.js");
+const Notification = require("../models/notifications.js");
+const crypto = require("crypto");
 
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
 const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
 
+const flwHeaders = { Authorization: `Bearer ${flutterwaveSecretKey}` };
+
+async function grantCourseEnrollment(transaction) {
+  if (!transaction.courseId || !transaction.userId) return;
+  const course = await Course.findById(transaction.courseId);
+  const user = await User.findById(transaction.userId);
+  if (!course || !user) throw new Error('Course or student not found');
+
+  const alreadyEnrolled = course.enrolledStudents.some(id => String(id) === String(user._id));
+  if (!alreadyEnrolled) {
+    course.enrolledStudents.addToSet(user._id);
+    course.enrollments.push({ user: user._id, status: 'active', enrolledOn: new Date().toISOString() });
+    await course.save();
+    user.contact = false;
+    await user.save();
+    await Notification.create({
+      title: 'Course enrolled',
+      content: `${user.fullname} Just enrolled for your Course ${course.title}`,
+      contentId: course._id,
+      userId: course.instructorId,
+    });
+    if (course.instructorId && course.fee > 0) {
+      const instructor = await User.findByIdAndUpdate(course.instructorId, { $inc: { balance: course.fee * 0.95 } }, { new: true });
+      if (instructor) await Transaction.create({ userId: instructor._id, courseId: course._id, amount: course.fee, type: 'credit', status: 'successful', txRef: `course-credit-${transaction.txRef}` });
+    }
+  }
+}
+
 const transactionController = {
+  initializeCoursePayment: async (req, res) => {
+    try {
+      const userId = req.user.id;
+      const { courseId, redirect_url } = req.body;
+      const [course, user] = await Promise.all([Course.findById(courseId), User.findById(userId)]);
+      if (!course) return res.status(404).json({ message: 'Course not found' });
+      if (!user || user.role !== 'student') return res.status(403).json({ message: 'Only students can enroll' });
+      if (!user.isVerified) return res.status(403).json({ message: 'Please verify your email before paying' });
+      if (course.enrolledStudents.some(id => String(id) === String(user._id))) return res.status(409).json({ message: 'Student is already enrolled in the course' });
+      const amount = Number(course.fee || 0);
+      if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ message: 'This course does not require payment' });
+
+      const txRef = `course-${course._id}-${user._id}-${crypto.randomUUID()}`;
+      await Transaction.create({ userId, courseId, amount, txRef, type: 'course_payment', status: 'pending', currency: 'NGN', metadata: { title: course.title } });
+      const response = await axios.post(`${flutterwaveBaseURL}payments`, {
+        tx_ref: txRef, amount, currency: 'NGN', redirect_url,
+        customer: { email: user.email, name: user.fullname, phonenumber: user.phone || undefined },
+        customizations: { title: 'ExpertHub Training', description: `Enrollment for ${course.title}` },
+        meta: { userId: String(userId), courseId: String(courseId) },
+      }, { headers: flwHeaders });
+      if (response.data?.status !== 'success' || !response.data?.data?.link) throw new Error('Payment gateway did not return a checkout link');
+      return res.status(201).json({ link: response.data.data.link, txRef });
+    } catch (error) {
+      console.error('Course payment initialization failed:', error.response?.data || error.message);
+      return res.status(502).json({ message: 'Unable to start payment. Please try again.' });
+    }
+  },
+
+  verifyCoursePayment: async (req, res) => {
+    try {
+      const transaction = await Transaction.findOne({ txRef: req.params.txRef });
+      if (!transaction || transaction.type !== 'course_payment') return res.status(404).json({ message: 'Payment not found' });
+      if (transaction.status !== 'successful') {
+        const gatewayId = req.query.id || transaction.gatewayTransactionId;
+        if (!gatewayId) return res.status(409).json({ message: 'Payment is still pending' });
+        const response = await axios.get(`${flutterwaveBaseURL}transactions/${gatewayId}/verify`, { headers: flwHeaders });
+        const payment = response.data?.data;
+        if (response.data?.status !== 'success' || payment?.status !== 'successful' || payment?.tx_ref !== transaction.txRef || Number(payment.amount) !== Number(transaction.amount) || payment.currency !== transaction.currency) return res.status(400).json({ message: 'Payment could not be confirmed' });
+        transaction.gatewayTransactionId = String(payment.id);
+        transaction.status = 'successful';
+        await transaction.save();
+      }
+      await grantCourseEnrollment(transaction);
+      return res.json({ message: 'Payment confirmed', courseId: transaction.courseId });
+    } catch (error) {
+      console.error('Course payment verification failed:', error.response?.data || error.message);
+      return res.status(502).json({ message: 'Payment confirmation is temporarily unavailable. Please try again.' });
+    }
+  },
+
+  flutterwaveWebhook: async (req, res) => {
+    if (!process.env.FLUTTERWAVE_WEBHOOK_HASH || req.headers['verif-hash'] !== process.env.FLUTTERWAVE_WEBHOOK_HASH) return res.sendStatus(401);
+    res.sendStatus(200);
+    try {
+      const payment = req.body?.data;
+      const transaction = await Transaction.findOne({ txRef: payment?.tx_ref, type: 'course_payment' });
+      if (!transaction || payment.status !== 'successful' || Number(payment.amount) !== Number(transaction.amount) || payment.currency !== transaction.currency) return;
+      transaction.gatewayTransactionId = String(payment.id);
+      transaction.status = 'successful';
+      await transaction.save();
+      await grantCourseEnrollment(transaction);
+    } catch (error) { console.error('Flutterwave webhook processing failed:', error); }
+  },
   getBalance: async (req, res) => {
     const { userId } = req.params;
 

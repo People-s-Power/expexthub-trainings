@@ -1,6 +1,7 @@
 const express = require('express');
 const courseController = require('../controllers/courseController.js');
 const Course = require('../models/courses.js');
+const authenticate = require('../middlewares/auth.js');
 
 const courseRouter = express.Router();
 
@@ -29,7 +30,7 @@ courseRouter.get("/single-course/:courseId", courseController.getCourseById)
 // courseRouter.post("/addCourseResources/:courseId", courseController.addCourseResources);
 //course enroll route
 courseRouter.get("/admissions/:courseId", courseController.getEnrolledStudents);
-courseRouter.post("/enroll/:courseId", courseController.enrollCourse);
+courseRouter.post("/enroll/:courseId", authenticate, courseController.enrollCourse);
 courseRouter.post("/assign/:courseId", courseController.assignTutor);
 
 courseRouter.get("/enrolled-courses/:userId", courseController.getEnrolledCourses);
