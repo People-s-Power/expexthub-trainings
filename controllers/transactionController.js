@@ -44,7 +44,7 @@ const transactionController = {
       const { courseId, redirect_url } = req.body;
       const [course, user] = await Promise.all([Course.findById(courseId), User.findById(userId)]);
       if (!course) return res.status(404).json({ message: 'Course not found' });
-      if (!user || user.role !== 'student') return res.status(403).json({ message: 'Only students can enroll' });
+      if (!user || !['student', 'client'].includes(user.role)) return res.status(403).json({ message: 'Only students can enroll' });
       if (!user.isVerified) return res.status(403).json({ message: 'Please verify your email before paying' });
       if (course.enrolledStudents.some(id => String(id) === String(user._id))) return res.status(409).json({ message: 'Student is already enrolled in the course' });
       const amount = Number(course.fee || 0);

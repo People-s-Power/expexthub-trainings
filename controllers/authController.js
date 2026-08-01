@@ -138,7 +138,7 @@ const authControllers = {
         password,
       } = req.body;
 
-      if (!userType || !fullname || !email || !password) {
+      if (!userType || !fullname || !email || !password || !state) {
         return res.status(400).json({ message: "Please fill all required fields" });
       }
 
@@ -162,6 +162,8 @@ const authControllers = {
         email: email.toLowerCase(),
         fullname,
         phone,
+        country,
+        state,
         address,
         role,
         verificationCode,
