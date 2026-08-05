@@ -65,13 +65,25 @@ const courseSchema = new mongoose.Schema({
             ref: 'User',
         },
         enrolledOn: {
-            type: String
+            type: Date
         },
         status: {
-            type: String
+            type: String,
+            enum: ['active', 'payment_plan_active', 'expired', 'suspended', 'scholarship'],
+            default: 'active'
         },
         updatedAt: {
-            type: String
+            type: Date
+        },
+        // Scholarship metadata was previously pushed by the controller but had no
+        // schema path, so Mongoose silently discarded it and grants were untraceable.
+        scholarship: {
+            type: Boolean,
+            default: false
+        },
+        grantedBy: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'User',
         }
     }],
     days: [{
@@ -105,13 +117,32 @@ const courseSchema = new mongoose.Schema({
     },
     benefits: [{
         type: String
-    }]
-});
+    }],
+    // Optional seat cap. Null/absent means unlimited, preserving existing behaviour
+    // for every course created before capacity existed.
+    capacity: {
+        type: Number,
+        min: 1,
+        required: false
+    },
+    enrollmentDeadline: {
+        type: Date,
+        required: false
+    }
+}, { timestamps: true });
+
+// "Which courses is this student enrolled in?" runs on every dashboard load;
+// without these it is a full collection scan per request.
+courseSchema.index({ enrolledStudents: 1 });
+courseSchema.index({ 'enrollments.user': 1 });
+courseSchema.index({ instructorId: 1 });
+courseSchema.index({ approved: 1, category: 1 });
 
 
 //populate enrolled students
 courseSchema.methods.populateEnrolledStudents = async function () {
-    await this.populate('enrolledStudents').execPopulate();
+    // execPopulate() was removed in Mongoose 6; document.populate() now returns a promise.
+    await this.populate('enrolledStudents');
 };
 
 

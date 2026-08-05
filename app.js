@@ -1,6 +1,7 @@
 require("dotenv/config");
 const express = require("express");
 const cors = require("cors");
+const mongoose = require("mongoose");
 const fileUpload = require("express-fileupload");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -36,9 +37,38 @@ const { default: axios } = require("axios");
 
 const app = express();
 const server = http.createServer(app);
+
+// Origin allowlist. `origin: "*"` together with `credentials: true` is rejected by
+// browsers, so the previous config silently broke any credentialed request. When no
+// allowlist is configured we stay permissive but drop credentials, which is the only
+// spec-valid form of a wildcard.
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  process.env.TRAINING_URL,
+  ...(process.env.ALLOWED_ORIGINS || "").split(","),
+]
+  .map((value) => (value || "").trim().replace(/\/$/, ""))
+  .filter(Boolean);
+
+const corsOptions = allowedOrigins.length
+  ? {
+      origin: (origin, callback) => {
+        // No Origin header: same-origin, curl, or server-to-server (e.g. the gateway webhook).
+        if (!origin) return callback(null, true);
+        const normalized = origin.replace(/\/$/, "");
+        if (allowedOrigins.includes(normalized)) return callback(null, true);
+        return callback(new Error("Not allowed by CORS"));
+      },
+      credentials: true,
+      methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization", "verif-hash"],
+      maxAge: 86400,
+    }
+  : { origin: "*", credentials: false };
+
 const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: allowedOrigins.length ? allowedOrigins : "*",
     methods: ["GET", "POST"],
   },
 });
@@ -46,14 +76,12 @@ const io = new Server(server, {
 const PORT = process.env.PORT || 3002;
 startCronJobs();
 // Middleware
-app.use(
-  cors({
-    origin: "*",
-    allowedHeaders: ["*"],
-    methods: ["*"],
-    credentials: true,
-  })
-);
+app.use(cors(corsOptions));
+
+// Behind a load balancer / reverse proxy, req.ip must come from X-Forwarded-For or
+// every request looks like it originates from the proxy and rate limiting keys collide.
+app.set("trust proxy", 1);
+app.disable("x-powered-by");
 
 app.use(express.urlencoded({ extended: false }));
 app.use(bodyParser.json({ limit: "35mb" }));
@@ -90,6 +118,59 @@ app.use("/appointment", appointmentRouter);
 app.use("/certificate", certificateRouter);
 app.use("/start-up-kit", startUpKitRouter);
 app.use("/workspace", workspaceRouter);
+
+app.get("/health", (req, res) => {
+  const states = ["disconnected", "connected", "connecting", "disconnecting"];
+  const state = states[mongoose.connection.readyState] || "unknown";
+  const healthy = mongoose.connection.readyState === 1;
+  res.status(healthy ? 200 : 503).json({ status: healthy ? "ok" : "degraded", database: state });
+});
+
+app.use((req, res) => {
+  res.status(404).json({ message: `Route ${req.method} ${req.originalUrl} not found` });
+});
+
+// Global error handler. Without this, a throw inside a route left the request hanging
+// until the client timed out, and stack traces could leak to the response body.
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error);
+
+  if (error?.message === "Not allowed by CORS") {
+    return res.status(403).json({ message: "Origin not allowed" });
+  }
+  // Malformed ObjectId in a route param would otherwise surface as a 500.
+  if (error?.name === "CastError") {
+    return res.status(400).json({ message: `Invalid ${error.path}` });
+  }
+  if (error?.name === "ValidationError") {
+    return res.status(400).json({ message: Object.values(error.errors || {}).map((e) => e.message).join(", ") || "Validation failed" });
+  }
+  if (error?.code === 11000) {
+    return res.status(409).json({ message: "This record already exists" });
+  }
+  if (error?.type === "entity.too.large") {
+    return res.status(413).json({ message: "Upload is too large" });
+  }
+  if (error instanceof SyntaxError && "body" in error) {
+    return res.status(400).json({ message: "Malformed JSON body" });
+  }
+
+  console.error("Unhandled error:", req.method, req.originalUrl, error);
+  return res.status(500).json({ message: "Something went wrong. Please try again." });
+});
+
+// A rejected promise or uncaught throw outside the request cycle would otherwise kill
+// the process silently mid-payment. Log it and let the orchestrator restart us.
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled promise rejection:", reason);
+});
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught exception:", error);
+});
+process.on("SIGTERM", () => {
+  console.log("SIGTERM received, closing server");
+  server.close(() => process.exit(0));
+});
 
 // Socket.io logic
 io.on("connection", async (socket) => {

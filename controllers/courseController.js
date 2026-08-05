@@ -16,6 +16,7 @@ const isSameOrAfter = require("dayjs/plugin/isSameOrAfter.js");
 const LearningEvent = require("../models/event.js");
 const { createGoogleMeet } = require("../utils/createGoogleMeeting.js");
 const { default: mongoose } = require("mongoose");
+const { creditInstructor } = require("../services/coursePaymentService.js");
 
 dayjs.extend(isBetween)
 dayjs.extend(isSameOrAfter)
@@ -502,62 +503,116 @@ const courseController = {
     enrollCourse: async (req, res) => {
         const courseId = req.params.courseId;
 
-        const id = req.user?.id || req.body.id
+        // Always the authenticated user. Honouring req.body.id here let any signed-in
+        // account enrol somebody else, and let a student enrol into a paid course by
+        // passing the id of a user who had already paid.
+        const id = req.user?.id || req.user?._id;
 
         try {
+            if (!id) {
+                return res.status(401).json({ message: 'Authentication required' });
+            }
 
-            const course = await Course.findById(courseId);
-            const user = await User.findById(id);
+            const [course, user] = await Promise.all([
+                Course.findById(courseId),
+                User.findById(id),
+            ]);
             if (!course) {
                 return res.status(404).json({ message: 'Course not found' });
             }
             if (!user) {
                 return res.status(404).json({ message: 'User not found' });
             }
-            // console.log(course);
-            // Check if the student is already enrolled
+            if (user.blocked) {
+                return res.status(403).json({ message: 'Your account is not permitted to enroll' });
+            }
+            if (!user.isVerified) {
+                return res.status(403).json({ message: 'Please verify your email before enrolling' });
+            }
+            if (!course.approved) {
+                return res.status(403).json({ message: 'This course is not open for enrollment yet' });
+            }
+            if (String(course.instructorId) === String(id)) {
+                return res.status(400).json({ message: 'You cannot enroll in your own course' });
+            }
+            if (course.enrollmentDeadline && new Date(course.enrollmentDeadline) < new Date()) {
+                return res.status(409).json({ message: 'Enrollment for this course has closed' });
+            }
             if ((course.enrolledStudents || []).some(studentId => String(studentId) === String(id))) {
-                return res.status(400).json({ message: 'Student is already enrolled in the course' });
+                return res.status(409).json({ message: 'Student is already enrolled in the course' });
+            }
+            if (course.capacity && (course.enrolledStudents || []).length >= course.capacity) {
+                return res.status(409).json({ message: 'This course is full' });
             }
 
             // Paid courses can only be accessed after a server-confirmed payment.
             // Free and scholarship enrollments continue to use this endpoint.
             if (Number(course.fee || 0) > 0) {
-                const [paidTransaction, completedPlan] = await Promise.all([
-                    Transaction.findOne({ userId: id, courseId, type: 'course_payment', status: 'successful' }),
-                    CoursePaymentPlan.findOne({ userId: id, courseId, status: 'completed' }),
+                const [paidTransaction, activePlan] = await Promise.all([
+                    Transaction.findOne({
+                        userId: id,
+                        courseId,
+                        type: { $in: ['course_payment', 'course_payment_wallet'] },
+                        status: 'successful',
+                    }),
+                    // Any plan with at least one installment paid already grants access,
+                    // so a part-paid student is not blocked from the course they bought.
+                    CoursePaymentPlan.findOne({
+                        userId: id,
+                        courseId,
+                        status: { $in: ['active', 'completed', 'overdue'] },
+                        amountPaidMinor: { $gt: 0 },
+                    }),
                 ]);
-                if (!paidTransaction && !completedPlan) {
+                if (!paidTransaction && !activePlan) {
                     return res.status(402).json({ message: 'Please complete payment before enrolling in this course' });
                 }
             }
 
-            // const student = course.enrollments.find(student => student.user.toString() === id);
+            // Conditional write: two concurrent requests cannot both append an
+            // enrollment, and the capacity ceiling is re-checked atomically.
+            const capacityFilter = course.capacity
+                ? { [`enrolledStudents.${course.capacity - 1}`]: { $exists: false } }
+                : {};
+            const result = await Course.updateOne(
+                { _id: course._id, enrolledStudents: { $ne: user._id }, ...capacityFilter },
+                {
+                    $addToSet: { enrolledStudents: user._id },
+                    $push: {
+                        enrollments: {
+                            user: user._id,
+                            status: 'active',
+                            enrolledOn: new Date(),
+                        },
+                    },
+                },
+            );
+            if (result.modifiedCount === 0) {
+                const fresh = await Course.findById(course._id).select('enrolledStudents capacity').lean();
+                const nowEnrolled = (fresh?.enrolledStudents || []).some(studentId => String(studentId) === String(id));
+                if (nowEnrolled) {
+                    return res.status(409).json({ message: 'Student is already enrolled in the course' });
+                }
+                return res.status(409).json({ message: 'This course is full' });
+            }
 
-            // if (student) {
-            //     return res.status(400).json({ message: 'Student is already enrolled in the course' });
-            // }
-            // Enroll the student in the course
-            course.enrolledStudents.push(id);
-            course.enrollments.push({
-                user: id,
-                status: 'active',
-                enrolledOn: new Date()
-            });
-            await course.save();
-            user.contact = false
-            await user.save()
+            await User.updateOne({ _id: user._id }, { $set: { contact: false } });
 
-            await Notification.create({
-                title: "Course enrolled",
-                content: `${user.fullname} Just enrolled for your Course ${course.title}`,
-                contentId: course._id,
-                userId: course.instructorId,
-            });
+            // A failed notification must not fail an accepted enrollment.
+            try {
+                await Notification.create({
+                    title: "Course enrolled",
+                    content: `${user.fullname} just enrolled for your course ${course.title}`,
+                    contentId: course._id,
+                    userId: course.instructorId,
+                });
+            } catch (notificationError) {
+                console.error('Enrollment notification failed:', notificationError.message);
+            }
 
-            return res.status(200).json({ message: 'Enrolled successfully' });
+            return res.status(200).json({ message: 'Enrolled successfully', courseId: course._id });
         } catch (error) {
-            console.error(error);
+            console.error('Enrollment failed:', error);
             return res.status(500).json({ message: 'Unexpected error during enrollment' });
         }
     },
@@ -872,163 +927,179 @@ const courseController = {
             if (!user) {
                 return res.status(404).json({ message: 'User not found' });
             }
+            if (user.blocked) {
+                return res.status(403).json({ message: 'This account is not permitted to enroll' });
+            }
 
-            const student = course.enrollments.find(student => student.user.toString() === id);
-            if (!student) {
+            const enrollment = course.enrollments.find(item => String(item.user) === String(id));
+            if (!enrollment) {
                 return res.status(400).json({ message: 'Student is not enrolled in this course' });
             }
 
-            student.status = 'active';
-            student.enrolledOn = new Date();
-            await course.save();
+            // Atomic + conditional: only renew if the enrollment is not already active,
+            // so repeated clicks cannot re-trigger the instructor credit below.
+            const renewedAt = new Date();
+            const result = await Course.updateOne(
+                { _id: course._id, enrollments: { $elemMatch: { user: user._id, status: { $ne: 'active' } } } },
+                {
+                    $set: {
+                        'enrollments.$.status': 'active',
+                        'enrollments.$.enrolledOn': renewedAt,
+                        'enrollments.$.updatedAt': renewedAt,
+                    },
+                },
+            );
+            if (result.modifiedCount === 0) {
+                return res.status(409).json({ message: 'This enrollment is already active' });
+            }
 
             if (course.fee > 0) {
-                const author = await User.findById(course.instructorId);
-                if (author) {
-                    await Transaction.create({
-                        userId: author._id,
-                        amount: course.fee,
-                        type: 'credit'
-                    });
-                    const amountToAdd = course.fee * 0.95;
-                    author.balance += amountToAdd;
-                    await author.save();
+                // creditInstructor is idempotent on txRef and uses an atomic $inc, so a
+                // retried renewal cannot credit the instructor twice. The previous
+                // read-modify-write (author.balance += ...) could, and did.
+                try {
+                    await creditInstructor(
+                        {
+                            courseId: course._id,
+                            txRef: `renewal-${course._id}-${user._id}-${renewedAt.getTime()}`,
+                        },
+                        Number(course.fee),
+                    );
+                } catch (creditError) {
+                    console.error('Renewal instructor credit failed:', creditError.message);
                 }
             }
 
-            await Notification.create({
-                title: "Course enrollment renewal",
-                content: `${user.fullname} Just renewed enrollment for your Course ${course.title}`,
-                contentId: course._id,
-                userId: course.instructorId,
-            });
+            try {
+                await Notification.create({
+                    title: "Course enrollment renewal",
+                    content: `${user.fullname} just renewed enrollment for your course ${course.title}`,
+                    contentId: course._id,
+                    userId: course.instructorId,
+                });
+            } catch (notificationError) {
+                console.error('Renewal notification failed:', notificationError.message);
+            }
+
             return res.status(200).json({ message: 'Renewed successfully' });
 
         } catch (error) {
-            console.error(error);
+            console.error('Course renewal failed:', error);
             return res.status(500).json({ message: 'Unexpected error during renewal' });
         }
     },
 
     giveScholarship: async (req, res) => {
         const courseId = req.params.courseId;
-        const { studentIds } = req.body; // Array of student IDs to give scholarships to
+        const { studentIds } = req.body;
+        const grantedBy = req.user?.id || req.user?._id;
 
         try {
-            const course = await Course.findById(courseId);
-
-            if (!course) {
-                return res.status(404).json({ message: 'Course not found' });
-            }
-
-            // Validate that studentIds is an array
             if (!Array.isArray(studentIds) || studentIds.length === 0) {
                 return res.status(400).json({ message: 'Please provide an array of student IDs' });
             }
+            // Limit bulk operations to prevent accidental mass grants.
+            if (studentIds.length > 100) {
+                return res.status(400).json({ message: 'Cannot grant scholarships to more than 100 students at once' });
+            }
 
-            // Validate that all student IDs exist
-            const students = await User.find({ _id: { $in: studentIds } });
+            const course = await Course.findById(courseId);
+            if (!course) {
+                return res.status(404).json({ message: 'Course not found' });
+            }
+            if (!course.approved) {
+                return res.status(403).json({ message: 'Cannot grant scholarships for an unapproved course' });
+            }
+
+            const students = await User.find({ _id: { $in: studentIds }, blocked: false });
             if (students.length !== studentIds.length) {
-                return res.status(400).json({ message: 'One or more student IDs are invalid' });
+                return res.status(400).json({ message: 'One or more student IDs are invalid or blocked' });
             }
 
             const scholarshipResults = [];
             const failedEnrollments = [];
 
-            for (const studentId of studentIds) {
+            for (const student of students) {
                 try {
-                    // Check if student is already enrolled
-                    const isAlreadyEnrolled = course.enrolledStudents.includes(studentId) ||
-                        course.enrollments?.find(enrollment => enrollment.user.toString() === studentId);
-
-                    if (isAlreadyEnrolled) {
-                        failedEnrollments.push({
-                            studentId,
-                            reason: 'Student is already enrolled in this course'
-                        });
+                    const alreadyEnrolled = (course.enrolledStudents || []).some(id => String(id) === String(student._id));
+                    if (alreadyEnrolled) {
+                        failedEnrollments.push({ studentId: student._id, reason: 'Already enrolled' });
+                        continue;
+                    }
+                    if (course.capacity && (course.enrolledStudents || []).length >= course.capacity) {
+                        failedEnrollments.push({ studentId: student._id, reason: 'Course is full' });
                         continue;
                     }
 
-                    // Add student to enrolledStudents array
-                    course.enrolledStudents.push(studentId);
+                    // Conditional atomic write: prevent two concurrent scholarship grants
+                    // from both appending the same student.
+                    const capacityFilter = course.capacity
+                        ? { [`enrolledStudents.${course.capacity - 1}`]: { $exists: false } }
+                        : {};
+                    const result = await Course.updateOne(
+                        { _id: course._id, enrolledStudents: { $ne: student._id }, ...capacityFilter },
+                        {
+                            $addToSet: { enrolledStudents: student._id },
+                            $push: {
+                                enrollments: {
+                                    user: student._id,
+                                    status: 'active',
+                                    enrolledOn: new Date(),
+                                    scholarship: true,
+                                    grantedBy,
+                                },
+                            },
+                        },
+                    );
+                    if (result.modifiedCount === 0) {
+                        failedEnrollments.push({ studentId: student._id, reason: 'Concurrent enrollment or capacity reached' });
+                        continue;
+                    }
 
-                    // Add to enrollments array with scholarship metadata
-                    course.enrollments.push({
-                        user: studentId,
-                        status: 'active',
-                        enrolledOn: new Date(),
-                        scholarship: true,
-                        grantedBy: req.user?.id || req.body.grantedBy // Track who granted the scholarship
-                    });
+                    await User.updateOne({ _id: student._id }, { $set: { contact: false } });
 
-                    // Get student details for notification
-                    const student = students.find(s => s._id.toString() === studentId);
+                    try {
+                        await Notification.create({
+                            title: "Scholarship granted",
+                            content: `You have been awarded a scholarship for ${course.title}`,
+                            contentId: course._id,
+                            userId: student._id,
+                        });
+                    } catch (notificationError) {
+                        console.error('Scholarship notification failed:', notificationError.message);
+                    }
 
-                    // Create notification for the student
+                    scholarshipResults.push({ studentId: student._id, status: 'success' });
+                } catch (error) {
+                    console.error(`Scholarship grant failed for student ${student._id}:`, error);
+                    failedEnrollments.push({ studentId: student._id, reason: error.message });
+                }
+            }
+
+            // Instructor notification sent once, not per student.
+            if (scholarshipResults.length > 0) {
+                try {
                     await Notification.create({
-                        title: "Scholarship Granted",
-                        content: `Congratulations! You have been granted a scholarship for the course "${course.title}"`,
-                        contentId: course._id,
-                        userId: studentId,
-                    });
-
-                    // Create notification for the course instructor
-                    await Notification.create({
-                        title: "Scholarship Granted",
-                        content: `A scholarship has been granted to ${student.fullname} for your course "${course.title}"`,
+                        title: "Scholarships granted",
+                        content: `You granted ${scholarshipResults.length} scholarship(s) for ${course.title}`,
                         contentId: course._id,
                         userId: course.instructorId,
                     });
-
-                    scholarshipResults.push({
-                        studentId,
-                        studentName: student.fullname,
-                        status: 'success'
-                    });
-
-                } catch (enrollmentError) {
-                    console.error(`Error enrolling student ${studentId}:`, enrollmentError);
-                    failedEnrollments.push({
-                        studentId,
-                        reason: 'Failed to enroll student due to server error'
-                    });
+                } catch (notificationError) {
+                    console.error('Instructor scholarship notification failed:', notificationError.message);
                 }
             }
 
-            // Save the course with all new enrollments
-            await course.save();
-
-            // Prepare response
-            const response = {
-                success: true,
-                message: `Scholarships granted successfully to ${scholarshipResults.length} student(s)`,
-                results: {
-                    successful: scholarshipResults,
-                    failed: failedEnrollments
-                },
-                course: {
-                    id: course._id,
-                    title: course.title,
-                    totalEnrolledStudents: course.enrolledStudents.length
-                }
-            };
-
-            // If some enrollments failed, indicate partial success
-            if (failedEnrollments.length > 0) {
-                response.message = `Scholarships partially granted. ${scholarshipResults.length} successful, ${failedEnrollments.length} failed.`;
-            }
-
-            return res.status(200).json(response);
-
-        } catch (error) {
-            console.error('Error granting scholarships:', error);
-            return res.status(500).json({
-                message: 'Unexpected error while granting scholarships',
-                error: error.message
+            return res.status(200).json({
+                message: `Granted ${scholarshipResults.length} scholarship(s)`,
+                successful: scholarshipResults,
+                failed: failedEnrollments,
             });
+        } catch (error) {
+            console.error('Scholarship grant operation failed:', error);
+            return res.status(500).json({ message: 'Scholarship operation failed. Please try again.' });
         }
     },
-
 
 };
 
