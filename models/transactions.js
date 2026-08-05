@@ -3,6 +3,8 @@ const mongoose = require('mongoose');
 const transactionSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   courseId: { type: mongoose.Schema.Types.ObjectId, ref: 'Course', required: false },
+  paymentPlanId: { type: mongoose.Schema.Types.ObjectId, ref: 'CoursePaymentPlan', required: false, index: true },
+  installmentNumber: { type: Number, required: false, min: 1, max: 3 },
   amount: Number,
   type: String,
   soldBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: false },

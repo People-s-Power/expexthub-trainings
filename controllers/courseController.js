@@ -9,6 +9,7 @@ const createZoomMeeting = require("../utils/createZoomMeeting.js");
 const KJUR = require("jsrsasign");
 const Notification = require("../models/notifications.js");
 const Transaction = require("../models/transactions.js");
+const CoursePaymentPlan = require("../models/coursePaymentPlans.js");
 const dayjs = require("dayjs");
 const isBetween = require("dayjs/plugin/isBetween.js");
 const isSameOrAfter = require("dayjs/plugin/isSameOrAfter.js");
@@ -507,16 +508,28 @@ const courseController = {
 
             const course = await Course.findById(courseId);
             const user = await User.findById(id);
-            const author = await User.findById(course.instructorId)
-
-            console.log(user);
             if (!course) {
                 return res.status(404).json({ message: 'Course not found' });
             }
+            if (!user) {
+                return res.status(404).json({ message: 'User not found' });
+            }
             // console.log(course);
             // Check if the student is already enrolled
-            if (course.enrolledStudents.includes(id)) {
+            if ((course.enrolledStudents || []).some(studentId => String(studentId) === String(id))) {
                 return res.status(400).json({ message: 'Student is already enrolled in the course' });
+            }
+
+            // Paid courses can only be accessed after a server-confirmed payment.
+            // Free and scholarship enrollments continue to use this endpoint.
+            if (Number(course.fee || 0) > 0) {
+                const [paidTransaction, completedPlan] = await Promise.all([
+                    Transaction.findOne({ userId: id, courseId, type: 'course_payment', status: 'successful' }),
+                    CoursePaymentPlan.findOne({ userId: id, courseId, status: 'completed' }),
+                ]);
+                if (!paidTransaction && !completedPlan) {
+                    return res.status(402).json({ message: 'Please complete payment before enrolling in this course' });
+                }
             }
 
             // const student = course.enrollments.find(student => student.user.toString() === id);
@@ -541,17 +554,6 @@ const courseController = {
                 contentId: course._id,
                 userId: course.instructorId,
             });
-
-            if (course.fee > 0) {
-                await Transaction.create({
-                    userId: author._id,
-                    amount: course.fee,
-                    type: 'credit'
-                })
-                const amountToAdd = course.fee * 0.95;
-                author.balance += amountToAdd
-                await author.save();
-            }
 
             return res.status(200).json({ message: 'Enrolled successfully' });
         } catch (error) {

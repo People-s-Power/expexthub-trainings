@@ -1,44 +1,25 @@
-const { log } = require("handlebars");
 const Transaction = require("../models/transactions.js");
 const User = require("../models/user.js");
 const axios = require("axios");
 const Course = require("../models/courses.js");
-const Notification = require("../models/notifications.js");
 const crypto = require("crypto");
+const CoursePaymentPlan = require('../models/coursePaymentPlans.js');
+const PaymentWebhookEvent = require('../models/paymentWebhookEvents.js');
+const {
+  finalizeFullCoursePayment,
+  finalizeInstallmentPayment,
+  grantCourseAccess,
+  creditInstructor,
+} = require('../services/coursePaymentService.js');
 
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
 const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
 
 const flwHeaders = { Authorization: `Bearer ${flutterwaveSecretKey}` };
 
-async function grantCourseEnrollment(transaction) {
-  if (!transaction.courseId || !transaction.userId) return;
-  const course = await Course.findById(transaction.courseId);
-  const user = await User.findById(transaction.userId);
-  if (!course || !user) throw new Error('Course or student not found');
-
-  const alreadyEnrolled = course.enrolledStudents.some(id => String(id) === String(user._id));
-  if (!alreadyEnrolled) {
-    course.enrolledStudents.addToSet(user._id);
-    course.enrollments.push({ user: user._id, status: 'active', enrolledOn: new Date().toISOString() });
-    await course.save();
-    user.contact = false;
-    await user.save();
-    await Notification.create({
-      title: 'Course enrolled',
-      content: `${user.fullname} Just enrolled for your Course ${course.title}`,
-      contentId: course._id,
-      userId: course.instructorId,
-    });
-    if (course.instructorId && course.fee > 0) {
-      const instructor = await User.findByIdAndUpdate(course.instructorId, { $inc: { balance: course.fee * 0.95 } }, { new: true });
-      if (instructor) await Transaction.create({ userId: instructor._id, courseId: course._id, amount: course.fee, type: 'credit', status: 'successful', txRef: `course-credit-${transaction.txRef}` });
-    }
-  }
-}
-
 const transactionController = {
   initializeCoursePayment: async (req, res) => {
+    let transaction;
     try {
       const userId = req.user.id;
       const { courseId, redirect_url } = req.body;
@@ -47,13 +28,15 @@ const transactionController = {
       if (!user || !['student', 'client'].includes(user.role)) return res.status(403).json({ message: 'Only students can enroll' });
       if (!user.isVerified) return res.status(403).json({ message: 'Please verify your email before paying' });
       if (course.enrolledStudents.some(id => String(id) === String(user._id))) return res.status(409).json({ message: 'Student is already enrolled in the course' });
+      const existingPlan = await CoursePaymentPlan.findOne({ userId, courseId, status: { $in: ['pending', 'active', 'overdue'] } });
+      if (existingPlan) return res.status(409).json({ message: 'You already have an installment plan for this course. Continue with your next installment.' });
       const amount = Number(course.fee || 0);
       if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ message: 'This course does not require payment' });
 
       const txRef = `course-${course._id}-${user._id}-${crypto.randomUUID()}`;
-      await Transaction.create({ userId, courseId, amount, txRef, type: 'course_payment', status: 'pending', currency: 'NGN', metadata: { title: course.title } });
+      transaction = await Transaction.create({ userId, courseId, amount, txRef, type: 'course_payment', status: 'pending', currency: 'NGN', metadata: { title: course.title } });
       const response = await axios.post(`${flutterwaveBaseURL}payments`, {
-        tx_ref: txRef, amount, currency: 'NGN', redirect_url,
+        tx_ref: txRef, amount, currency: 'NGN', redirect_url: redirect_url || process.env.FRONTEND_URL,
         customer: { email: user.email, name: user.fullname, phonenumber: user.phone || undefined },
         customizations: { title: 'ExpertHub Training', description: `Enrollment for ${course.title}` },
         meta: { userId: String(userId), courseId: String(courseId) },
@@ -61,6 +44,7 @@ const transactionController = {
       if (response.data?.status !== 'success' || !response.data?.data?.link) throw new Error('Payment gateway did not return a checkout link');
       return res.status(201).json({ link: response.data.data.link, txRef });
     } catch (error) {
+      if (transaction) await Transaction.updateOne({ _id: transaction._id, status: 'pending' }, { $set: { status: 'failed' } });
       console.error('Course payment initialization failed:', error.response?.data || error.message);
       return res.status(502).json({ message: 'Unable to start payment. Please try again.' });
     }
@@ -69,19 +53,21 @@ const transactionController = {
   verifyCoursePayment: async (req, res) => {
     try {
       const transaction = await Transaction.findOne({ txRef: req.params.txRef });
-      if (!transaction || transaction.type !== 'course_payment') return res.status(404).json({ message: 'Payment not found' });
+      if (!transaction || !['course_payment', 'course_installment'].includes(transaction.type)) return res.status(404).json({ message: 'Payment not found' });
       if (transaction.status !== 'successful') {
         const gatewayId = req.query.id || transaction.gatewayTransactionId;
         if (!gatewayId) return res.status(409).json({ message: 'Payment is still pending' });
         const response = await axios.get(`${flutterwaveBaseURL}transactions/${gatewayId}/verify`, { headers: flwHeaders });
         const payment = response.data?.data;
         if (response.data?.status !== 'success' || payment?.status !== 'successful' || payment?.tx_ref !== transaction.txRef || Number(payment.amount) !== Number(transaction.amount) || payment.currency !== transaction.currency) return res.status(400).json({ message: 'Payment could not be confirmed' });
-        transaction.gatewayTransactionId = String(payment.id);
-        transaction.status = 'successful';
-        await transaction.save();
+        if (transaction.type === 'course_installment') await finalizeInstallmentPayment(transaction, payment);
+        else await finalizeFullCoursePayment(transaction, payment);
+      } else if (transaction.type === 'course_installment') {
+        await finalizeInstallmentPayment(transaction);
+      } else {
+        await finalizeFullCoursePayment(transaction);
       }
-      await grantCourseEnrollment(transaction);
-      return res.json({ message: 'Payment confirmed', courseId: transaction.courseId });
+      return res.json({ message: 'Payment confirmed', courseId: transaction.courseId, paymentPlanId: transaction.paymentPlanId || null });
     } catch (error) {
       console.error('Course payment verification failed:', error.response?.data || error.message);
       return res.status(502).json({ message: 'Payment confirmation is temporarily unavailable. Please try again.' });
@@ -90,16 +76,65 @@ const transactionController = {
 
   flutterwaveWebhook: async (req, res) => {
     if (!process.env.FLUTTERWAVE_WEBHOOK_HASH || req.headers['verif-hash'] !== process.env.FLUTTERWAVE_WEBHOOK_HASH) return res.sendStatus(401);
-    res.sendStatus(200);
+    const payment = req.body?.data;
+    const eventId = payment?.id ? `flutterwave-${payment.id}` : `flutterwave-${payment?.tx_ref || crypto.randomUUID()}`;
+    let event;
     try {
-      const payment = req.body?.data;
-      const transaction = await Transaction.findOne({ txRef: payment?.tx_ref, type: 'course_payment' });
-      if (!transaction || payment.status !== 'successful' || Number(payment.amount) !== Number(transaction.amount) || payment.currency !== transaction.currency) return;
-      transaction.gatewayTransactionId = String(payment.id);
-      transaction.status = 'successful';
-      await transaction.save();
-      await grantCourseEnrollment(transaction);
-    } catch (error) { console.error('Flutterwave webhook processing failed:', error); }
+      const existingEvent = await PaymentWebhookEvent.findOne({ eventId });
+      if (existingEvent?.status === 'processed') return res.sendStatus(200);
+      event = existingEvent || await PaymentWebhookEvent.create({ eventId, payload: req.body });
+      event.payload = req.body;
+      event.status = 'received';
+      await event.save();
+      const transaction = await Transaction.findOne({ txRef: payment?.tx_ref, type: { $in: ['course_payment', 'course_installment'] } });
+      if (!transaction || payment?.status !== 'successful' || Number(payment.amount) !== Number(transaction.amount) || payment.currency !== transaction.currency) {
+        event.status = 'processed';
+        event.processedAt = new Date();
+        await event.save();
+        return res.sendStatus(200);
+      }
+      if (transaction.type === 'course_installment') await finalizeInstallmentPayment(transaction, payment);
+      else await finalizeFullCoursePayment(transaction, payment);
+      event.status = 'processed';
+      event.processedAt = new Date();
+      await event.save();
+      return res.sendStatus(200);
+    } catch (error) {
+      console.error('Flutterwave webhook processing failed:', error);
+      if (event) {
+        event.status = 'failed';
+        event.error = error.message;
+        await event.save().catch(saveError => console.error('Could not persist webhook failure:', saveError));
+      }
+      return res.sendStatus(500); // Let Flutterwave retry transient processing failures.
+    }
+  },
+  payCourseWithWallet: async (req, res) => {
+    const userId = req.user?.id || req.user?._id;
+    const { courseId } = req.body;
+    try {
+      const [course, user] = await Promise.all([Course.findById(courseId), User.findById(userId)]);
+      if (!course) return res.status(404).json({ message: 'Course not found' });
+      if (!user || !['student', 'client'].includes(user.role)) return res.status(403).json({ message: 'Only students can enroll' });
+      if (course.enrolledStudents.some(id => String(id) === String(userId))) return res.status(409).json({ message: 'Student is already enrolled in the course' });
+      const amount = Number(course.fee || 0);
+      if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ message: 'This course does not require payment' });
+      const chargedUser = await User.findOneAndUpdate({ _id: userId, balance: { $gte: amount } }, { $inc: { balance: -amount } }, { new: true });
+      if (!chargedUser) return res.status(400).json({ message: 'Insufficient wallet balance' });
+      const transaction = await Transaction.create({ userId, courseId, amount, type: 'course_payment_wallet', status: 'successful', currency: 'NGN', txRef: `course-wallet-${courseId}-${userId}-${crypto.randomUUID()}` });
+      try {
+        await grantCourseAccess({ userId, courseId });
+        await creditInstructor(transaction, amount);
+      } catch (error) {
+        await User.findByIdAndUpdate(userId, { $inc: { balance: amount } });
+        await Transaction.updateOne({ _id: transaction._id }, { $set: { status: 'failed' } });
+        throw error;
+      }
+      return res.json({ message: 'Payment successful and course enrollment confirmed', courseId });
+    } catch (error) {
+      console.error('Course wallet payment failed:', error);
+      return res.status(500).json({ message: 'Wallet payment failed. Please try again.' });
+    }
   },
   getBalance: async (req, res) => {
     const { userId } = req.params;
@@ -339,8 +374,10 @@ const transactionController = {
   },
 
   payWith: async (req, res) => {
-    const { userId, amount } = req.body;
+    const userId = req.user?.id || req.user?._id;
+    const amount = Number(req.body.amount);
     try {
+      if (!Number.isFinite(amount) || amount <= 0) return res.status(400).send('Invalid payment amount');
       const user = await User.findById(userId);
       if (!user) {
         return res.status(404).send('User not found');
