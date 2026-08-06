@@ -184,18 +184,39 @@ const transactionController = {
       }
 
       if (transaction.status !== 'successful') {
-        const gatewayId = req.query.id || transaction.gatewayTransactionId;
-        if (!gatewayId) return res.status(409).json({ message: 'Payment is still pending', code: 'PENDING' });
+        // Flutterwave's Standard redirect carries `transaction_id`; some older
+        // integrations send `id`. Accept either, and when neither is present fall
+        // back to verifying by our own reference — confirmation must never
+        // dead-end just because a query parameter was named differently.
+        const gatewayId = req.query.transaction_id || req.query.id || transaction.gatewayTransactionId;
 
-        const response = await axios.get(`${flutterwaveBaseURL}transactions/${encodeURIComponent(gatewayId)}/verify`, {
-          headers: flwHeaders,
-          timeout: GATEWAY_TIMEOUT_MS,
-        });
-        const payment = response.data?.data;
+        let payment;
+        let gatewayOk = false;
+        try {
+          const response = gatewayId
+            ? await axios.get(`${flutterwaveBaseURL}transactions/${encodeURIComponent(gatewayId)}/verify`, {
+                headers: flwHeaders,
+                timeout: GATEWAY_TIMEOUT_MS,
+              })
+            : await axios.get(`${flutterwaveBaseURL}transactions/verify_by_reference`, {
+                params: { tx_ref: transaction.txRef },
+                headers: flwHeaders,
+                timeout: GATEWAY_TIMEOUT_MS,
+              });
+          payment = response.data?.data;
+          gatewayOk = response.data?.status === 'success';
+        } catch (lookupError) {
+          // 404 means Flutterwave has no record of this charge yet: genuinely
+          // pending rather than an outage, so let the client keep polling.
+          if (lookupError.response?.status === 404) {
+            return res.status(409).json({ message: 'Payment is still pending confirmation', code: 'PENDING' });
+          }
+          throw lookupError;
+        }
 
         // Every field is re-checked against our own record: a matching reference is
         // not enough, the amount and currency must also be what we charged.
-        const isConfirmed = response.data?.status === 'success'
+        const isConfirmed = gatewayOk
           && payment?.status === 'successful'
           && payment?.tx_ref === transaction.txRef
           && Number(payment.amount) >= Number(transaction.amount)
