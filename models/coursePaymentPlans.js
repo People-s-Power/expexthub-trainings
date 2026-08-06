@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 
 const installmentSchema = new mongoose.Schema({
-  number: { type: Number, required: true, min: 1, max: 3 },
+  number: { type: Number, required: true, min: 1, max: 6 },
   amountMinor: { type: Number, required: true, min: 1 },
   dueAt: { type: Date, required: true },
   status: {
@@ -20,7 +20,10 @@ const coursePaymentPlanSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   courseId: { type: mongoose.Schema.Types.ObjectId, ref: 'Course', required: true, index: true },
   currency: { type: String, default: 'NGN', uppercase: true },
-  installmentCount: { type: Number, default: 3, immutable: true },
+  // Snapshotted from the course at plan creation and immutable thereafter: if a
+  // tutor later changes the course policy, students already mid-plan keep the
+  // schedule they agreed to.
+  installmentCount: { type: Number, default: 3, min: 2, max: 6, immutable: true },
   totalAmountMinor: { type: Number, required: true, min: 1 },
   amountPaidMinor: { type: Number, default: 0, min: 0 },
   status: {
@@ -40,7 +43,13 @@ const coursePaymentPlanSchema = new mongoose.Schema({
   },
   installments: {
     type: [installmentSchema],
-    validate: value => Array.isArray(value) && value.length === 3,
+    validate: {
+      validator: function(value) {
+        // The count was fixed at creation, so validate against this document's own count.
+        return Array.isArray(value) && value.length === this.installmentCount;
+      },
+      message: 'Installments array length must match the plan\'s installmentCount'
+    }
   },
   lastPaymentAt: Date,
 }, { timestamps: true });

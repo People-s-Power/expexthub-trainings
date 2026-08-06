@@ -13,6 +13,7 @@ const {
   finalizeInstallmentPayment,
   creditInstructor,
   grantCourseAccess,
+  resolveInstallmentPolicy,
 } = require('../services/coursePaymentService.js');
 
 const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
@@ -89,6 +90,9 @@ const paymentPlanController = {
       if (!course) return res.status(404).json({ message: 'Course not found' });
       if (!course.approved) return res.status(403).json({ message: 'This course is not open for enrollment yet' });
       if (String(course.instructorId) === String(userId)) return res.status(400).json({ message: 'You cannot enroll in your own course' });
+
+      const policy = resolveInstallmentPolicy(course);
+      if (!policy.installmentsEnabled) return res.status(403).json({ message: 'This course does not offer installment plans' });
       if (course.enrollmentDeadline && new Date(course.enrollmentDeadline) < new Date()) {
         return res.status(409).json({ message: 'Enrollment for this course has closed' });
       }
@@ -115,9 +119,10 @@ const paymentPlanController = {
             userId,
             courseId: course._id,
             currency: 'NGN',
+            installmentCount: policy.installmentCount,
             totalAmountMinor,
             priceSnapshot: { courseTitle: course.title, courseFee: Number(course.fee) },
-            installments: buildInstallments(totalAmountMinor),
+            installments: buildInstallments(totalAmountMinor, policy.installmentCount),
           });
         } catch (createError) {
           // Lost a race against a concurrent create; the unique partial index held,
@@ -153,10 +158,12 @@ const paymentPlanController = {
     let plan;
     const number = Number(req.params.number);
     try {
-      if (![1, 2, 3].includes(number)) return res.status(400).json({ message: 'Installment number must be 1, 2, or 3' });
-
       plan = await getOwnedPlan(req, res);
       if (!plan) return;
+
+      if (!Number.isInteger(number) || number < 1 || number > plan.installmentCount) {
+        return res.status(400).json({ message: `Installment number must be between 1 and ${plan.installmentCount}` });
+      }
       const user = await validateStudent(authenticatedUserId(req));
 
       if (plan.status === 'completed') return res.status(409).json({ message: 'This payment plan is already complete', plan: serializePlan(plan) });
@@ -208,7 +215,7 @@ const paymentPlanController = {
         currency: transaction.currency,
         redirect_url: resolveRedirectUrl(req.body.redirect_url),
         customer: { email: user.email, name: user.fullname, phonenumber: user.phone || undefined },
-        customizations: { title: 'ExpertHub Training', description: `Installment ${number} of 3 for ${plan.priceSnapshot.courseTitle}` },
+        customizations: { title: 'ExpertHub Training', description: `Installment ${number} of ${plan.installmentCount} for ${plan.priceSnapshot.courseTitle}` },
         meta: { userId: String(plan.userId), courseId: String(plan.courseId), paymentPlanId: String(plan._id), installmentNumber: number },
       }, { headers: flwHeaders, timeout: GATEWAY_TIMEOUT_MS });
 
@@ -241,10 +248,12 @@ const paymentPlanController = {
   payInstallmentWithWallet: async (req, res) => {
     const number = Number(req.params.number);
     try {
-      if (![1, 2, 3].includes(number)) return res.status(400).json({ message: 'Installment number must be 1, 2, or 3' });
-
       const plan = await getOwnedPlan(req, res);
       if (!plan) return;
+
+      if (!Number.isInteger(number) || number < 1 || number > plan.installmentCount) {
+        return res.status(400).json({ message: `Installment number must be between 1 and ${plan.installmentCount}` });
+      }
       await validateStudent(authenticatedUserId(req));
 
       if (plan.status === 'cancelled') return res.status(409).json({ message: 'This payment plan has been cancelled' });

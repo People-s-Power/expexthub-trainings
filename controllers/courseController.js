@@ -185,7 +185,7 @@ const courseController = {
 
     addCourse: async (req, res) => {
 
-        const { title, about, duration, type, startDate, endDate, startTime, endTime, category, privacy, days, fee, strikedFee, scholarship, meetingPassword, target, modules, benefits, timeframe, audience, meetingType, primaryColor } = req.body;
+        const { title, about, duration, type, startDate, endDate, startTime, endTime, category, privacy, days, fee, strikedFee, scholarship, meetingPassword, target, modules, benefits, timeframe, audience, meetingType, primaryColor, installmentsEnabled, installmentCount } = req.body;
 
         // Get user ID from the request headers
         const userId = req.params.userId;
@@ -223,6 +223,22 @@ const courseController = {
         const audienceIds = Array.isArray(audience)
             ? audience.filter((id) => mongoose.Types.ObjectId.isValid(id))
             : [];
+
+        // Validate installment settings when provided. Free courses cannot offer
+        // installments regardless of the flag, so clients only send these for paid courses.
+        let validatedInstallmentsEnabled = false;
+        let validatedInstallmentCount = 3;
+        if (fee && Number(fee) > 0) {
+            validatedInstallmentsEnabled = Boolean(installmentsEnabled);
+            if (validatedInstallmentsEnabled) {
+                const count = Number(installmentCount);
+                if (Number.isInteger(count) && count >= 2 && count <= 6) {
+                    validatedInstallmentCount = count;
+                } else if (installmentCount !== undefined) {
+                    return res.status(400).json({ message: 'Installment count must be between 2 and 6' });
+                }
+            }
+        }
 
 
         if (user.role === "tutor" && ((user.premiumPlan === "basic" && coursesByUser.length >= 5) || user.premiumPlan === "standard" && coursesByUser.length >= 20)) {
@@ -274,6 +290,8 @@ const courseController = {
                 primaryColor,
                 days,
                 strikedFee,
+                installmentsEnabled: validatedInstallmentsEnabled,
+                installmentCount: validatedInstallmentCount,
                 modules,
                 benefits,
                 enrolledStudents: scholarshipIds,
@@ -784,6 +802,9 @@ const courseController = {
 
     editCourse: async (req, res) => {
         try {
+            const courseId = req.params.id;
+            const course = await Course.findById(courseId);
+            if (!course) return res.status(404).json({ message: 'Course not found' });
 
             let videos = req.body.videos.map(video => {
                 return {
@@ -802,15 +823,31 @@ const courseController = {
             })
             console.log(videos, req.body.videos, "yes oo");
 
-            const course = await Course.updateOne({
-                _id: req.params.id
-            }, {
-                ...req.body,
-                videos
-            }, {
-                new: true
-            })
-            res.json(course);
+            // Validate installment settings when provided in the update. Free courses
+            // cannot offer installments, so clear the flag and reset count to default if
+            // the fee is being removed or set to zero.
+            const updates = { ...req.body, videos };
+            const updatedFee = Number(updates.fee ?? course.fee);
+            if (updates.installmentsEnabled !== undefined || updates.installmentCount !== undefined) {
+                if (updatedFee > 0) {
+                    if (updates.installmentsEnabled !== undefined) {
+                        updates.installmentsEnabled = Boolean(updates.installmentsEnabled);
+                    }
+                    if (updates.installmentCount !== undefined) {
+                        const count = Number(updates.installmentCount);
+                        if (!Number.isInteger(count) || count < 2 || count > 6) {
+                            return res.status(400).json({ message: 'Installment count must be between 2 and 6' });
+                        }
+                        updates.installmentCount = count;
+                    }
+                } else {
+                    updates.installmentsEnabled = false;
+                    updates.installmentCount = 3;
+                }
+            }
+
+            await Course.updateOne({ _id: courseId }, updates, { new: true });
+            res.json({ message: 'Course updated successfully' });
         } catch (error) {
             console.error(error);
             res.status(400).json(error);

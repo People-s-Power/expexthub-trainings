@@ -46,6 +46,22 @@ const courseSchema = new mongoose.Schema({
     endTime: String,
     fee: Number,
     strikedFee: Number,
+    // Instructor-controlled installment policy. Defaults to off so every course
+    // created before this feature keeps its current pay-in-full-only behaviour.
+    // Pay in full is always available and is deliberately not configurable.
+    installmentsEnabled: {
+        type: Boolean,
+        default: false
+    },
+    // Only meaningful when installmentsEnabled is true. Bounded because each
+    // installment is a separate gateway charge: too many makes checkout tedious
+    // and the per-transaction fees uneconomic.
+    installmentCount: {
+        type: Number,
+        min: 2,
+        max: 6,
+        default: 3
+    },
     target: Number,
     assignedTutors: [{
         type: mongoose.Schema.Types.ObjectId,

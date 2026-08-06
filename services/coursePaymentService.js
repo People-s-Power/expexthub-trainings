@@ -9,6 +9,33 @@ const PLATFORM_FEE_RATE = 0.05;
 const INSTALLMENT_INTERVAL_DAYS = 30;
 const GRACE_PERIOD_DAYS = 7;
 
+// Single source of truth for the installment bounds. The Course model, the plan
+// model, the controllers and the client all validate against these, so a tutor
+// can never save a policy the payment pipeline would later reject.
+const MIN_INSTALLMENTS = 2;
+const MAX_INSTALLMENTS = 6;
+const DEFAULT_INSTALLMENTS = 3;
+
+/**
+ * The effective installment policy for a course.
+ *
+ * Courses created before this feature have neither field set, so they resolve to
+ * "pay in full only" — existing behaviour is preserved without a migration. A
+ * free course can never be paid in instalments regardless of the flag.
+ */
+function resolveInstallmentPolicy(course) {
+  const fee = Number(course?.fee) || 0;
+  const rawCount = Number(course?.installmentCount);
+  const count = Number.isInteger(rawCount) && rawCount >= MIN_INSTALLMENTS && rawCount <= MAX_INSTALLMENTS
+    ? rawCount
+    : DEFAULT_INSTALLMENTS;
+
+  return {
+    installmentsEnabled: Boolean(course?.installmentsEnabled) && fee > 0,
+    installmentCount: count,
+  };
+}
+
 function toMinorUnits(amount) {
   const value = Number(amount);
   if (!Number.isFinite(value) || value <= 0) return 0;
@@ -42,12 +69,17 @@ function serializePlan(plan) {
   };
 }
 
-function buildInstallments(totalAmountMinor, now = new Date()) {
-  const first = Math.floor(totalAmountMinor / 3);
-  const second = Math.floor(totalAmountMinor / 3);
-  // The remainder lands on the final installment so the three always sum to the
+function buildInstallments(totalAmountMinor, count = 3, now = new Date()) {
+  if (!Number.isInteger(count) || count < 2 || count > 6) {
+    throw new Error('Installment count must be between 2 and 6');
+  }
+  const perInstallment = Math.floor(totalAmountMinor / count);
+  const amounts = Array(count).fill(perInstallment);
+  // The remainder lands on the final installment so they always sum to the
   // exact total — no lost or invented kobo.
-  const amounts = [first, second, totalAmountMinor - first - second];
+  const remainder = totalAmountMinor - (perInstallment * count);
+  amounts[amounts.length - 1] += remainder;
+
   return amounts.map((amountMinor, index) => {
     const dueAt = new Date(now);
     dueAt.setUTCDate(dueAt.getUTCDate() + (index * INSTALLMENT_INTERVAL_DAYS));
@@ -287,11 +319,15 @@ module.exports = {
   MINOR_UNIT,
   PLATFORM_FEE_RATE,
   GRACE_PERIOD_DAYS,
+  MIN_INSTALLMENTS,
+  MAX_INSTALLMENTS,
+  DEFAULT_INSTALLMENTS,
   toMinorUnits,
   toMajorUnits,
   serializePlan,
   buildInstallments,
   refreshDueStatus,
+  resolveInstallmentPolicy,
   grantCourseAccess,
   creditInstructor,
   finalizeFullCoursePayment,
