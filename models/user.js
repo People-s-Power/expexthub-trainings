@@ -103,6 +103,20 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: ""
   },
+  // Codes are short-lived and rate-limited so a six-digit secret cannot be
+  // brute-forced. Absent on accounts whose code predates these fields, which the
+  // controller treats as "no expiry recorded" rather than locking them out.
+  verificationCodeExpiresAt: {
+    type: Date,
+  },
+  verificationCodeSentAt: {
+    type: Date,
+  },
+  // Wrong guesses against the current code. Reset whenever a new code is issued.
+  verificationAttempts: {
+    type: Number,
+    default: 0,
+  },
   days: [{
     checked: Boolean,
     day: String,

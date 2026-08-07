@@ -8,18 +8,20 @@ const {
   toMinorUnits,
   toMajorUnits,
   serializePlan,
-  buildInstallments,
   refreshDueStatus,
   finalizeInstallmentPayment,
-  creditInstructor,
-  grantCourseAccess,
-  resolveInstallmentPolicy,
+  planOutstandingMinor,
+  nextPaymentNumber,
+  validatePaymentAmount,
+  openPlanForStudent,
+  FULL_PAYMENT_TYPES,
 } = require('../services/coursePaymentService.js');
 
 const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
 const flwHeaders = { Authorization: `Bearer ${process.env.FLUTTERWAVE_SECRET}` };
 const GATEWAY_TIMEOUT_MS = 20000;
-// A checkout link older than this is assumed abandoned, so a fresh one is issued.
+// A checkout link older than this is assumed abandoned, so the slot is released
+// and a fresh charge can be started.
 const CHECKOUT_REUSE_WINDOW_MS = 30 * 60 * 1000;
 
 function authenticatedUserId(req) {
@@ -64,8 +66,35 @@ async function validateStudent(userId) {
   const user = await User.findById(userId);
   if (!user || !['student', 'client'].includes(user.role)) throw Object.assign(new Error('Only students can pay for courses'), { status: 403 });
   if (user.blocked) throw Object.assign(new Error('Your account is not permitted to enroll'), { status: 403 });
-  if (!user.isVerified) throw Object.assign(new Error('Please verify your email before paying'), { status: 403 });
+  if (!user.isVerified) {
+    throw Object.assign(new Error('Please verify your email before paying'), { status: 403, code: 'EMAIL_NOT_VERIFIED' });
+  }
   return user;
+}
+
+/**
+ * Releases checkout slots the student walked away from.
+ *
+ * The gateway charge itself is not cancelled — it cannot be — but the webhook
+ * settles by payment number regardless of the local status, so a late completion
+ * still credits correctly. Returns true when the plan was modified.
+ */
+async function releaseStalePayments(plan) {
+  const stale = (plan.installments || []).filter(entry => {
+    if (entry.status !== 'processing') return false;
+    const startedAt = entry.lastAttemptAt ? new Date(entry.lastAttemptAt).getTime() : 0;
+    return Date.now() - startedAt > CHECKOUT_REUSE_WINDOW_MS;
+  });
+  if (!stale.length) return false;
+
+  for (const entry of stale) {
+    entry.status = 'failed';
+    if (entry.txRef) {
+      await Transaction.updateOne({ txRef: entry.txRef, status: 'pending' }, { $set: { status: 'failed' } });
+    }
+  }
+  await plan.save();
+  return true;
 }
 
 const paymentPlanController = {
@@ -90,13 +119,9 @@ const paymentPlanController = {
       if (!course) return res.status(404).json({ message: 'Course not found' });
       if (!course.approved) return res.status(403).json({ message: 'This course is not open for enrollment yet' });
       if (String(course.instructorId) === String(userId)) return res.status(400).json({ message: 'You cannot enroll in your own course' });
-
-      const policy = resolveInstallmentPolicy(course);
-      if (!policy.installmentsEnabled) return res.status(403).json({ message: 'This course does not offer installment plans' });
       if (course.enrollmentDeadline && new Date(course.enrollmentDeadline) < new Date()) {
         return res.status(409).json({ message: 'Enrollment for this course has closed' });
       }
-      if (course.enrolledStudents.some(id => String(id) === String(userId))) return res.status(409).json({ message: 'Student is already enrolled in the course' });
       if (course.capacity && (course.enrolledStudents || []).length >= course.capacity) {
         return res.status(409).json({ message: 'This course is full' });
       }
@@ -105,37 +130,25 @@ const paymentPlanController = {
       const paidInFull = await Transaction.findOne({
         userId,
         courseId: course._id,
-        type: { $in: ['course_payment', 'course_payment_wallet'] },
+        type: { $in: FULL_PAYMENT_TYPES },
         status: 'successful',
       });
       if (paidInFull) return res.status(409).json({ message: 'You have already paid for this course' });
 
-      let plan = await CoursePaymentPlan.findOne({ userId, courseId: course._id, status: { $in: ['pending', 'active', 'overdue'] } });
-      if (!plan) {
-        const totalAmountMinor = toMinorUnits(course.fee);
-        if (!totalAmountMinor) return res.status(400).json({ message: 'This course does not require payment' });
-        try {
-          plan = await CoursePaymentPlan.create({
-            userId,
-            courseId: course._id,
-            currency: 'NGN',
-            installmentCount: policy.installmentCount,
-            totalAmountMinor,
-            priceSnapshot: { courseTitle: course.title, courseFee: Number(course.fee) },
-            installments: buildInstallments(totalAmountMinor, policy.installmentCount),
-          });
-        } catch (createError) {
-          // Lost a race against a concurrent create; the unique partial index held,
-          // so adopt the plan that won instead of failing the request.
-          if (createError?.code !== 11000) throw createError;
-          plan = await CoursePaymentPlan.findOne({ userId, courseId: course._id, status: { $in: ['pending', 'active', 'overdue'] } });
-          if (!plan) throw createError;
-        }
+      // Enrollment alone is not a blocker here: a part-paid student is enrolled
+      // and still needs to come back and clear their balance.
+      const alreadyEnrolled = (course.enrolledStudents || []).some(id => String(id) === String(userId));
+      const plan = await openPlanForStudent({ user, course });
+      if (alreadyEnrolled && planOutstandingMinor(plan) <= 0) {
+        return res.status(409).json({ message: 'Student is already enrolled in the course' });
       }
 
-      return res.status(201).json({ ...responsePlan(plan), customer: { email: user.email, name: user.fullname, phone: user.phone || undefined } });
+      return res.status(201).json({
+        ...responsePlan(plan),
+        customer: { email: user.email, name: user.fullname, phone: user.phone || undefined },
+      });
     } catch (error) {
-      if (error.status) return res.status(error.status).json({ message: error.message });
+      if (error.status) return res.status(error.status).json({ message: error.message, code: error.code });
       if (error.code === 11000) return res.status(409).json({ message: 'A payment plan already exists for this course' });
       console.error('Create payment plan failed:', error);
       return res.status(500).json({ message: 'Unable to create payment plan' });
@@ -153,70 +166,84 @@ const paymentPlanController = {
     }
   },
 
-  initializeInstallment: async (req, res) => {
+  /**
+   * Starts a gateway checkout for a student-chosen amount.
+   *
+   * The amount is validated server-side against the outstanding balance, the
+   * minimum-payment policy and anything already in flight — the client's figure
+   * is a request, never the authority.
+   */
+  initializePayment: async (req, res) => {
     let transaction;
     let plan;
-    const number = Number(req.params.number);
+    let paymentNumber;
     try {
       plan = await getOwnedPlan(req, res);
       if (!plan) return;
 
-      if (!Number.isInteger(number) || number < 1 || number > plan.installmentCount) {
-        return res.status(400).json({ message: `Installment number must be between 1 and ${plan.installmentCount}` });
-      }
       const user = await validateStudent(authenticatedUserId(req));
 
-      if (plan.status === 'completed') return res.status(409).json({ message: 'This payment plan is already complete', plan: serializePlan(plan) });
+      if (plan.status === 'completed') return res.status(409).json({ message: 'This course is already fully paid', plan: serializePlan(plan) });
       if (plan.status === 'cancelled') return res.status(409).json({ message: 'This payment plan has been cancelled' });
 
-      const installment = plan.installments.find(item => item.number === number);
-      if (!installment) return res.status(404).json({ message: 'Installment not found' });
-      if (installment.status === 'paid') return res.status(409).json({ message: 'This installment has already been paid', plan: serializePlan(plan) });
+      await releaseStalePayments(plan);
 
-      // Installments must be settled in order, otherwise a student could pay the
-      // cheapest one and hold access while earlier ones stay outstanding.
-      const previous = plan.installments.find(item => item.number === number - 1);
-      if (previous && previous.status !== 'paid') return res.status(409).json({ message: 'Please pay the previous installment first' });
-
-      // Reuse a recent, still-pending checkout rather than stacking charges.
-      if (installment.txRef) {
-        const existing = await Transaction.findOne({ txRef: installment.txRef, status: 'pending' });
-        const isFresh = existing && (Date.now() - new Date(existing.date).getTime()) < CHECKOUT_REUSE_WINDOW_MS;
-        if (isFresh && existing.metadata?.checkoutLink) {
+      // Reuse a still-open checkout for the same amount instead of stacking charges
+      // when a student clicks Pay twice or returns to the tab.
+      const requestedMinor = toMinorUnits(req.body.amount);
+      const openPayment = (plan.installments || []).find(entry => entry.status === 'processing' && entry.amountMinor === requestedMinor);
+      if (openPayment?.txRef) {
+        const existing = await Transaction.findOne({ txRef: openPayment.txRef, status: 'pending' });
+        if (existing?.metadata?.checkoutLink) {
           return res.status(200).json({ link: existing.metadata.checkoutLink, txRef: existing.txRef, plan: serializePlan(plan), reused: true });
         }
-        // Stale attempt: retire it so the new reference is unambiguous.
-        if (existing) await Transaction.updateOne({ _id: existing._id, status: 'pending' }, { $set: { status: 'failed' } });
       }
 
-      const txRef = `course-plan-${plan._id}-${number}-${crypto.randomUUID()}`;
+      const { amountMinor, error } = validatePaymentAmount(plan, req.body.amount);
+      if (error) return res.status(400).json({ message: error, plan: serializePlan(plan) });
+
+      paymentNumber = nextPaymentNumber(plan);
+      const txRef = `course-plan-${plan._id}-${paymentNumber}-${crypto.randomUUID()}`;
       transaction = await Transaction.create({
         userId: plan.userId,
         courseId: plan.courseId,
         paymentPlanId: plan._id,
-        installmentNumber: number,
-        amount: toMajorUnits(installment.amountMinor),
+        installmentNumber: paymentNumber,
+        amount: toMajorUnits(amountMinor),
         txRef,
         type: 'course_installment',
         status: 'pending',
         currency: plan.currency,
-        metadata: { title: plan.priceSnapshot.courseTitle, installmentNumber: number },
+        metadata: { title: plan.priceSnapshot?.courseTitle, paymentNumber },
       });
 
-      installment.txRef = txRef;
-      installment.status = 'processing';
-      installment.attempts += 1;
-      installment.lastAttemptAt = new Date();
+      plan.installments.push({
+        number: paymentNumber,
+        amountMinor,
+        status: 'processing',
+        txRef,
+        attempts: 1,
+        lastAttemptAt: new Date(),
+      });
       await plan.save();
 
+      const outstandingAfter = toMajorUnits(Math.max(0, planOutstandingMinor(plan) - amountMinor));
       const response = await axios.post(`${flutterwaveBaseURL}payments`, {
         tx_ref: txRef,
         amount: transaction.amount,
         currency: transaction.currency,
         redirect_url: resolveRedirectUrl(req.body.redirect_url),
         customer: { email: user.email, name: user.fullname, phonenumber: user.phone || undefined },
-        customizations: { title: 'ExpertHub Training', description: `Installment ${number} of ${plan.installmentCount} for ${plan.priceSnapshot.courseTitle}` },
-        meta: { userId: String(plan.userId), courseId: String(plan.courseId), paymentPlanId: String(plan._id), installmentNumber: number },
+        customizations: {
+          title: 'ExpertHub Training',
+          description: `Part payment for ${plan.priceSnapshot?.courseTitle || 'course'}${outstandingAfter > 0 ? ` (balance after: ${outstandingAfter})` : ' (final payment)'}`,
+        },
+        meta: {
+          userId: String(plan.userId),
+          courseId: String(plan.courseId),
+          paymentPlanId: String(plan._id),
+          installmentNumber: paymentNumber,
+        },
       }, { headers: flwHeaders, timeout: GATEWAY_TIMEOUT_MS });
 
       const link = response.data?.data?.link;
@@ -228,42 +255,40 @@ const paymentPlanController = {
     } catch (error) {
       if (transaction) {
         await Transaction.updateOne({ _id: transaction._id, status: 'pending' }, { $set: { status: 'failed' } });
-        if (plan) {
+        if (plan && paymentNumber) {
           // Re-read before rolling back: the webhook may have already settled this
-          // installment while the checkout call was failing on our side.
+          // payment while the checkout call was failing on our side.
           const fresh = await CoursePaymentPlan.findById(plan._id);
-          const freshInstallment = fresh?.installments.find(item => item.number === number);
-          if (freshInstallment?.status === 'processing') {
-            freshInstallment.status = 'failed';
+          const freshPayment = fresh?.installments.find(item => item.number === paymentNumber);
+          if (freshPayment?.status === 'processing') {
+            freshPayment.status = 'failed';
             await fresh.save();
           }
         }
       }
-      console.error('Installment initialization failed:', error.response?.data || error.message);
-      if (error.status) return res.status(error.status).json({ message: error.message });
-      return res.status(502).json({ message: 'Unable to start installment payment. Please try again.' });
+      console.error('Part payment initialization failed:', error.response?.data || error.message);
+      if (error.status) return res.status(error.status).json({ message: error.message, code: error.code });
+      return res.status(502).json({ message: 'Unable to start payment. Please try again.' });
     }
   },
 
-  payInstallmentWithWallet: async (req, res) => {
-    const number = Number(req.params.number);
+  payWithWallet: async (req, res) => {
     try {
       const plan = await getOwnedPlan(req, res);
       if (!plan) return;
 
-      if (!Number.isInteger(number) || number < 1 || number > plan.installmentCount) {
-        return res.status(400).json({ message: `Installment number must be between 1 and ${plan.installmentCount}` });
-      }
       await validateStudent(authenticatedUserId(req));
-
       if (plan.status === 'cancelled') return res.status(409).json({ message: 'This payment plan has been cancelled' });
+      if (plan.status === 'completed') return res.status(409).json({ message: 'This course is already fully paid', plan: serializePlan(plan) });
 
-      const installment = plan.installments.find(item => item.number === number);
-      const previous = plan.installments.find(item => item.number === number - 1);
-      if (!installment || installment.status === 'paid') return res.status(409).json({ message: 'Installment is not payable' });
-      if (previous && previous.status !== 'paid') return res.status(409).json({ message: 'Please pay the previous installment first' });
+      await releaseStalePayments(plan);
 
-      const amount = toMajorUnits(installment.amountMinor);
+      const { amountMinor, error } = validatePaymentAmount(plan, req.body.amount);
+      if (error) return res.status(400).json({ message: error, plan: serializePlan(plan) });
+
+      const amount = toMajorUnits(amountMinor);
+      // Debit atomically so two concurrent calls cannot both pass a balance check
+      // and spend the same funds twice.
       const user = await User.findOneAndUpdate(
         { _id: plan.userId, balance: { $gte: amount } },
         { $inc: { balance: -amount } },
@@ -271,32 +296,51 @@ const paymentPlanController = {
       );
       if (!user) return res.status(400).json({ message: 'Insufficient wallet balance' });
 
-      const txRef = `course-plan-wallet-${plan._id}-${number}-${crypto.randomUUID()}`;
-      const transaction = await Transaction.create({
-        userId: plan.userId,
-        courseId: plan.courseId,
-        paymentPlanId: plan._id,
-        installmentNumber: number,
-        amount,
-        txRef,
-        type: 'course_installment_wallet',
-        status: 'successful',
-        currency: plan.currency,
-        paidAt: new Date(),
-      });
-
+      const paymentNumber = nextPaymentNumber(plan);
+      const txRef = `course-plan-wallet-${plan._id}-${paymentNumber}-${crypto.randomUUID()}`;
+      let transaction;
       try {
+        plan.installments.push({
+          number: paymentNumber,
+          amountMinor,
+          status: 'processing',
+          txRef,
+          attempts: 1,
+          lastAttemptAt: new Date(),
+        });
+        await plan.save();
+
+        transaction = await Transaction.create({
+          userId: plan.userId,
+          courseId: plan.courseId,
+          paymentPlanId: plan._id,
+          installmentNumber: paymentNumber,
+          amount,
+          txRef,
+          type: 'course_installment_wallet',
+          status: 'successful',
+          currency: plan.currency,
+          paidAt: new Date(),
+        });
+
         await finalizeInstallmentPayment(transaction);
-      } catch (error) {
+      } catch (settlementError) {
         await User.findByIdAndUpdate(plan.userId, { $inc: { balance: amount } });
-        await Transaction.updateOne({ _id: transaction._id }, { $set: { status: 'failed' } });
-        throw error;
+        if (transaction) await Transaction.updateOne({ _id: transaction._id }, { $set: { status: 'failed' } });
+        throw settlementError;
       }
 
-      return res.json({ message: 'Installment paid successfully', plan: serializePlan(await CoursePaymentPlan.findById(plan._id)) });
+      const settled = await CoursePaymentPlan.findById(plan._id);
+      const outstanding = toMajorUnits(planOutstandingMinor(settled));
+      return res.json({
+        message: outstanding > 0
+          ? `Payment successful. ${outstanding} remaining on this course.`
+          : 'Payment successful. This course is now fully paid.',
+        plan: serializePlan(settled),
+      });
     } catch (error) {
-      if (error.status) return res.status(error.status).json({ message: error.message });
-      console.error('Wallet installment payment failed:', error);
+      if (error.status) return res.status(error.status).json({ message: error.message, code: error.code });
+      console.error('Wallet part payment failed:', error);
       return res.status(500).json({ message: 'Wallet payment failed. Please try again.' });
     }
   },

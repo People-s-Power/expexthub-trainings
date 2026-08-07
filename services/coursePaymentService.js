@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const Course = require('../models/courses.js');
 const User = require('../models/user.js');
 const Transaction = require('../models/transactions.js');
@@ -6,35 +7,28 @@ const CoursePaymentPlan = require('../models/coursePaymentPlans.js');
 
 const MINOR_UNIT = 100;
 const PLATFORM_FEE_RATE = 0.05;
-const INSTALLMENT_INTERVAL_DAYS = 30;
 const GRACE_PERIOD_DAYS = 7;
 
-// Single source of truth for the installment bounds. The Course model, the plan
-// model, the controllers and the client all validate against these, so a tutor
-// can never save a policy the payment pipeline would later reject.
-const MIN_INSTALLMENTS = 2;
-const MAX_INSTALLMENTS = 6;
-const DEFAULT_INSTALLMENTS = 3;
+// Part payments are chosen by the student, not scheduled by the tutor, so a plan
+// is bounded by a settlement deadline instead of a fixed instalment calendar:
+// the outstanding balance must be cleared within this many days of the first
+// payment.
+const SETTLEMENT_WINDOW_DAYS = 30;
 
-/**
- * The effective installment policy for a course.
- *
- * Courses created before this feature have neither field set, so they resolve to
- * "pay in full only" — existing behaviour is preserved without a migration. A
- * free course can never be paid in instalments regardless of the flag.
- */
-function resolveInstallmentPolicy(course) {
-  const fee = Number(course?.fee) || 0;
-  const rawCount = Number(course?.installmentCount);
-  const count = Number.isInteger(rawCount) && rawCount >= MIN_INSTALLMENTS && rawCount <= MAX_INSTALLMENTS
-    ? rawCount
-    : DEFAULT_INSTALLMENTS;
+// Floor on a single part payment, as a share of the course fee. Without it a
+// student could unlock a course for a token amount and never return. The payment
+// that clears the balance is exempt, so a small remainder is always payable.
+const MIN_PART_PAYMENT_RATE = 0.2;
 
-  return {
-    installmentsEnabled: Boolean(course?.installmentsEnabled) && fee > 0,
-    installmentCount: count,
-  };
-}
+// Ceiling on how many separate charges one plan may accumulate. Each is a real
+// gateway transaction with its own fee, so unbounded ₦1-over-minimum payments
+// would cost more to collect than they are worth.
+const MAX_PAYMENTS_PER_PLAN = 24;
+
+// Transaction types that each, on their own, mean the course fee was settled in
+// full. Anything checking "has this student already paid?" must consider all of
+// them or it will let a paid student be charged twice.
+const FULL_PAYMENT_TYPES = ['course_payment', 'course_payment_wallet', 'course_payment_offline'];
 
 function toMinorUnits(amount) {
   const value = Number(amount);
@@ -46,91 +40,233 @@ function toMajorUnits(amountMinor) {
   return Number((Number(amountMinor) / MINOR_UNIT).toFixed(2));
 }
 
-function serializePlan(plan) {
-  const data = plan.toObject ? plan.toObject() : plan;
-  const totalMinor = Number(data.totalAmountMinor) || 0;
-  const paidMinor = Number(data.amountPaidMinor) || 0;
-  const installments = (data.installments || []).map(installment => ({
-    ...installment,
-    amount: toMajorUnits(installment.amountMinor),
-  }));
-  const nextDue = installments.find(installment => installment.status !== 'paid') || null;
-
-  return {
-    ...data,
-    totalAmount: toMajorUnits(totalMinor),
-    amountPaid: toMajorUnits(paidMinor),
-    amountOutstanding: toMajorUnits(Math.max(0, totalMinor - paidMinor)),
-    installments,
-    // Surfaced so the client never has to re-derive payment sequencing itself.
-    nextInstallmentNumber: nextDue ? nextDue.number : null,
-    isComplete: data.status === 'completed',
-    hasCourseAccess: data.accessStatus === 'active',
-  };
-}
-
-function buildInstallments(totalAmountMinor, count = 3, now = new Date()) {
-  if (!Number.isInteger(count) || count < 2 || count > 6) {
-    throw new Error('Installment count must be between 2 and 6');
-  }
-  const perInstallment = Math.floor(totalAmountMinor / count);
-  const amounts = Array(count).fill(perInstallment);
-  // The remainder lands on the final installment so they always sum to the
-  // exact total — no lost or invented kobo.
-  const remainder = totalAmountMinor - (perInstallment * count);
-  amounts[amounts.length - 1] += remainder;
-
-  return amounts.map((amountMinor, index) => {
-    const dueAt = new Date(now);
-    dueAt.setUTCDate(dueAt.getUTCDate() + (index * INSTALLMENT_INTERVAL_DAYS));
-    return { number: index + 1, amountMinor, dueAt, status: 'pending' };
-  });
+function addDays(date, days) {
+  const result = new Date(date);
+  result.setUTCDate(result.getUTCDate() + days);
+  return result;
 }
 
 /**
- * Recomputes derived plan state from the clock: marks passed installments
- * overdue and suspends course access once an installment is overdue beyond the
- * grace period. Returns true when the caller needs to persist the document.
+ * The smallest payment we will accept right now.
+ *
+ * Always capped at the outstanding balance so the final payment is never blocked
+ * by the percentage floor — otherwise a student owing less than 20% of the fee
+ * could not settle at all.
  */
-function refreshDueStatus(plan) {
-  const now = new Date();
-  let changed = false;
+function minimumPaymentMinor(totalAmountMinor, outstandingMinor) {
+  const outstanding = Math.max(0, Number(outstandingMinor) || 0);
+  if (outstanding <= 0) return 0;
+  const floor = Math.ceil((Number(totalAmountMinor) || 0) * MIN_PART_PAYMENT_RATE);
+  return Math.min(outstanding, Math.max(1, floor));
+}
 
-  for (const installment of plan.installments || []) {
-    // Installment 1 is due immediately at checkout, so it is never "overdue" —
-    // access simply is not granted until it is paid.
-    if (installment.status === 'pending' && installment.number > 1 && installment.dueAt < now) {
-      installment.status = 'overdue';
+/**
+ * Part payment is now a platform-level capability rather than a per-course
+ * tutor setting: any course with a fee can be paid for in parts, and the student
+ * decides each amount. Free courses have nothing to split.
+ */
+function resolvePartPaymentPolicy(course) {
+  const totalAmountMinor = toMinorUnits(course?.fee);
+  return {
+    partPaymentEnabled: totalAmountMinor > 0,
+    totalAmountMinor,
+    minimumFirstPaymentMinor: minimumPaymentMinor(totalAmountMinor, totalAmountMinor),
+    settlementWindowDays: SETTLEMENT_WINDOW_DAYS,
+  };
+}
+
+function planOutstandingMinor(plan) {
+  const total = Number(plan?.totalAmountMinor) || 0;
+  const paid = Number(plan?.amountPaidMinor) || 0;
+  return Math.max(0, total - paid);
+}
+
+/** The next free slot in the payment ledger. */
+function nextPaymentNumber(plan) {
+  const highest = (plan?.installments || []).reduce(
+    (max, entry) => Math.max(max, Number(entry.number) || 0),
+    0,
+  );
+  return highest + 1;
+}
+
+/**
+ * Brings a stored plan in line with the part-payment model.
+ *
+ * Plans created under the old fixed-schedule design carry placeholder rows for
+ * instalments that were never attempted. Those rows are meaningless once the
+ * student picks their own amounts, so they are pruned — but anything that ever
+ * reached the gateway (settled, in flight, or failed with a reference) is kept,
+ * because a webhook may still arrive for it and it is matched by `number`.
+ * Surviving rows are deliberately not renumbered, so those references stay valid.
+ *
+ * Returns true when the caller needs to persist the document.
+ */
+function normalizePlan(plan) {
+  let changed = false;
+  const entries = plan.installments || [];
+  const settled = entries.filter(entry => entry.status === 'paid' || entry.status === 'processing' || Boolean(entry.txRef));
+
+  if (settled.length !== entries.length) {
+    plan.installments = settled;
+    changed = true;
+  }
+
+  // Legacy plans predate these fields; derive them from the payment history so
+  // the settlement clock starts from when the student actually first paid.
+  const paidEntries = (plan.installments || []).filter(entry => entry.status === 'paid' && entry.paidAt);
+  if (paidEntries.length) {
+    const earliest = paidEntries.reduce((oldest, entry) => (entry.paidAt < oldest.paidAt ? entry : oldest));
+    if (!plan.firstPaymentAt) {
+      plan.firstPaymentAt = earliest.paidAt;
       changed = true;
     }
-  }
-
-  const overdue = (plan.installments || []).filter(installment => installment.status === 'overdue');
-  const allPaid = (plan.installments || []).length > 0 && (plan.installments || []).every(item => item.status === 'paid');
-
-  if (allPaid) {
-    if (plan.status !== 'completed') { plan.status = 'completed'; changed = true; }
-    if (plan.accessStatus !== 'active') { plan.accessStatus = 'active'; changed = true; }
-    return changed;
-  }
-
-  if (overdue.length && plan.status !== 'cancelled') {
-    if (plan.status !== 'overdue') { plan.status = 'overdue'; changed = true; }
-
-    // Students keep access through a grace period so a late payment does not
-    // instantly lock them out of a course they have partly paid for.
-    const worstOverdue = overdue.reduce((oldest, item) => (item.dueAt < oldest.dueAt ? item : oldest));
-    const graceExpiresAt = new Date(worstOverdue.dueAt);
-    graceExpiresAt.setUTCDate(graceExpiresAt.getUTCDate() + GRACE_PERIOD_DAYS);
-
-    const shouldSuspend = now > graceExpiresAt;
-    if (shouldSuspend && plan.accessStatus === 'active') {
-      plan.accessStatus = 'suspended';
+    if (!plan.settlementDueAt) {
+      plan.settlementDueAt = addDays(plan.firstPaymentAt, SETTLEMENT_WINDOW_DAYS);
+      changed = true;
+    }
+    if (!plan.lastPaymentAt) {
+      const latest = paidEntries.reduce((newest, entry) => (entry.paidAt > newest.paidAt ? entry : newest));
+      plan.lastPaymentAt = latest.paidAt;
       changed = true;
     }
   }
 
   return changed;
+}
+
+/**
+ * Recomputes derived plan state from the clock: flags an unsettled balance
+ * overdue past its deadline, and suspends course access once the grace period
+ * has also elapsed. Returns true when the caller needs to persist the document.
+ */
+function refreshDueStatus(plan) {
+  const now = new Date();
+  let changed = normalizePlan(plan);
+
+  const total = Number(plan.totalAmountMinor) || 0;
+  const paid = Number(plan.amountPaidMinor) || 0;
+
+  if (total > 0 && paid >= total) {
+    if (plan.status !== 'completed') { plan.status = 'completed'; changed = true; }
+    if (plan.accessStatus !== 'active') { plan.accessStatus = 'active'; changed = true; }
+    return changed;
+  }
+
+  if (plan.status === 'cancelled') return changed;
+
+  // Nothing paid yet — the plan is a quote, not a debt, so no clock runs on it.
+  if (paid <= 0) {
+    if (plan.status !== 'pending') { plan.status = 'pending'; changed = true; }
+    return changed;
+  }
+
+  const dueAt = plan.settlementDueAt ? new Date(plan.settlementDueAt) : null;
+  if (!dueAt || now <= dueAt) {
+    if (plan.status !== 'active') { plan.status = 'active'; changed = true; }
+    return changed;
+  }
+
+  if (plan.status !== 'overdue') { plan.status = 'overdue'; changed = true; }
+
+  // The grace period runs from the later of the deadline and the last payment, so
+  // a student who is still actively paying down the balance keeps their access
+  // even after the original deadline passes.
+  const lastPaymentAt = plan.lastPaymentAt ? new Date(plan.lastPaymentAt) : dueAt;
+  const graceStartsAt = lastPaymentAt > dueAt ? lastPaymentAt : dueAt;
+  if (now > addDays(graceStartsAt, GRACE_PERIOD_DAYS) && plan.accessStatus === 'active') {
+    plan.accessStatus = 'suspended';
+    changed = true;
+  }
+
+  return changed;
+}
+
+function serializePlan(plan) {
+  const data = plan.toObject ? plan.toObject() : plan;
+  const totalMinor = Number(data.totalAmountMinor) || 0;
+  const paidMinor = Number(data.amountPaidMinor) || 0;
+  const outstandingMinor = Math.max(0, totalMinor - paidMinor);
+
+  // Only settled and in-flight payments are shown; the ledger has no future rows
+  // to display because the student has not committed to them yet.
+  const payments = (data.installments || [])
+    .map(entry => ({ ...entry, amount: toMajorUnits(entry.amountMinor) }))
+    .sort((a, b) => a.number - b.number);
+
+  const pendingPayment = payments.find(entry => entry.status === 'processing') || null;
+  const inFlightMinor = payments
+    .filter(entry => entry.status === 'processing')
+    .reduce((sum, entry) => sum + (Number(entry.amountMinor) || 0), 0);
+  const availableMinor = Math.max(0, outstandingMinor - inFlightMinor);
+
+  return {
+    ...data,
+    totalAmount: toMajorUnits(totalMinor),
+    amountPaid: toMajorUnits(paidMinor),
+    amountOutstanding: toMajorUnits(outstandingMinor),
+    amountInProgress: toMajorUnits(inFlightMinor),
+    // Everything the client needs to render and validate the amount field without
+    // re-deriving policy of its own.
+    minimumNextPayment: toMajorUnits(minimumPaymentMinor(totalMinor, availableMinor)),
+    maximumNextPayment: toMajorUnits(availableMinor),
+    paymentsMade: payments.filter(entry => entry.status === 'paid').length,
+    paymentsRemaining: Math.max(0, MAX_PAYMENTS_PER_PLAN - payments.filter(entry => entry.status !== 'failed').length),
+    payments,
+    // Retained under the old key so any client still reading `installments`
+    // during the rollout keeps working.
+    installments: payments,
+    pendingPaymentNumber: pendingPayment ? pendingPayment.number : null,
+    isComplete: data.status === 'completed',
+    hasCourseAccess: data.accessStatus === 'active',
+  };
+}
+
+/** Money already committed to a checkout that has not resolved yet. */
+function planInFlightMinor(plan) {
+  return (plan?.installments || [])
+    .filter(entry => entry.status === 'processing')
+    .reduce((sum, entry) => sum + (Number(entry.amountMinor) || 0), 0);
+}
+
+/**
+ * Validates a student-chosen payment amount against the plan.
+ *
+ * Returns { amountMinor } on success, or { error } with a message the client can
+ * show verbatim.
+ */
+function validatePaymentAmount(plan, requestedAmount) {
+  const outstandingMinor = planOutstandingMinor(plan);
+  if (outstandingMinor <= 0) return { error: 'This course is already fully paid' };
+
+  // Abandoned attempts are retained for audit but must not consume the student's
+  // budget of real payments.
+  const chargeable = (plan.installments || []).filter(entry => entry.status !== 'failed');
+  if (chargeable.length >= MAX_PAYMENTS_PER_PLAN) {
+    return { error: 'You have reached the maximum number of part payments for this course. Please pay the remaining balance in one payment.' };
+  }
+
+  // A checkout that is still open has already claimed part of the balance;
+  // ignoring it would let a student open two tabs and overpay the course.
+  const availableMinor = outstandingMinor - planInFlightMinor(plan);
+  if (availableMinor <= 0) {
+    return { error: 'You already have a payment in progress for this course. Complete or cancel it before starting another.' };
+  }
+
+  const value = Number(requestedAmount);
+  if (!Number.isFinite(value) || value <= 0) return { error: 'Enter the amount you want to pay' };
+
+  const amountMinor = toMinorUnits(value);
+  const minimumMinor = minimumPaymentMinor(Number(plan.totalAmountMinor) || 0, availableMinor);
+
+  if (amountMinor > availableMinor) {
+    return { error: `The most you can pay right now is ${toMajorUnits(availableMinor)}` };
+  }
+  if (amountMinor < minimumMinor) {
+    return { error: `The minimum payment is ${toMajorUnits(minimumMinor)}` };
+  }
+
+  return { amountMinor };
 }
 
 /**
@@ -245,13 +381,23 @@ async function finalizeFullCoursePayment(transaction, gatewayPayment) {
   return current;
 }
 
-async function finalizeInstallmentPayment(transaction, gatewayPayment) {
+/**
+ * Settles one part payment against its plan.
+ *
+ * Named for the transaction type it serves (`course_installment`), which is kept
+ * stable so payments already in flight at the gateway when this shipped still
+ * finalize through the webhook.
+ */
+async function finalizeInstallmentPayment(transaction, gatewayPayment, options = {}) {
+  // Offline payments are money the tutor already holds, so the instructor
+  // credit is suppressed for them — everything else settles identically.
+  const { creditRecipient = true } = options;
   const plan = await CoursePaymentPlan.findById(transaction.paymentPlanId);
   if (!plan) throw new Error('Payment plan not found');
 
-  const installmentNumber = Number(transaction.installmentNumber);
-  const installment = plan.installments.find(item => item.number === installmentNumber);
-  if (!installment) throw new Error('Installment not found');
+  const paymentNumber = Number(transaction.installmentNumber);
+  const payment = plan.installments.find(item => item.number === paymentNumber);
+  if (!payment) throw new Error('Payment not found on plan');
 
   const transactionUpdate = {
     status: 'successful',
@@ -260,43 +406,150 @@ async function finalizeInstallmentPayment(transaction, gatewayPayment) {
   if (gatewayPayment?.id) transactionUpdate.gatewayTransactionId = String(gatewayPayment.id);
   await Transaction.updateOne({ _id: transaction._id, status: { $ne: 'successful' } }, { $set: transactionUpdate });
 
+  const now = new Date();
+  // The settlement clock starts at the first payment and is never extended by
+  // later ones, so a plan cannot be strung out indefinitely by paying the
+  // minimum whenever the deadline approaches.
+  const settlementDueAt = plan.settlementDueAt || addDays(now, SETTLEMENT_WINDOW_DAYS);
+
   // The elemMatch guard is what makes the $inc safe: only the first finalizer
-  // to flip this installment to paid also increments the paid total, so a
-  // replayed webhook cannot inflate amountPaidMinor.
+  // to flip this payment to paid also increments the paid total, so a replayed
+  // webhook cannot inflate amountPaidMinor.
   const updatedPlan = await CoursePaymentPlan.findOneAndUpdate(
-    { _id: plan._id, installments: { $elemMatch: { number: installmentNumber, status: { $ne: 'paid' } } } },
+    { _id: plan._id, installments: { $elemMatch: { number: paymentNumber, status: { $ne: 'paid' } } } },
     {
       $set: {
         'installments.$.status': 'paid',
-        'installments.$.gatewayTransactionId': gatewayPayment?.id ? String(gatewayPayment.id) : installment.gatewayTransactionId,
-        'installments.$.paidAt': new Date(),
+        'installments.$.gatewayTransactionId': gatewayPayment?.id ? String(gatewayPayment.id) : payment.gatewayTransactionId,
+        'installments.$.paidAt': now,
         status: 'active',
         accessStatus: 'active',
-        lastPaymentAt: new Date(),
+        lastPaymentAt: now,
+        firstPaymentAt: plan.firstPaymentAt || now,
+        settlementDueAt,
       },
-      $inc: { amountPaidMinor: installment.amountMinor },
+      $inc: { amountPaidMinor: payment.amountMinor },
     },
     { new: true },
   );
 
   const currentPlan = updatedPlan || await CoursePaymentPlan.findById(plan._id);
-  const allPaid = currentPlan.installments.every(item => item.status === 'paid');
-  if (allPaid && currentPlan.status !== 'completed') {
+  const isSettled = Number(currentPlan.amountPaidMinor) >= Number(currentPlan.totalAmountMinor);
+  if (isSettled && currentPlan.status !== 'completed') {
     currentPlan.status = 'completed';
     currentPlan.accessStatus = 'active';
     await currentPlan.save();
   }
 
-  // Access is granted from the first paid installment onward.
+  // Access is granted from the first settled payment onward.
   await grantCourseAccess({ userId: currentPlan.userId, courseId: currentPlan.courseId, plan: currentPlan });
 
-  // Only credit when this call is the one that actually marked the installment
-  // paid; otherwise a replay would pay the instructor twice for one installment.
-  if (updatedPlan) {
+  // Only credit when this call is the one that actually marked the payment paid;
+  // otherwise a replay would pay the instructor twice for one payment.
+  if (updatedPlan && creditRecipient) {
     await creditInstructor(transaction, Number(transaction.amount));
   }
 
   return currentPlan;
+}
+
+/**
+ * Records money collected outside the platform against a student's plan.
+ *
+ * Used by the tutor-initiated enrolment flow. The cash never passed through the
+ * gateway, so the instructor is not credited — they already have it — but the
+ * balance, access grant and settlement clock all run through the same
+ * settlement path as an online payment, so the student sees one balance
+ * regardless of how each part of it was paid.
+ */
+async function recordOfflinePayment({ plan, amountMinor, recordedBy }) {
+  const amount = Math.max(0, Math.trunc(Number(amountMinor) || 0));
+  if (amount <= 0) return null;
+
+  const paymentNumber = nextPaymentNumber(plan);
+  const txRef = `course-offline-${plan._id}-${paymentNumber}-${crypto.randomBytes(6).toString('hex')}`;
+  const now = new Date();
+
+  plan.installments.push({
+    number: paymentNumber,
+    amountMinor: amount,
+    status: 'processing',
+    txRef,
+    lastAttemptAt: now,
+    attempts: 1,
+  });
+  await plan.save();
+
+  let transaction;
+  try {
+    transaction = await Transaction.create({
+      userId: plan.userId,
+      courseId: plan.courseId,
+      paymentPlanId: plan._id,
+      installmentNumber: paymentNumber,
+      amount: toMajorUnits(amount),
+      type: 'course_payment_offline',
+      status: 'pending',
+      txRef,
+      paidAt: now,
+      metadata: {
+        channel: 'offline',
+        recordedBy: recordedBy ? String(recordedBy) : undefined,
+      },
+    });
+  } catch (error) {
+    // Nothing was charged, so leave no half-written row behind.
+    await CoursePaymentPlan.updateOne({ _id: plan._id }, { $pull: { installments: { txRef } } });
+    throw error;
+  }
+
+  return finalizeInstallmentPayment(transaction, null, { creditRecipient: false });
+}
+
+/**
+ * Opens or reuses the live part-payment plan for a student on a course.
+ *
+ * Shared by the student-facing endpoint and by the tutor-initiated enrolment
+ * flow so both go through exactly one definition of "the student's live plan".
+ */
+async function openPlanForStudent({ user, course, createdBy }) {
+  const policy = resolvePartPaymentPolicy(course);
+  if (!policy.partPaymentEnabled) {
+    throw Object.assign(new Error('This course does not require payment'), { status: 400 });
+  }
+
+  const existing = await CoursePaymentPlan.findOne({
+    userId: user._id,
+    courseId: course._id,
+    status: { $in: ['pending', 'active', 'overdue'] },
+  });
+  if (existing) {
+    if (refreshDueStatus(existing)) await existing.save();
+    return existing;
+  }
+
+  try {
+    return await CoursePaymentPlan.create({
+      userId: user._id,
+      courseId: course._id,
+      currency: 'NGN',
+      totalAmountMinor: policy.totalAmountMinor,
+      priceSnapshot: { courseTitle: course.title, courseFee: Number(course.fee) },
+      installments: [],
+      createdBy: createdBy || undefined,
+    });
+  } catch (createError) {
+    // Lost a race against a concurrent create; the unique partial index held, so
+    // adopt the plan that won instead of failing the request.
+    if (createError?.code !== 11000) throw createError;
+    const winner = await CoursePaymentPlan.findOne({
+      userId: user._id,
+      courseId: course._id,
+      status: { $in: ['pending', 'active', 'overdue'] },
+    });
+    if (!winner) throw createError;
+    return winner;
+  }
 }
 
 /** True when the student may open course content right now. */
@@ -317,20 +570,29 @@ async function hasActiveCourseAccess(userId, courseId) {
 
 module.exports = {
   MINOR_UNIT,
+  FULL_PAYMENT_TYPES,
   PLATFORM_FEE_RATE,
   GRACE_PERIOD_DAYS,
-  MIN_INSTALLMENTS,
-  MAX_INSTALLMENTS,
-  DEFAULT_INSTALLMENTS,
+  SETTLEMENT_WINDOW_DAYS,
+  MIN_PART_PAYMENT_RATE,
+  MAX_PAYMENTS_PER_PLAN,
   toMinorUnits,
   toMajorUnits,
+  addDays,
   serializePlan,
-  buildInstallments,
+  normalizePlan,
   refreshDueStatus,
-  resolveInstallmentPolicy,
+  resolvePartPaymentPolicy,
+  planOutstandingMinor,
+  planInFlightMinor,
+  nextPaymentNumber,
+  minimumPaymentMinor,
+  validatePaymentAmount,
+  openPlanForStudent,
   grantCourseAccess,
   creditInstructor,
   finalizeFullCoursePayment,
   finalizeInstallmentPayment,
+  recordOfflinePayment,
   hasActiveCourseAccess,
 };

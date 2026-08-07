@@ -66,7 +66,9 @@ async function checkPurchaseEligibility({ course, user, userId }) {
   if (!user) return { status: 404, message: 'User not found' };
   if (user.blocked) return { status: 403, message: 'Your account is not permitted to enroll' };
   if (!['student', 'client'].includes(user.role)) return { status: 403, message: 'Only students can enroll' };
-  if (!user.isVerified) return { status: 403, message: 'Please verify your email before paying' };
+  // A machine-readable code lets the client open its verification flow instead of
+  // string-matching this message.
+  if (!user.isVerified) return { status: 403, message: 'Please verify your email before paying', code: 'EMAIL_NOT_VERIFIED' };
   if (!course.approved) return { status: 403, message: 'This course is not open for enrollment yet' };
   if (String(course.instructorId) === String(userId)) return { status: 400, message: 'You cannot enroll in your own course' };
   if (course.enrollmentDeadline && new Date(course.enrollmentDeadline) < new Date()) {
@@ -85,12 +87,21 @@ async function checkPurchaseEligibility({ course, user, userId }) {
     status: { $in: ['pending', 'active', 'overdue'] },
   });
   if (existingPlan) {
-    return {
-      status: 409,
-      message: 'You already have an installment plan for this course. Continue with your next installment.',
-      code: 'PLAN_EXISTS',
-      planId: existingPlan._id,
-    };
+    // An untouched plan is just an abandoned intent, so it must not block paying
+    // in full. Retire it and let the full payment proceed. A plan with money
+    // against it is a real balance and has to be settled through the plan.
+    if (Number(existingPlan.amountPaidMinor) > 0 || (existingPlan.installments || []).some(entry => entry.status === 'processing')) {
+      return {
+        status: 409,
+        message: 'You already have a part payment plan for this course. Continue from your outstanding balance.',
+        code: 'PLAN_EXISTS',
+        planId: existingPlan._id,
+      };
+    }
+    await CoursePaymentPlan.updateOne(
+      { _id: existingPlan._id, amountPaidMinor: 0, status: { $in: ['pending', 'active', 'overdue'] } },
+      { $set: { status: 'cancelled' } },
+    );
   }
 
   return null;

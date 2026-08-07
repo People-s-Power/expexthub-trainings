@@ -26,13 +26,14 @@ transactionRouter.post('/pay-with', authenticate, walletLimiter, transactionCont
 transactionRouter.post('/initialize-course-payment', authenticate, authorize('student', 'client'), paymentLimiter, validateObjectId('courseId'), transactionController.initializeCoursePayment);
 transactionRouter.post('/pay-course-with-wallet', authenticate, authorize('student', 'client'), walletLimiter, validateObjectId('courseId'), transactionController.payCourseWithWallet);
 
-// Payment plan endpoints (student/client only)
+// Part payment endpoints (student/client only). The student chooses each amount,
+// so there is no per-instalment addressing any more — the plan tracks the balance.
 const paymentPlanController = require('../controllers/paymentPlanController.js');
 transactionRouter.post('/course-payment-plans', authenticate, authorize('student', 'client'), paymentLimiter, validateObjectId('courseId'), paymentPlanController.createPlan);
 transactionRouter.get('/course-payment-plans', authenticate, authorize('student', 'client'), generalLimiter, paymentPlanController.listPlans);
 transactionRouter.get('/course-payment-plans/:planId', authenticate, authorize('student', 'client'), validateObjectId('planId'), generalLimiter, paymentPlanController.getPlan);
-transactionRouter.post('/course-payment-plans/:planId/installments/:number/initialize', authenticate, authorize('student', 'client'), paymentLimiter, validateObjectId('planId'), paymentPlanController.initializeInstallment);
-transactionRouter.post('/course-payment-plans/:planId/installments/:number/pay-with-wallet', authenticate, authorize('student', 'client'), walletLimiter, validateObjectId('planId'), paymentPlanController.payInstallmentWithWallet);
+transactionRouter.post('/course-payment-plans/:planId/payments', authenticate, authorize('student', 'client'), paymentLimiter, validateObjectId('planId'), paymentPlanController.initializePayment);
+transactionRouter.post('/course-payment-plans/:planId/payments/wallet', authenticate, authorize('student', 'client'), walletLimiter, validateObjectId('planId'), paymentPlanController.payWithWallet);
 
 // Admin-only operations
 transactionRouter.post('/cancel-premium/:userId', authenticate, authorize('admin'), validateObjectId('userId'), transactionController.cancelPremiumPlan);

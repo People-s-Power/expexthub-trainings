@@ -1,9 +1,21 @@
 const mongoose = require('mongoose');
 
-const installmentSchema = new mongoose.Schema({
-  number: { type: Number, required: true, min: 1, max: 6 },
+/**
+ * One part payment a student committed to.
+ *
+ * The collection is still called `installments` and the entries are still keyed
+ * by `number` because in-flight gateway transactions reference that number, and
+ * renumbering or renaming would orphan a webhook mid-flight. Entries are only
+ * created when a student actually starts a payment — there are no placeholder
+ * rows for money nobody has committed to yet.
+ */
+const partPaymentSchema = new mongoose.Schema({
+  // Not dense: numbers are stable identifiers, so pruning never re-uses one.
+  number: { type: Number, required: true, min: 1, max: 100 },
   amountMinor: { type: Number, required: true, min: 1 },
-  dueAt: { type: Date, required: true },
+  // Legacy schedules carried a due date per instalment. Student-chosen payments
+  // are due immediately, so this is only populated on pre-existing documents.
+  dueAt: { type: Date },
   status: {
     type: String,
     enum: ['pending', 'processing', 'paid', 'failed', 'overdue'],
@@ -20,10 +32,8 @@ const coursePaymentPlanSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   courseId: { type: mongoose.Schema.Types.ObjectId, ref: 'Course', required: true, index: true },
   currency: { type: String, default: 'NGN', uppercase: true },
-  // Snapshotted from the course at plan creation and immutable thereafter: if a
-  // tutor later changes the course policy, students already mid-plan keep the
-  // schedule they agreed to.
-  installmentCount: { type: Number, default: 3, min: 2, max: 6, immutable: true },
+  // Snapshotted at creation: a later fee change must not move the goalposts for
+  // a student who has already started paying.
   totalAmountMinor: { type: Number, required: true, min: 1 },
   amountPaidMinor: { type: Number, default: 0, min: 0 },
   status: {
@@ -41,17 +51,15 @@ const coursePaymentPlanSchema = new mongoose.Schema({
     courseTitle: String,
     courseFee: Number,
   },
-  installments: {
-    type: [installmentSchema],
-    validate: {
-      validator: function(value) {
-        // The count was fixed at creation, so validate against this document's own count.
-        return Array.isArray(value) && value.length === this.installmentCount;
-      },
-      message: 'Installments array length must match the plan\'s installmentCount'
-    }
-  },
+  installments: { type: [partPaymentSchema], default: [] },
+  firstPaymentAt: Date,
   lastPaymentAt: Date,
+  // The balance must be cleared by this date. Set from the first settled payment
+  // and never extended, so a plan has a definite end.
+  settlementDueAt: { type: Date, index: true },
+  // Set when a tutor or admin opened the plan on the student's behalf while
+  // recording an offline payment, so manual enrolments stay auditable.
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
 }, { timestamps: true });
 
 // A student can have one live plan for a course. Historical cancelled plans remain auditable.

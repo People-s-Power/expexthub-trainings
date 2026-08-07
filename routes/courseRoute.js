@@ -31,6 +31,9 @@ courseRouter.get("/enrolled-courses/:userId", authenticate, validateObjectId('us
 // Instructor/admin course management
 courseRouter.post("/add-course/:userId", authenticate, authorize('tutor', 'admin'), validateObjectId('userId'), courseController.addCourse);
 courseRouter.get("/admissions/:courseId", authenticate, authorize('tutor', 'admin'), validateObjectId('courseId'), courseController.getEnrolledStudents);
+// Enrolling somebody else needs its own endpoint: /enroll deliberately ignores
+// any student id in the body so a student cannot enroll another account.
+courseRouter.post("/enroll-student/:courseId", authenticate, authorize('tutor', 'admin'), validateObjectId('courseId'), courseController.enrollStudentByInstructor);
 courseRouter.post("/assign/:courseId", authenticate, authorize('tutor', 'admin'), validateObjectId('courseId'), courseController.assignTutor);
 courseRouter.delete("/delete/:id", authenticate, authorize('tutor', 'admin'), validateObjectId('id'), courseController.deleteCourse);
 courseRouter.put("/edit/:id", authenticate, authorize('tutor', 'admin'), validateObjectId('id'), courseController.editCourse);

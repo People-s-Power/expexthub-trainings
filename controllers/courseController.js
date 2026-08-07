@@ -16,7 +16,16 @@ const isSameOrAfter = require("dayjs/plugin/isSameOrAfter.js");
 const LearningEvent = require("../models/event.js");
 const { createGoogleMeet } = require("../utils/createGoogleMeeting.js");
 const { default: mongoose } = require("mongoose");
-const { creditInstructor } = require("../services/coursePaymentService.js");
+const {
+    creditInstructor,
+    openPlanForStudent,
+    recordOfflinePayment,
+    resolvePartPaymentPolicy,
+    serializePlan,
+    toMinorUnits,
+    toMajorUnits,
+    FULL_PAYMENT_TYPES,
+} = require("../services/coursePaymentService.js");
 
 dayjs.extend(isBetween)
 dayjs.extend(isSameOrAfter)
@@ -25,6 +34,66 @@ dayjs.extend(isSameOrAfter)
 // const categories = ["Virtual Assistant", "Product Management", "Cybersecurity", "Software Development", "AI / Machine Learning", "Data Analysis & Visualisation", "Story Telling", "Animation", "Cloud Computing", "Dev Ops", "UI/UX Design", "Journalism", "Game development", "Data Science", "Digital Marketing", "Advocacy"]
 
 
+
+/**
+ * Appends an enrollment without duplicating a row or overshooting capacity.
+ *
+ * The filter is the concurrency control: two simultaneous requests cannot both
+ * match it, so the database — not the application — decides who takes the last
+ * seat.
+ */
+async function addEnrollment(course, studentId, status = 'active') {
+    const capacityFilter = course.capacity
+        ? { [`enrolledStudents.${course.capacity - 1}`]: { $exists: false } }
+        : {};
+
+    const result = await Course.updateOne(
+        { _id: course._id, enrolledStudents: { $ne: studentId }, ...capacityFilter },
+        {
+            $addToSet: { enrolledStudents: studentId },
+            $push: {
+                enrollments: {
+                    user: studentId,
+                    status,
+                    enrolledOn: new Date(),
+                },
+            },
+        },
+    );
+    if (result.modifiedCount > 0) return { enrolled: true };
+
+    const fresh = await Course.findById(course._id).select('enrolledStudents').lean();
+    const alreadyEnrolled = (fresh?.enrolledStudents || []).some(id => String(id) === String(studentId));
+    return { enrolled: false, reason: alreadyEnrolled ? 'already_enrolled' : 'full' };
+}
+
+/**
+ * True when the caller may administer this course.
+ *
+ * Read from the stored user rather than the token claims, so a role changed
+ * after a token was issued takes effect immediately.
+ */
+function canManageCourse(course, caller) {
+    if (!course || !caller) return false;
+    if (caller.role === 'admin') return true;
+    const callerId = String(caller._id);
+    if (String(course.instructorId) === callerId) return true;
+    return (course.assignedTutors || []).some(tutorId => String(tutorId) === callerId);
+}
+
+/** Tells the student they were added. Never fails the enrollment it reports. */
+async function notifyEnrolledStudent(student, course, headline = 'You have been enrolled in a course') {
+    try {
+        await Notification.create({
+            title: headline,
+            content: `You have been enrolled in ${course.title}`,
+            contentId: course._id,
+            userId: student._id,
+        });
+    } catch (error) {
+        console.error('Enrollment notification failed:', error.message);
+    }
+}
 
 const courseController = {
 
@@ -185,7 +254,7 @@ const courseController = {
 
     addCourse: async (req, res) => {
 
-        const { title, about, duration, type, startDate, endDate, startTime, endTime, category, privacy, days, fee, strikedFee, scholarship, meetingPassword, target, modules, benefits, timeframe, audience, meetingType, primaryColor, installmentsEnabled, installmentCount } = req.body;
+        const { title, about, duration, type, startDate, endDate, startTime, endTime, category, privacy, days, fee, strikedFee, scholarship, meetingPassword, target, modules, benefits, timeframe, audience, meetingType, primaryColor } = req.body;
 
         // Get user ID from the request headers
         const userId = req.params.userId;
@@ -224,21 +293,9 @@ const courseController = {
             ? audience.filter((id) => mongoose.Types.ObjectId.isValid(id))
             : [];
 
-        // Validate installment settings when provided. Free courses cannot offer
-        // installments regardless of the flag, so clients only send these for paid courses.
-        let validatedInstallmentsEnabled = false;
-        let validatedInstallmentCount = 3;
-        if (fee && Number(fee) > 0) {
-            validatedInstallmentsEnabled = Boolean(installmentsEnabled);
-            if (validatedInstallmentsEnabled) {
-                const count = Number(installmentCount);
-                if (Number.isInteger(count) && count >= 2 && count <= 6) {
-                    validatedInstallmentCount = count;
-                } else if (installmentCount !== undefined) {
-                    return res.status(400).json({ message: 'Installment count must be between 2 and 6' });
-                }
-            }
-        }
+        // Part payment is a platform capability available on every paid course —
+        // the student chooses what to pay and when — so there is nothing for the
+        // instructor to configure here.
 
 
         if (user.role === "tutor" && ((user.premiumPlan === "basic" && coursesByUser.length >= 5) || user.premiumPlan === "standard" && coursesByUser.length >= 20)) {
@@ -290,8 +347,6 @@ const courseController = {
                 primaryColor,
                 days,
                 strikedFee,
-                installmentsEnabled: validatedInstallmentsEnabled,
-                installmentCount: validatedInstallmentCount,
                 modules,
                 benefits,
                 enrolledStudents: scholarshipIds,
@@ -545,7 +600,7 @@ const courseController = {
                 return res.status(403).json({ message: 'Your account is not permitted to enroll' });
             }
             if (!user.isVerified) {
-                return res.status(403).json({ message: 'Please verify your email before enrolling' });
+                return res.status(403).json({ message: 'Please verify your email before enrolling', code: 'EMAIL_NOT_VERIFIED' });
             }
             if (!course.approved) {
                 return res.status(403).json({ message: 'This course is not open for enrollment yet' });
@@ -570,7 +625,7 @@ const courseController = {
                     Transaction.findOne({
                         userId: id,
                         courseId,
-                        type: { $in: ['course_payment', 'course_payment_wallet'] },
+                        type: { $in: FULL_PAYMENT_TYPES },
                         status: 'successful',
                     }),
                     // Any plan with at least one installment paid already grants access,
@@ -589,26 +644,9 @@ const courseController = {
 
             // Conditional write: two concurrent requests cannot both append an
             // enrollment, and the capacity ceiling is re-checked atomically.
-            const capacityFilter = course.capacity
-                ? { [`enrolledStudents.${course.capacity - 1}`]: { $exists: false } }
-                : {};
-            const result = await Course.updateOne(
-                { _id: course._id, enrolledStudents: { $ne: user._id }, ...capacityFilter },
-                {
-                    $addToSet: { enrolledStudents: user._id },
-                    $push: {
-                        enrollments: {
-                            user: user._id,
-                            status: 'active',
-                            enrolledOn: new Date(),
-                        },
-                    },
-                },
-            );
-            if (result.modifiedCount === 0) {
-                const fresh = await Course.findById(course._id).select('enrolledStudents capacity').lean();
-                const nowEnrolled = (fresh?.enrolledStudents || []).some(studentId => String(studentId) === String(id));
-                if (nowEnrolled) {
+            const { enrolled, reason } = await addEnrollment(course, user._id);
+            if (!enrolled) {
+                if (reason === 'already_enrolled') {
                     return res.status(409).json({ message: 'Student is already enrolled in the course' });
                 }
                 return res.status(409).json({ message: 'This course is full' });
@@ -631,6 +669,186 @@ const courseController = {
             return res.status(200).json({ message: 'Enrolled successfully', courseId: course._id });
         } catch (error) {
             console.error('Enrollment failed:', error);
+            return res.status(500).json({ message: 'Unexpected error during enrollment' });
+        }
+    },
+
+    /**
+     * Enrolls a student on a course the caller administers.
+     *
+     * Deliberately a separate endpoint from `enrollCourse` rather than a flag on
+     * it: `enrollCourse` ignores any student id in the body precisely so a
+     * signed-in student cannot enroll somebody else, and that property is worth
+     * keeping. Here the student id IS the input, and the right to name another
+     * user comes from owning the course — checked below, not from the role
+     * alone, so one tutor cannot enroll students onto another tutor's course.
+     *
+     * Payment methods:
+     *   free/scholarship — no money changes hands; the seat is granted outright.
+     *   offline          — cash the tutor already collected. Recorded against
+     *                      the same balance-tracked plan a student-paid course
+     *                      uses, so a part payment taken offline and one taken
+     *                      online are the same object to everyone downstream.
+     *   gateway          — nothing is recorded; the caller is told to send the
+     *                      student through checkout instead.
+     */
+    enrollStudentByInstructor: async (req, res) => {
+        const courseId = req.params.courseId;
+        const callerId = req.user?.id || req.user?._id;
+        const studentId = req.body?.studentId || req.body?.id;
+        const paymentMethod = String(req.body?.paymentMethod || '').toLowerCase();
+
+        try {
+            if (!callerId) {
+                return res.status(401).json({ message: 'Authentication required' });
+            }
+            if (!mongoose.Types.ObjectId.isValid(String(studentId || ''))) {
+                return res.status(400).json({ message: 'Select the student you want to enroll' });
+            }
+
+            const [course, caller, student] = await Promise.all([
+                Course.findById(courseId),
+                User.findById(callerId),
+                User.findById(studentId),
+            ]);
+
+            if (!course) {
+                return res.status(404).json({ message: 'Course not found' });
+            }
+            if (!canManageCourse(course, caller)) {
+                return res.status(403).json({ message: 'You can only enroll students on your own courses' });
+            }
+            if (!student) {
+                return res.status(404).json({ message: 'Student not found' });
+            }
+            if (!['student', 'client'].includes(student.role)) {
+                return res.status(400).json({ message: 'Only student accounts can be enrolled on a course' });
+            }
+            if (student.blocked) {
+                return res.status(403).json({ message: 'This account is not permitted to enroll' });
+            }
+            if (String(course.instructorId) === String(student._id)) {
+                return res.status(400).json({ message: 'The course instructor cannot be enrolled as a student' });
+            }
+            if ((course.enrolledStudents || []).some(id => String(id) === String(student._id))) {
+                return res.status(409).json({ message: 'Student is already enrolled in the course' });
+            }
+            if (course.capacity && (course.enrolledStudents || []).length >= course.capacity) {
+                return res.status(409).json({ message: 'This course is full' });
+            }
+            // The approval and enrollment-deadline gates exist to protect
+            // students browsing the catalogue. The owner adding a known student
+            // is an explicit act, so neither applies here.
+
+            const fee = Number(course.fee || 0);
+            if (fee <= 0) {
+                const { enrolled, reason } = await addEnrollment(course, student._id, 'active');
+                if (!enrolled) {
+                    return res.status(409).json({
+                        message: reason === 'already_enrolled'
+                            ? 'Student is already enrolled in the course'
+                            : 'This course is full',
+                    });
+                }
+                await notifyEnrolledStudent(student, course);
+                return res.status(200).json({ message: 'Student enrolled successfully', courseId: course._id });
+            }
+
+            // Paid course. Anything already settled counts, so re-enrolling a
+            // student who paid before never asks for the money twice.
+            const [paidTransaction, existingPlan] = await Promise.all([
+                Transaction.findOne({
+                    userId: student._id,
+                    courseId: course._id,
+                    type: { $in: FULL_PAYMENT_TYPES },
+                    status: 'successful',
+                }),
+                CoursePaymentPlan.findOne({
+                    userId: student._id,
+                    courseId: course._id,
+                    status: { $in: ['pending', 'active', 'overdue', 'completed'] },
+                }),
+            ]);
+
+            if (paidTransaction || Number(existingPlan?.amountPaidMinor || 0) > 0) {
+                const status = existingPlan && existingPlan.status !== 'completed' ? 'payment_plan_active' : 'active';
+                const { enrolled, reason } = await addEnrollment(course, student._id, status);
+                if (!enrolled) {
+                    return res.status(409).json({
+                        message: reason === 'already_enrolled'
+                            ? 'Student is already enrolled in the course'
+                            : 'This course is full',
+                    });
+                }
+                await notifyEnrolledStudent(student, course);
+                return res.status(200).json({
+                    message: 'Student enrolled successfully',
+                    courseId: course._id,
+                    plan: existingPlan ? serializePlan(existingPlan) : undefined,
+                });
+            }
+
+            if (paymentMethod === 'scholarship' || paymentMethod === 'free') {
+                const { enrolled, reason } = await addEnrollment(course, student._id, 'scholarship');
+                if (!enrolled) {
+                    return res.status(409).json({
+                        message: reason === 'already_enrolled'
+                            ? 'Student is already enrolled in the course'
+                            : 'This course is full',
+                    });
+                }
+                await notifyEnrolledStudent(student, course, 'You have been given a scholarship place');
+                return res.status(200).json({ message: 'Student enrolled on a scholarship place', courseId: course._id });
+            }
+
+            if (paymentMethod === 'offline') {
+                const policy = resolvePartPaymentPolicy(course);
+                const plan = await openPlanForStudent({ user: student, course, createdBy: caller._id });
+
+                // Absent an amount, the tutor is recording the full fee. A part
+                // amount leaves the remainder for the student to settle online.
+                const requested = req.body?.amountPaid === undefined || req.body?.amountPaid === null || req.body?.amountPaid === ''
+                    ? toMajorUnits(policy.totalAmountMinor)
+                    : Number(req.body.amountPaid);
+
+                if (!Number.isFinite(requested) || requested <= 0) {
+                    return res.status(400).json({ message: 'Enter the amount you collected from the student' });
+                }
+
+                const amountMinor = toMinorUnits(requested);
+                const outstandingMinor = Math.max(0, Number(plan.totalAmountMinor) - Number(plan.amountPaidMinor || 0));
+                if (amountMinor > outstandingMinor) {
+                    return res.status(400).json({
+                        message: `The outstanding balance is ${toMajorUnits(outstandingMinor)}. You cannot record more than that.`,
+                    });
+                }
+
+                const settledPlan = await recordOfflinePayment({
+                    plan,
+                    amountMinor,
+                    recordedBy: caller._id,
+                });
+
+                await notifyEnrolledStudent(student, course);
+                return res.status(200).json({
+                    message: 'Payment recorded and student enrolled',
+                    courseId: course._id,
+                    plan: serializePlan(settledPlan),
+                });
+            }
+
+            // No settled money and no offline record: enrolling now would give
+            // away a paid seat, so say what the caller has to do instead.
+            return res.status(402).json({
+                message: 'This is a paid course. Record the payment you collected, or send the student a payment link.',
+                code: 'PAYMENT_REQUIRED',
+                fee,
+            });
+        } catch (error) {
+            if (error?.status) {
+                return res.status(error.status).json({ message: error.message });
+            }
+            console.error('Instructor enrollment failed:', error);
             return res.status(500).json({ message: 'Unexpected error during enrollment' });
         }
     },
@@ -823,28 +1041,12 @@ const courseController = {
             })
             console.log(videos, req.body.videos, "yes oo");
 
-            // Validate installment settings when provided in the update. Free courses
-            // cannot offer installments, so clear the flag and reset count to default if
-            // the fee is being removed or set to zero.
             const updates = { ...req.body, videos };
-            const updatedFee = Number(updates.fee ?? course.fee);
-            if (updates.installmentsEnabled !== undefined || updates.installmentCount !== undefined) {
-                if (updatedFee > 0) {
-                    if (updates.installmentsEnabled !== undefined) {
-                        updates.installmentsEnabled = Boolean(updates.installmentsEnabled);
-                    }
-                    if (updates.installmentCount !== undefined) {
-                        const count = Number(updates.installmentCount);
-                        if (!Number.isInteger(count) || count < 2 || count > 6) {
-                            return res.status(400).json({ message: 'Installment count must be between 2 and 6' });
-                        }
-                        updates.installmentCount = count;
-                    }
-                } else {
-                    updates.installmentsEnabled = false;
-                    updates.installmentCount = 3;
-                }
-            }
+            // Installment policy left the course document — the student now
+            // chooses each amount. Dropped explicitly so a cached older client
+            // sending these fields gets a clean update rather than a schema error.
+            delete updates.installmentsEnabled;
+            delete updates.installmentCount;
 
             await Course.updateOne({ _id: courseId }, updates, { new: true });
             res.json({ message: 'Course updated successfully' });

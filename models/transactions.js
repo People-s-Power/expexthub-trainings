@@ -4,7 +4,9 @@ const transactionSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
   courseId: { type: mongoose.Schema.Types.ObjectId, ref: 'Course', required: false, index: true },
   paymentPlanId: { type: mongoose.Schema.Types.ObjectId, ref: 'CoursePaymentPlan', required: false, index: true },
-  installmentNumber: { type: Number, required: false, min: 1, max: 6 },
+  // Sequence number of a part payment within its plan. Bounded generously: the
+  // real ceiling on payments per plan is enforced in the payment service.
+  installmentNumber: { type: Number, required: false, min: 1, max: 100 },
   amount: Number,
   type: String,
   soldBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: false },
