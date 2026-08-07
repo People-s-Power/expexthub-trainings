@@ -1,9 +1,15 @@
 const crypto = require('crypto');
+const axios = require('axios');
 const Course = require('../models/courses.js');
 const User = require('../models/user.js');
 const Transaction = require('../models/transactions.js');
 const Notification = require('../models/notifications.js');
 const CoursePaymentPlan = require('../models/coursePaymentPlans.js');
+
+const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
+const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
+const flwHeaders = { Authorization: `Bearer ${flutterwaveSecretKey}` };
+const GATEWAY_TIMEOUT_MS = 20000;
 
 const MINOR_UNIT = 100;
 const PLATFORM_FEE_RATE = 0.05;
@@ -28,7 +34,7 @@ const MAX_PAYMENTS_PER_PLAN = 24;
 // Transaction types that each, on their own, mean the course fee was settled in
 // full. Anything checking "has this student already paid?" must consider all of
 // them or it will let a paid student be charged twice.
-const FULL_PAYMENT_TYPES = ['course_payment', 'course_payment_wallet', 'course_payment_offline'];
+const FULL_PAYMENT_TYPES = ['course_payment', 'course_payment_wallet'];
 
 function toMinorUnits(amount) {
   const value = Number(amount);
@@ -388,10 +394,7 @@ async function finalizeFullCoursePayment(transaction, gatewayPayment) {
  * stable so payments already in flight at the gateway when this shipped still
  * finalize through the webhook.
  */
-async function finalizeInstallmentPayment(transaction, gatewayPayment, options = {}) {
-  // Offline payments are money the tutor already holds, so the instructor
-  // credit is suppressed for them — everything else settles identically.
-  const { creditRecipient = true } = options;
+async function finalizeInstallmentPayment(transaction, gatewayPayment) {
   const plan = await CoursePaymentPlan.findById(transaction.paymentPlanId);
   if (!plan) throw new Error('Payment plan not found');
 
@@ -446,64 +449,65 @@ async function finalizeInstallmentPayment(transaction, gatewayPayment, options =
 
   // Only credit when this call is the one that actually marked the payment paid;
   // otherwise a replay would pay the instructor twice for one payment.
-  if (updatedPlan && creditRecipient) {
+  if (updatedPlan) {
     await creditInstructor(transaction, Number(transaction.amount));
   }
 
   return currentPlan;
 }
 
-/**
- * Records money collected outside the platform against a student's plan.
- *
- * Used by the tutor-initiated enrolment flow. The cash never passed through the
- * gateway, so the instructor is not credited — they already have it — but the
- * balance, access grant and settlement clock all run through the same
- * settlement path as an online payment, so the student sees one balance
- * regardless of how each part of it was paid.
- */
-async function recordOfflinePayment({ plan, amountMinor, recordedBy }) {
-  const amount = Math.max(0, Math.trunc(Number(amountMinor) || 0));
-  if (amount <= 0) return null;
+/** Only allow redirect targets we own, so the checkout cannot be turned into an
+ * open redirect that hands a payment reference to somebody else's page. */
+function resolveRedirectUrl(requested) {
+  const allowed = [process.env.FRONTEND_URL, process.env.TRAINING_URL]
+    .filter(Boolean)
+    .map(value => value.replace(/\/$/, ''));
 
-  const paymentNumber = nextPaymentNumber(plan);
-  const txRef = `course-offline-${plan._id}-${paymentNumber}-${crypto.randomBytes(6).toString('hex')}`;
-  const now = new Date();
+  if (!requested) return allowed[0];
 
-  plan.installments.push({
-    number: paymentNumber,
-    amountMinor: amount,
-    status: 'processing',
-    txRef,
-    lastAttemptAt: now,
-    attempts: 1,
-  });
-  await plan.save();
-
-  let transaction;
   try {
-    transaction = await Transaction.create({
-      userId: plan.userId,
-      courseId: plan.courseId,
-      paymentPlanId: plan._id,
-      installmentNumber: paymentNumber,
-      amount: toMajorUnits(amount),
-      type: 'course_payment_offline',
-      status: 'pending',
-      txRef,
-      paidAt: now,
-      metadata: {
-        channel: 'offline',
-        recordedBy: recordedBy ? String(recordedBy) : undefined,
-      },
+    const target = new URL(requested);
+    const isAllowed = allowed.some(base => {
+      try { return new URL(base).origin === target.origin; } catch { return false; }
     });
-  } catch (error) {
-    // Nothing was charged, so leave no half-written row behind.
-    await CoursePaymentPlan.updateOne({ _id: plan._id }, { $pull: { installments: { txRef } } });
-    throw error;
+    return isAllowed ? requested : allowed[0];
+  } catch {
+    return allowed[0];
   }
+}
 
-  return finalizeInstallmentPayment(transaction, null, { creditRecipient: false });
+/**
+ * Opens a hosted Flutterwave checkout and returns its link.
+ *
+ * Bank transfer is listed first because a tutor enrolling a student needs an
+ * account number to hand over — the hosted page renders one for the exact
+ * amount, so no money is ever collected as cash. Card and USSD stay available
+ * for a student paying for themselves.
+ *
+ * Every caller shares this one definition so the payload, timeout and failure
+ * semantics cannot drift between the student and tutor entry points.
+ */
+async function initializeGatewayCheckout({ txRef, amount, currency = 'NGN', customer, title, description, meta, redirectUrl }) {
+  const response = await axios.post(`${flutterwaveBaseURL}payments`, {
+    tx_ref: txRef,
+    amount,
+    currency,
+    redirect_url: resolveRedirectUrl(redirectUrl),
+    payment_options: 'banktransfer,card,ussd',
+    customer: {
+      email: customer?.email,
+      name: customer?.name,
+      phonenumber: customer?.phone || undefined,
+    },
+    customizations: { title: title || 'ExpertHub Training', description },
+    meta,
+  }, { headers: flwHeaders, timeout: GATEWAY_TIMEOUT_MS });
+
+  const link = response.data?.data?.link;
+  if (response.data?.status !== 'success' || !link) {
+    throw new Error('Payment gateway did not return a checkout link');
+  }
+  return link;
 }
 
 /**
@@ -593,6 +597,7 @@ module.exports = {
   creditInstructor,
   finalizeFullCoursePayment,
   finalizeInstallmentPayment,
-  recordOfflinePayment,
   hasActiveCourseAccess,
+  resolveRedirectUrl,
+  initializeGatewayCheckout,
 };

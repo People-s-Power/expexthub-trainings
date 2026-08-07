@@ -11,6 +11,7 @@ const {
   finalizeInstallmentPayment,
   grantCourseAccess,
   creditInstructor,
+  initializeGatewayCheckout,
 } = require('../services/coursePaymentService.js');
 
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
@@ -29,32 +30,6 @@ function safeCompare(a, b) {
     return false;
   }
   return crypto.timingSafeEqual(bufferA, bufferB);
-}
-
-/**
- * Only allow redirect targets we own, so a caller cannot turn our checkout into
- * an open redirect that hands a payment reference to an attacker's page.
- */
-function resolveRedirectUrl(requested) {
-  const allowed = [process.env.FRONTEND_URL, process.env.TRAINING_URL]
-    .filter(Boolean)
-    .map(value => value.replace(/\/$/, ''));
-
-  if (!requested) return allowed[0];
-
-  try {
-    const target = new URL(requested);
-    const isAllowed = allowed.some(base => {
-      try {
-        return new URL(base).origin === target.origin;
-      } catch {
-        return false;
-      }
-    });
-    return isAllowed ? requested : allowed[0];
-  } catch {
-    return allowed[0];
-  }
 }
 
 /**
@@ -151,18 +126,14 @@ const transactionController = {
         metadata: { title: course.title, courseFeeSnapshot: amount },
       });
 
-      const response = await axios.post(`${flutterwaveBaseURL}payments`, {
-        tx_ref: txRef,
+      const link = await initializeGatewayCheckout({
+        txRef,
         amount,
-        currency: 'NGN',
-        redirect_url: resolveRedirectUrl(req.body.redirect_url),
-        customer: { email: user.email, name: user.fullname, phonenumber: user.phone || undefined },
-        customizations: { title: 'ExpertHub Training', description: `Enrollment for ${course.title}` },
+        customer: { email: user.email, name: user.fullname, phone: user.phone },
+        description: `Enrollment for ${course.title}`,
         meta: { userId: String(userId), courseId: String(courseId) },
-      }, { headers: flwHeaders, timeout: GATEWAY_TIMEOUT_MS });
-
-      const link = response.data?.data?.link;
-      if (response.data?.status !== 'success' || !link) throw new Error('Payment gateway did not return a checkout link');
+        redirectUrl: req.body.redirect_url,
+      });
 
       await Transaction.updateOne({ _id: transaction._id }, { $set: { 'metadata.checkoutLink': link } });
       return res.status(201).json({ link, txRef });

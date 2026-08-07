@@ -16,16 +16,18 @@ const isSameOrAfter = require("dayjs/plugin/isSameOrAfter.js");
 const LearningEvent = require("../models/event.js");
 const { createGoogleMeet } = require("../utils/createGoogleMeeting.js");
 const { default: mongoose } = require("mongoose");
+const crypto = require("crypto");
 const {
     creditInstructor,
-    openPlanForStudent,
-    recordOfflinePayment,
-    resolvePartPaymentPolicy,
+    initializeGatewayCheckout,
     serializePlan,
-    toMinorUnits,
-    toMajorUnits,
     FULL_PAYMENT_TYPES,
 } = require("../services/coursePaymentService.js");
+
+// How long a hosted checkout link stays worth reusing. Matches the student-facing
+// window so a tutor re-opening the dialog gets the same link rather than stacking
+// charges on one seat.
+const CHECKOUT_REUSE_WINDOW_MS = 30 * 60 * 1000;
 
 dayjs.extend(isBetween)
 dayjs.extend(isSameOrAfter)
@@ -683,14 +685,14 @@ const courseController = {
      * user comes from owning the course — checked below, not from the role
      * alone, so one tutor cannot enroll students onto another tutor's course.
      *
-     * Payment methods:
+     * No money is ever taken as cash. Outcomes:
      *   free/scholarship — no money changes hands; the seat is granted outright.
-     *   offline          — cash the tutor already collected. Recorded against
-     *                      the same balance-tracked plan a student-paid course
-     *                      uses, so a part payment taken offline and one taken
-     *                      online are the same object to everyone downstream.
-     *   gateway          — nothing is recorded; the caller is told to send the
-     *                      student through checkout instead.
+     *   paid course      — returns a hosted checkout link opened on the
+     *                      student's own account, whose bank-transfer option
+     *                      shows an account number for exactly the fee. The
+     *                      enrollment itself happens in the webhook/verify path
+     *                      like any other payment, so no seat is given away
+     *                      before the money lands.
      */
     enrollStudentByInstructor: async (req, res) => {
         const courseId = req.params.courseId;
@@ -801,49 +803,102 @@ const courseController = {
                 return res.status(200).json({ message: 'Student enrolled on a scholarship place', courseId: course._id });
             }
 
-            if (paymentMethod === 'offline') {
-                const policy = resolvePartPaymentPolicy(course);
-                const plan = await openPlanForStudent({ user: student, course, createdBy: caller._id });
-
-                // Absent an amount, the tutor is recording the full fee. A part
-                // amount leaves the remainder for the student to settle online.
-                const requested = req.body?.amountPaid === undefined || req.body?.amountPaid === null || req.body?.amountPaid === ''
-                    ? toMajorUnits(policy.totalAmountMinor)
-                    : Number(req.body.amountPaid);
-
-                if (!Number.isFinite(requested) || requested <= 0) {
-                    return res.status(400).json({ message: 'Enter the amount you collected from the student' });
-                }
-
-                const amountMinor = toMinorUnits(requested);
-                const outstandingMinor = Math.max(0, Number(plan.totalAmountMinor) - Number(plan.amountPaidMinor || 0));
-                if (amountMinor > outstandingMinor) {
-                    return res.status(400).json({
-                        message: `The outstanding balance is ${toMajorUnits(outstandingMinor)}. You cannot record more than that.`,
-                    });
-                }
-
-                const settledPlan = await recordOfflinePayment({
-                    plan,
-                    amountMinor,
-                    recordedBy: caller._id,
-                });
-
-                await notifyEnrolledStudent(student, course);
-                return res.status(200).json({
-                    message: 'Payment recorded and student enrolled',
-                    courseId: course._id,
-                    plan: serializePlan(settledPlan),
+            // A checkout the student already has open is real money in flight.
+            // Cancelling the plan under it would charge them twice for one seat,
+            // so send the tutor to that balance instead of opening a new charge.
+            if ((existingPlan?.installments || []).some(entry => entry.status === 'processing')) {
+                return res.status(409).json({
+                    message: 'This student has a payment in progress for this course. They will be enrolled automatically once it clears.',
+                    code: 'PLAN_EXISTS',
+                    planId: existingPlan._id,
                 });
             }
 
-            // No settled money and no offline record: enrolling now would give
-            // away a paid seat, so say what the caller has to do instead.
-            return res.status(402).json({
-                message: 'This is a paid course. Record the payment you collected, or send the student a payment link.',
-                code: 'PAYMENT_REQUIRED',
-                fee,
-            });
+            // Paid course, nothing settled: the money has to go through the
+            // gateway. No cash is collected, so the tutor gets a hosted checkout
+            // whose bank-transfer option shows an account number for exactly this
+            // fee. Enrolment happens in the webhook/verify path, the same way it
+            // does when a student pays for themselves — so an unpaid checkout can
+            // never hand out a seat.
+            const openTransaction = await Transaction.findOne({
+                userId: student._id,
+                courseId: course._id,
+                type: 'course_payment',
+                status: 'pending',
+                amount: fee,
+                'metadata.checkoutLink': { $exists: true },
+                date: { $gte: new Date(Date.now() - CHECKOUT_REUSE_WINDOW_MS) },
+            }).sort({ date: -1 });
+
+            if (openTransaction?.metadata?.checkoutLink) {
+                return res.status(200).json({
+                    message: 'A checkout is already open for this student. Share this payment link to complete the enrollment.',
+                    code: 'PAYMENT_PENDING',
+                    link: openTransaction.metadata.checkoutLink,
+                    txRef: openTransaction.txRef,
+                    reused: true,
+                    fee,
+                    student: { id: student._id, fullname: student.fullname, email: student.email },
+                });
+            }
+
+            // An untouched plan is an abandoned intent, not a balance. Retire it so
+            // it cannot block a full payment; a plan with money against it was
+            // already handled above.
+            if (existingPlan) {
+                await CoursePaymentPlan.updateOne(
+                    { _id: existingPlan._id, amountPaidMinor: 0, status: { $in: ['pending', 'active', 'overdue'] } },
+                    { $set: { status: 'cancelled' } },
+                );
+            }
+
+            const txRef = `course-${course._id}-${student._id}-${crypto.randomUUID()}`;
+            let transaction;
+            try {
+                transaction = await Transaction.create({
+                    userId: student._id,
+                    courseId: course._id,
+                    amount: fee,
+                    txRef,
+                    type: 'course_payment',
+                    status: 'pending',
+                    currency: 'NGN',
+                    soldBy: caller._id,
+                    metadata: {
+                        title: course.title,
+                        courseFeeSnapshot: fee,
+                        // Records that a tutor started this charge on the student's
+                        // behalf; the payment itself still belongs to the student.
+                        initiatedBy: String(caller._id),
+                        channel: 'instructor_enrollment',
+                    },
+                });
+
+                const link = await initializeGatewayCheckout({
+                    txRef,
+                    amount: fee,
+                    customer: { email: student.email, name: student.fullname, phone: student.phone },
+                    description: `Enrollment for ${course.title}`,
+                    meta: { userId: String(student._id), courseId: String(course._id) },
+                    redirectUrl: req.body?.redirect_url,
+                });
+
+                await Transaction.updateOne({ _id: transaction._id }, { $set: { 'metadata.checkoutLink': link } });
+                return res.status(201).json({
+                    message: 'Share this payment link with the student to complete the enrollment.',
+                    code: 'PAYMENT_PENDING',
+                    link,
+                    txRef,
+                    fee,
+                    student: { id: student._id, fullname: student.fullname, email: student.email },
+                });
+            } catch (gatewayError) {
+                if (transaction) {
+                    await Transaction.updateOne({ _id: transaction._id, status: 'pending' }, { $set: { status: 'failed' } });
+                }
+                console.error('Instructor checkout initialization failed:', gatewayError.response?.data || gatewayError.message);
+                return res.status(502).json({ message: 'Unable to start payment. Please try again.' });
+            }
         } catch (error) {
             if (error?.status) {
                 return res.status(error.status).json({ message: error.message });

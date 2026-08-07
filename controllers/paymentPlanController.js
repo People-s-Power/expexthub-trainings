@@ -1,5 +1,4 @@
 const crypto = require('crypto');
-const axios = require('axios');
 const Course = require('../models/courses.js');
 const User = require('../models/user.js');
 const Transaction = require('../models/transactions.js');
@@ -15,11 +14,9 @@ const {
   validatePaymentAmount,
   openPlanForStudent,
   FULL_PAYMENT_TYPES,
+  initializeGatewayCheckout,
 } = require('../services/coursePaymentService.js');
 
-const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
-const flwHeaders = { Authorization: `Bearer ${process.env.FLUTTERWAVE_SECRET}` };
-const GATEWAY_TIMEOUT_MS = 20000;
 // A checkout link older than this is assumed abandoned, so the slot is released
 // and a fresh charge can be started.
 const CHECKOUT_REUSE_WINDOW_MS = 30 * 60 * 1000;
@@ -30,23 +27,6 @@ function authenticatedUserId(req) {
 
 function responsePlan(plan) {
   return { plan: serializePlan(plan) };
-}
-
-/** Only allow redirects back to an origin we own (no open redirect). */
-function resolveRedirectUrl(requested) {
-  const allowed = [process.env.FRONTEND_URL, process.env.TRAINING_URL]
-    .filter(Boolean)
-    .map(value => value.replace(/\/$/, ''));
-  if (!requested) return allowed[0];
-  try {
-    const target = new URL(requested);
-    const isAllowed = allowed.some(base => {
-      try { return new URL(base).origin === target.origin; } catch { return false; }
-    });
-    return isAllowed ? requested : allowed[0];
-  } catch {
-    return allowed[0];
-  }
 }
 
 async function getOwnedPlan(req, res) {
@@ -228,26 +208,20 @@ const paymentPlanController = {
       await plan.save();
 
       const outstandingAfter = toMajorUnits(Math.max(0, planOutstandingMinor(plan) - amountMinor));
-      const response = await axios.post(`${flutterwaveBaseURL}payments`, {
-        tx_ref: txRef,
+      const link = await initializeGatewayCheckout({
+        txRef,
         amount: transaction.amount,
         currency: transaction.currency,
-        redirect_url: resolveRedirectUrl(req.body.redirect_url),
-        customer: { email: user.email, name: user.fullname, phonenumber: user.phone || undefined },
-        customizations: {
-          title: 'ExpertHub Training',
-          description: `Part payment for ${plan.priceSnapshot?.courseTitle || 'course'}${outstandingAfter > 0 ? ` (balance after: ${outstandingAfter})` : ' (final payment)'}`,
-        },
+        customer: { email: user.email, name: user.fullname, phone: user.phone },
+        description: `Part payment for ${plan.priceSnapshot?.courseTitle || 'course'}${outstandingAfter > 0 ? ` (balance after: ${outstandingAfter})` : ' (final payment)'}`,
         meta: {
           userId: String(plan.userId),
           courseId: String(plan.courseId),
           paymentPlanId: String(plan._id),
           installmentNumber: paymentNumber,
         },
-      }, { headers: flwHeaders, timeout: GATEWAY_TIMEOUT_MS });
-
-      const link = response.data?.data?.link;
-      if (response.data?.status !== 'success' || !link) throw new Error('Payment gateway did not return a checkout link');
+        redirectUrl: req.body.redirect_url,
+      });
 
       transaction.metadata = { ...(transaction.metadata || {}), checkoutLink: link };
       await transaction.save();
