@@ -13,6 +13,7 @@ const {
   nextPaymentNumber,
   validatePaymentAmount,
   openPlanForStudent,
+  resolvePartPaymentPolicy,
   FULL_PAYMENT_TYPES,
   initializeGatewayCheckout,
 } = require('../services/coursePaymentService.js');
@@ -104,6 +105,27 @@ const paymentPlanController = {
       }
       if (course.capacity && (course.enrolledStudents || []).length >= course.capacity) {
         return res.status(409).json({ message: 'This course is full' });
+      }
+
+      // The instructor decides whether this course may be paid for in parts.
+      // Checked here as well as in openPlanForStudent so a student who somehow
+      // reaches this endpoint for a full-payment-only course gets a straight
+      // answer instead of a generic failure. Anyone already part-way through a
+      // plan is handled below — openPlanForStudent honours committed money
+      // regardless of the current setting.
+      const { partPaymentEnabled } = resolvePartPaymentPolicy(course);
+      const livePlan = await CoursePaymentPlan.findOne({
+        userId,
+        courseId: course._id,
+        status: { $in: ['pending', 'active', 'overdue'] },
+      });
+      const isMidPlan = Number(livePlan?.amountPaidMinor || 0) > 0
+        || (livePlan?.installments || []).some(entry => entry.status === 'processing');
+      if (!partPaymentEnabled && !isMidPlan) {
+        return res.status(403).json({
+          message: 'This course must be paid for in full.',
+          code: 'PART_PAYMENT_DISABLED',
+        });
       }
 
       // A student who already paid in full must not be able to open a plan on top.

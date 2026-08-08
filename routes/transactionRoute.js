@@ -35,6 +35,13 @@ transactionRouter.get('/course-payment-plans/:planId', authenticate, authorize('
 transactionRouter.post('/course-payment-plans/:planId/payments', authenticate, authorize('student', 'client'), paymentLimiter, validateObjectId('planId'), paymentPlanController.initializePayment);
 transactionRouter.post('/course-payment-plans/:planId/payments/wallet', authenticate, authorize('student', 'client'), walletLimiter, validateObjectId('planId'), paymentPlanController.payWithWallet);
 
+// Payment records for the admissions view. Tutors and admins both reach this;
+// the controller scopes rows by course ownership, so a tutor only ever sees the
+// money owed on their own courses.
+const paymentRecordController = require('../controllers/paymentRecordController.js');
+transactionRouter.get('/payment-records', authenticate, authorize('tutor', 'admin'), generalLimiter, paymentRecordController.listPaymentRecords);
+transactionRouter.get('/payment-records/courses', authenticate, authorize('tutor', 'admin'), generalLimiter, paymentRecordController.listPaymentRecordCourses);
+
 // Admin-only operations
 transactionRouter.post('/cancel-premium/:userId', authenticate, authorize('admin'), validateObjectId('userId'), transactionController.cancelPremiumPlan);
 transactionRouter.post('/add-funds', authenticate, authorize('admin'), walletLimiter, transactionController.addFunds);

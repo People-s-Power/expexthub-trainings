@@ -256,7 +256,7 @@ const courseController = {
 
     addCourse: async (req, res) => {
 
-        const { title, about, duration, type, startDate, endDate, startTime, endTime, category, privacy, days, fee, strikedFee, scholarship, meetingPassword, target, modules, benefits, timeframe, audience, meetingType, primaryColor } = req.body;
+        const { title, about, duration, type, startDate, endDate, startTime, endTime, category, privacy, days, fee, strikedFee, scholarship, meetingPassword, target, modules, benefits, timeframe, audience, meetingType, primaryColor, partPaymentEnabled } = req.body;
 
         // Get user ID from the request headers
         const userId = req.params.userId;
@@ -295,9 +295,11 @@ const courseController = {
             ? audience.filter((id) => mongoose.Types.ObjectId.isValid(id))
             : [];
 
-        // Part payment is a platform capability available on every paid course —
-        // the student chooses what to pay and when — so there is nothing for the
-        // instructor to configure here.
+        // The instructor consents to part payment per course. Coerced rather than
+        // passed through so a truthy string from a form post ("false", "0") cannot
+        // enable collection the instructor never agreed to — only an explicit true
+        // opts in, and anything else falls back to pay-in-full only.
+        const allowsPartPayment = partPaymentEnabled === true || partPaymentEnabled === 'true';
 
 
         if (user.role === "tutor" && ((user.premiumPlan === "basic" && coursesByUser.length >= 5) || user.premiumPlan === "standard" && coursesByUser.length >= 20)) {
@@ -346,6 +348,7 @@ const courseController = {
                 privacy,
                 target,
                 fee,
+                partPaymentEnabled: allowsPartPayment,
                 primaryColor,
                 days,
                 strikedFee,
@@ -698,7 +701,6 @@ const courseController = {
         const courseId = req.params.courseId;
         const callerId = req.user?.id || req.user?._id;
         const studentId = req.body?.studentId || req.body?.id;
-        const paymentMethod = String(req.body?.paymentMethod || '').toLowerCase();
 
         try {
             if (!callerId) {
@@ -790,18 +792,11 @@ const courseController = {
                 });
             }
 
-            if (paymentMethod === 'scholarship' || paymentMethod === 'free') {
-                const { enrolled, reason } = await addEnrollment(course, student._id, 'scholarship');
-                if (!enrolled) {
-                    return res.status(409).json({
-                        message: reason === 'already_enrolled'
-                            ? 'Student is already enrolled in the course'
-                            : 'This course is full',
-                    });
-                }
-                await notifyEnrolledStudent(student, course, 'You have been given a scholarship place');
-                return res.status(200).json({ message: 'Student enrolled on a scholarship place', courseId: course._id });
-            }
+            // This endpoint deliberately has no free-place branch. Waiving a fee is
+            // a separate, explicit decision and lives on courses/give-scholarship,
+            // so a mis-click while enrolling a paying student cannot give a seat
+            // away. A stale client still sending paymentMethod: 'scholarship' now
+            // falls through to the gateway rather than being honoured.
 
             // A checkout the student already has open is real money in flight.
             // Cancelling the plan under it would charge them twice for one seat,
@@ -1103,6 +1098,19 @@ const courseController = {
             delete updates.installmentsEnabled;
             delete updates.installmentCount;
 
+            // Normalize the consent flag the same way addCourse does, so a form
+            // post of "false" cannot read as consent. Absent means "not editing
+            // this setting" and is left untouched.
+            //
+            // Switching consent off is allowed at any time: it only stops new
+            // plans being opened. Students already part-way through keep the
+            // terms they accepted and can still clear their balance — that is
+            // enforced in coursePaymentService.openPlanForStudent.
+            if ('partPaymentEnabled' in updates) {
+                updates.partPaymentEnabled = updates.partPaymentEnabled === true
+                    || updates.partPaymentEnabled === 'true';
+            }
+
             await Course.updateOne({ _id: courseId }, updates, { new: true });
             res.json({ message: 'Course updated successfully' });
         } catch (error) {
@@ -1297,9 +1305,18 @@ const courseController = {
                 return res.status(400).json({ message: 'Cannot grant scholarships to more than 100 students at once' });
             }
 
-            const course = await Course.findById(courseId);
+            const [course, caller] = await Promise.all([
+                Course.findById(courseId),
+                User.findById(grantedBy),
+            ]);
             if (!course) {
                 return res.status(404).json({ message: 'Course not found' });
+            }
+            // Ownership, not just role: the route lets tutors through so they can
+            // waive their own course's fee, and this is what stops one tutor
+            // granting free places on another's course.
+            if (!canManageCourse(course, caller)) {
+                return res.status(403).json({ message: 'You can only grant scholarships on your own courses' });
             }
             if (!course.approved) {
                 return res.status(403).json({ message: 'Cannot grant scholarships for an unapproved course' });

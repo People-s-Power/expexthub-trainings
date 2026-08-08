@@ -67,14 +67,25 @@ function minimumPaymentMinor(totalAmountMinor, outstandingMinor) {
 }
 
 /**
- * Part payment is now a platform-level capability rather than a per-course
- * tutor setting: any course with a fee can be paid for in parts, and the student
- * decides each amount. Free courses have nothing to split.
+ * Whether this course may be paid for in parts, and on what terms.
+ *
+ * Two independent conditions, both required. The instructor must have consented
+ * (`course.partPaymentEnabled`) — part payment defers their earnings, so it is
+ * theirs to offer rather than the platform's to impose. And the course must
+ * actually cost something, since a free course has nothing to split.
+ *
+ * This is the single source of truth for the policy. Do not re-derive it inline:
+ * a second copy is how the checkout and the course page drift apart.
+ *
+ * Note what this does NOT govern — settling a plan that already exists. An
+ * instructor who switches the toggle off stops being offered to new students;
+ * a student already part-way through keeps paying down their balance on the
+ * terms they accepted. See `openPlanForStudent`.
  */
 function resolvePartPaymentPolicy(course) {
   const totalAmountMinor = toMinorUnits(course?.fee);
   return {
-    partPaymentEnabled: totalAmountMinor > 0,
+    partPaymentEnabled: totalAmountMinor > 0 && course?.partPaymentEnabled === true,
     totalAmountMinor,
     minimumFirstPaymentMinor: minimumPaymentMinor(totalAmountMinor, totalAmountMinor),
     settlementWindowDays: SETTLEMENT_WINDOW_DAYS,
@@ -515,18 +526,43 @@ async function initializeGatewayCheckout({ txRef, amount, currency = 'NGN', cust
  *
  * Shared by the student-facing endpoint and by the tutor-initiated enrolment
  * flow so both go through exactly one definition of "the student's live plan".
+ *
+ * The instructor's consent gate applies to *opening* a plan, not to keeping one
+ * alive. A student who has already committed money — settled or in flight —
+ * agreed to terms that were on offer at the time, and an instructor toggling
+ * part payment off afterwards must not strand them with a balance they can no
+ * longer pay. So a plan with money against it is always returned; only a brand
+ * new plan, or an untouched one nobody has paid into, requires current consent.
  */
 async function openPlanForStudent({ user, course, createdBy }) {
   const policy = resolvePartPaymentPolicy(course);
-  if (!policy.partPaymentEnabled) {
-    throw Object.assign(new Error('This course does not require payment'), { status: 400 });
-  }
 
   const existing = await CoursePaymentPlan.findOne({
     userId: user._id,
     courseId: course._id,
     status: { $in: ['pending', 'active', 'overdue'] },
   });
+
+  if (existing) {
+    const hasCommittedMoney = Number(existing.amountPaidMinor) > 0
+      || (existing.installments || []).some(entry => entry.status === 'processing');
+    if (hasCommittedMoney) {
+      if (refreshDueStatus(existing)) await existing.save();
+      return existing;
+    }
+  }
+
+  if (!policy.partPaymentEnabled) {
+    throw Object.assign(
+      new Error(
+        toMinorUnits(course?.fee) > 0
+          ? 'This course must be paid for in full'
+          : 'This course does not require payment',
+      ),
+      { status: 400, code: 'PART_PAYMENT_DISABLED' },
+    );
+  }
+
   if (existing) {
     if (refreshDueStatus(existing)) await existing.save();
     return existing;

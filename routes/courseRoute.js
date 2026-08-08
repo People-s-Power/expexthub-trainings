@@ -46,6 +46,11 @@ courseRouter.put('/update-status/:courseId', authenticate, authorize('tutor', 'a
 courseRouter.get("/unapproved", authenticate, authorize('admin'), courseController.getUnaproved);
 courseRouter.put("/approve/:courseId", authenticate, authorize('admin'), validateObjectId('courseId'), courseController.approveCourse);
 courseRouter.get('/renew/:courseId/:id', authenticate, authorize('admin'), validateObjectId('courseId', 'id'), courseController.renewCourse);
-courseRouter.post('/give-scholarship/:courseId', authenticate, authorize('admin'), validateObjectId('courseId'), courseController.giveScholarship);
+
+// Waiving a fee is the only way to give a free place — the enroll-student flow
+// deliberately has no free branch. Tutors are allowed through the role gate
+// because it is their own course's revenue they are waiving; the controller
+// still checks ownership, so a tutor cannot grant on someone else's course.
+courseRouter.post('/give-scholarship/:courseId', authenticate, authorize('tutor', 'admin'), validateObjectId('courseId'), courseController.giveScholarship);
 
 module.exports = courseRouter;

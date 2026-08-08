@@ -46,9 +46,19 @@ const courseSchema = new mongoose.Schema({
     endTime: String,
     fee: Number,
     strikedFee: Number,
-    // Part payment is a platform capability, not a per-course setting: any paid
-    // course can be paid for in parts and the student chooses each amount, so
-    // there is deliberately no instructor-facing installment policy here.
+    // Instructor consent to collect this course's fee in parts. The student still
+    // chooses each amount — this only decides whether the option is offered at
+    // all, so pay-in-full remains available on every paid course regardless.
+    //
+    // Defaults to false so a newly created course only offers part payment when
+    // the instructor deliberately turns it on. Courses that predate the toggle
+    // are backfilled to true by scripts/backfillPartPaymentConsent.js, because
+    // part payment was already live for them and silently withdrawing it would
+    // change the terms under students mid-decision.
+    partPaymentEnabled: {
+        type: Boolean,
+        default: false
+    },
     target: Number,
     assignedTutors: [{
         type: mongoose.Schema.Types.ObjectId,
