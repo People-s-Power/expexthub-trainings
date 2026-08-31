@@ -1,7 +1,21 @@
+const crypto = require('crypto');
 const mongoose = require('mongoose');
 const Course = require('../models/courses.js');
 const User = require('../models/user.js');
-const { MINOR_UNIT, FULL_PAYMENT_TYPES } = require('../services/coursePaymentService.js');
+const Transaction = require('../models/transactions.js');
+const CoursePaymentPlan = require('../models/coursePaymentPlans.js');
+const {
+  MINOR_UNIT,
+  FULL_PAYMENT_TYPES,
+  toMinorUnits,
+  toMajorUnits,
+  planOutstandingMinor,
+  planInFlightMinor,
+  nextPaymentNumber,
+  refreshDueStatus,
+  grantCourseAccess,
+  creditInstructor,
+} = require('../services/coursePaymentService.js');
 
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
@@ -46,6 +60,9 @@ function buildRecord(row) {
   const student = row.student || {};
   const plan = row.plan || null;
   const scholarship = row.scholarship === true || row.enrollmentStatus === 'scholarship';
+  // The admissions tabs split on this flag, so the money rows carry it too —
+  // one response then feeds both the payments view and the graduates view.
+  const graduate = student.graduate === true;
 
   const planTotalMinor = Number(plan?.totalAmountMinor || 0);
   const planPaidMinor = Number(plan?.amountPaidMinor || 0);
@@ -82,6 +99,7 @@ function buildRecord(row) {
     enrollmentStatus: row.enrollmentStatus || 'active',
     method,
     scholarship,
+    graduate,
     expected,
     paid,
     owed,
@@ -183,7 +201,7 @@ function recordPipeline(scope) {
         let: { studentId: '$enrollments.user' },
         pipeline: [
           { $match: { $expr: { $eq: ['$_id', '$$studentId'] } } },
-          { $project: { fullname: 1, email: 1, phone: 1, profilePicture: 1 } },
+          { $project: { fullname: 1, email: 1, phone: 1, profilePicture: 1, graduate: 1 } },
         ],
         as: 'student',
       },
@@ -257,6 +275,10 @@ const paymentRecordController = {
       if (status === 'owing') filtered = filtered.filter(record => record.owed > 0);
       else if (status === 'settled') filtered = filtered.filter(record => record.owed <= 0 && !record.scholarship);
       else if (status === 'scholarship') filtered = filtered.filter(record => record.scholarship);
+      else if (status === 'graduate') filtered = filtered.filter(record => record.graduate === true);
+      // "My Students" in the admissions view: anyone who has put money down,
+      // whether a part payment or the full fee.
+      else if (status === 'payers') filtered = filtered.filter(record => record.paid > 0);
 
       // Largest balance first: the rows that need chasing are the point of the view.
       filtered.sort((a, b) => b.owed - a.owed
@@ -310,6 +332,148 @@ const paymentRecordController = {
     } catch (error) {
       console.error('List payment record courses failed:', error);
       return res.status(500).json({ message: 'Unable to load courses' });
+    }
+  },
+
+  /**
+   * Admin records an offline settlement of a student's outstanding balance.
+   *
+   * Money collected outside the gateway (bank transfer handed to the admin,
+   * cash reconciliation) still has to land in the same ledger the gateway
+   * writes to, or the balance the payment records show drifts from reality.
+   * This writes a successful `course_installment` transaction and settles it
+   * against the plan through the same code path a webhook uses, so idempotency,
+   * instructor credit and enrollment all behave identically.
+   *
+   * The amount is clamped to the outstanding balance: an admin action must not
+   * be able to overpay a plan, and the final payment is exempt from the
+   * minimum-payment floor by design.
+   */
+  settleStudentBalance: async (req, res) => {
+    try {
+      const callerId = req.user?.id || req.user?._id;
+      const caller = await User.findById(callerId).select('role');
+      if (!caller) return res.status(401).json({ message: 'Authentication required' });
+      if (caller.role !== 'admin') return res.status(403).json({ message: 'Only admins may settle a balance' });
+
+      const { courseId, studentId } = req.body;
+      if (!mongoose.Types.ObjectId.isValid(String(courseId))) {
+        return res.status(400).json({ message: 'Invalid course id' });
+      }
+      if (!mongoose.Types.ObjectId.isValid(String(studentId))) {
+        return res.status(400).json({ message: 'Invalid student id' });
+      }
+
+      const [course, student] = await Promise.all([
+        Course.findById(courseId).select('title fee instructorId'),
+        User.findById(studentId).select('fullname email role'),
+      ]);
+      if (!course) return res.status(404).json({ message: 'Course not found' });
+      if (!student) return res.status(404).json({ message: 'Student not found' });
+
+      const plan = await CoursePaymentPlan.findOne({
+        courseId: course._id,
+        userId: student._id,
+        status: { $ne: 'cancelled' },
+      });
+      if (!plan) {
+        return res.status(404).json({ message: 'This student has no payment plan for this course' });
+      }
+      if (refreshDueStatus(plan)) await plan.save();
+
+      const outstandingMinor = planOutstandingMinor(plan);
+      if (outstandingMinor <= 0) {
+        return res.status(409).json({ message: 'This student has no outstanding balance on this course' });
+      }
+
+      // Anything already committed to an open checkout is not payable again.
+      const inFlightMinor = planInFlightMinor(plan);
+      const availableMinor = outstandingMinor - inFlightMinor;
+      if (availableMinor <= 0) {
+        return res.status(409).json({ message: 'A gateway payment is already in progress for this balance' });
+      }
+
+      // An explicit amount is allowed for partial offline settlement, but it is
+      // clamped to what is actually owed — the ledger must never go over.
+      const requestedMinor = req.body.amount === undefined || req.body.amount === null || req.body.amount === ''
+        ? availableMinor
+        : toMinorUnits(req.body.amount);
+      if (requestedMinor <= 0) {
+        return res.status(400).json({ message: 'Invalid settlement amount' });
+      }
+      const amountMinor = Math.min(requestedMinor, availableMinor);
+      const amountMajor = toMajorUnits(amountMinor);
+
+      const paymentNumber = nextPaymentNumber(plan);
+      const txRef = `admin-settle-${plan._id}-${paymentNumber}-${crypto.randomUUID()}`;
+
+      const transaction = await Transaction.create({
+        userId: student._id,
+        courseId: course._id,
+        paymentPlanId: plan._id,
+        installmentNumber: paymentNumber,
+        amount: amountMajor,
+        txRef,
+        type: 'course_installment',
+        status: 'successful',
+        currency: plan.currency || 'NGN',
+        paidAt: new Date(),
+        metadata: {
+          title: course.title,
+          paymentNumber,
+          settledBy: String(callerId),
+          purpose: 'admin_balance_settlement',
+          offline: true,
+        },
+      });
+
+      // Same elemMatch-guarded update the webhook finalizer uses: only the first
+      // writer flips the payment to paid and increments the plan total, so a
+      // retried request cannot double-credit.
+      const now = new Date();
+      const updatedPlan = await CoursePaymentPlan.findOneAndUpdate(
+        { _id: plan._id, installments: { $elemMatch: { number: paymentNumber, status: { $ne: 'paid' } } } },
+        {
+          $set: {
+            'installments.$.status': 'paid',
+            'installments.$.amountMinor': amountMinor,
+            'installments.$.txRef': txRef,
+            'installments.$.paidAt': now,
+            status: 'active',
+            accessStatus: 'active',
+            lastPaymentAt: now,
+            firstPaymentAt: plan.firstPaymentAt || now,
+            settlementDueAt: plan.settlementDueAt || now,
+          },
+          $inc: { amountPaidMinor: amountMinor },
+        },
+        { new: true },
+      );
+
+      const currentPlan = updatedPlan || await CoursePaymentPlan.findById(plan._id);
+      const isSettled = Number(currentPlan.amountPaidMinor) >= Number(currentPlan.totalAmountMinor);
+      if (isSettled && currentPlan.status !== 'completed') {
+        currentPlan.status = 'completed';
+        currentPlan.accessStatus = 'active';
+        await currentPlan.save();
+      }
+
+      await grantCourseAccess({ userId: student._id, courseId: course._id, plan: currentPlan });
+      if (updatedPlan) {
+        await creditInstructor(transaction, amountMajor);
+      }
+
+      return res.status(200).json({
+        message: isSettled
+          ? `Balance settled in full for ${student.fullname}`
+          : `Offline payment of ${amountMajor} recorded for ${student.fullname}`,
+        settledInFull: isSettled,
+        amount: amountMajor,
+        outstanding: toMajorUnits(planOutstandingMinor(currentPlan)),
+      });
+    } catch (error) {
+      console.error('Settle student balance failed:', error);
+      return res.status(500).json({ message: 'Unable to settle the balance' });
     }
   },
 };

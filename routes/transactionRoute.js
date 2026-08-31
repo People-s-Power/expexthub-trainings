@@ -41,6 +41,8 @@ transactionRouter.post('/course-payment-plans/:planId/payments/wallet', authenti
 const paymentRecordController = require('../controllers/paymentRecordController.js');
 transactionRouter.get('/payment-records', authenticate, authorize('tutor', 'admin'), generalLimiter, paymentRecordController.listPaymentRecords);
 transactionRouter.get('/payment-records/courses', authenticate, authorize('tutor', 'admin'), generalLimiter, paymentRecordController.listPaymentRecordCourses);
+// Admin-only: record an offline settlement of a student's outstanding balance.
+transactionRouter.post('/payment-records/settle-balance', authenticate, authorize('admin'), paymentLimiter, paymentRecordController.settleStudentBalance);
 
 // Admin-only operations
 transactionRouter.post('/cancel-premium/:userId', authenticate, authorize('admin'), validateObjectId('userId'), transactionController.cancelPremiumPlan);
