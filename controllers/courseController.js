@@ -1092,6 +1092,28 @@ const courseController = {
             console.log(videos, req.body.videos, "yes oo");
 
             const updates = { ...req.body, videos };
+
+            // The edit form sends the course image as `image` ({ type, url }).
+            // A freshly picked file arrives as a base64 data URL and must go
+            // through Cloudinary before it can be stored; an untouched image
+            // arrives as the existing Cloudinary URL and is kept as-is. Either
+            // way the document field is `thumbnail` — without this remap the
+            // edit wrote a stray `image` field and the thumbnail never changed.
+            if (updates.image && typeof updates.image === 'object' && updates.image.url) {
+                let cloudFile = updates.image.url;
+                if (String(updates.image.url).startsWith('data:')) {
+                    if (updates.image.type === 'video') {
+                        cloudFile = await cloudinaryVidUpload(updates.image.url);
+                    } else {
+                        cloudFile = await upload(updates.image.url, "image");
+                    }
+                }
+                updates.thumbnail = {
+                    type: updates.image.type,
+                    url: cloudFile,
+                };
+            }
+            delete updates.image;
             // Installment policy left the course document — the student now
             // chooses each amount. Dropped explicitly so a cached older client
             // sending these fields gets a clean update rather than a schema error.
