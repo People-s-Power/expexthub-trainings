@@ -569,7 +569,9 @@ const authControllers = {
     const genericResponse = { message: "If that account still needs verifying, a new code is on its way." };
     try {
       const user = await User.findById(req.params.userId);
-      if (!user || !user.email || user.isVerified) return res.json(genericResponse);
+      if (!user || !user.email || user.isVerified) {
+        return res.json({ ...genericResponse, cooldownSeconds: 0 });
+      }
 
       await issueVerificationCode(user);
       return res.json({ ...genericResponse, cooldownSeconds: Math.ceil(VERIFICATION_RESEND_COOLDOWN_MS / 1000) });
@@ -661,18 +663,7 @@ const authControllers = {
           message: "An account with " + email + " does not exist!",
         });
 
-      // Generate a fresh verification code per request
-      const verificationCode = generateVerificationCode();
-
-      await sendVerificationEmail(user.email, verificationCode);
-      user.verificationCode = verificationCode;
-      // Reset codes share the verification field, so they share its lifecycle too —
-      // otherwise a reset code would linger as a permanently valid email-verification
-      // code long after the reset was done with.
-      user.verificationCodeExpiresAt = new Date(Date.now() + VERIFICATION_CODE_TTL_MS);
-      user.verificationCodeSentAt = new Date();
-      user.verificationAttempts = 0;
-      await user.save();
+      await issueVerificationCode(user, { force: true });
 
       res.json({
         message: "Code sent to " + email,
@@ -687,20 +678,22 @@ const authControllers = {
 
   resetPassword: async (req, res) => {
     const { password, verificationCode } = req.body;
-    const user = await User.findOne({
-      verificationCode,
-    });
+    const user = await User.findOne({ verificationCode });
 
     if (!user) {
-      return res.status(400).send({
-        message: "Invalid OTP code ",
-      });
+      return res.status(400).send({ message: "Invalid OTP code" });
     }
 
     try {
-      const newHash = bcrypt.hashSync(password);
+      const result = await consumeVerificationCode(user, verificationCode);
+      if (!result.ok) {
+        return res.status(result.status).json({ message: result.message, code: result.code });
+      }
+      const newHash = bcrypt.hashSync(password, 10);
       user.password = newHash;
       user.verificationCode = null;
+      user.verificationCodeExpiresAt = null;
+      user.verificationCodeSentAt = null;
       await user.save();
 
       res.json({
@@ -716,65 +709,85 @@ const authControllers = {
 
   addTeamMember: async (req, res) => {
     try {
-      const { ownerId, tutorId, privileges } = req.body;
+      const ownerId = req.user?.id || req.user?._id;
+      const { tutorId, privileges } = req.body;
 
-      // Check if owner exists and is a tutor
+      if (!ownerId || !tutorId) {
+        return res.status(400).json({ message: "Owner and tutor are required" });
+      }
+      if (!Array.isArray(privileges)) {
+        return res.status(400).json({ message: "Privileges must be an array" });
+      }
+
       const owner = await User.findById(ownerId);
-      if (!owner) {
+      if (!owner || !['tutor', 'admin'].includes(owner.role)) {
         return res.status(404).json({ message: "Owner not found or invalid role" });
       }
 
-      // Check if the tutor exists
       const tutor = await User.findById(tutorId);
-      if (!tutor) {
+      if (!tutor || tutor.role !== 'tutor') {
         return res.status(400).json({ message: "Tutor not found" });
       }
+      if (owner._id.equals(tutor._id)) {
+        return res.status(400).json({ message: "You cannot add yourself to your team" });
+      }
 
-      // Ensure teamMembers array exists
       owner.teamMembers = owner.teamMembers || [];
       tutor.teamMembers = tutor.teamMembers || [];
 
-      // Check if the tutor is already added by this owner
       const isAlreadyAdded = owner.teamMembers.some(
         (member) => member?.tutorId?.toString() === tutorId.toString()
       );
-
       if (isAlreadyAdded) {
         return res.status(400).json({ message: "Tutor has already been added by this owner" });
       }
 
-      // Add the team member to both the tutor's and owner's records
-      const newMember = { privileges, ownerId, tutorId };
-
-      owner.teamMembers.push({ ...newMember, status: "pending" });
-      tutor.teamMembers.push({ ...newMember, status: "pending" });
+      const newMember = { privileges, ownerId: owner._id, tutorId: tutor._id, status: "pending" };
+      owner.teamMembers.push(newMember);
+      tutor.teamMembers.push(newMember);
 
       await owner.save();
       await tutor.save();
 
-      await sendTeamInvitation(tutor.email, owner.fullname, tutorId, ownerId, tutor.fullName);
+      // Email delivery must not turn a successfully persisted invitation into a
+      // false 500. The invite remains visible in the app and can be accepted there.
+      let emailDelivered = false;
+      try {
+        await sendTeamInvitation(tutor.email, owner.fullname, tutorId, ownerId, tutor.fullname);
+        emailDelivered = true;
+      } catch (mailError) {
+        console.error("Team invitation email failed:", mailError);
+      }
 
-
-      res.status(201).json({
+      return res.status(201).json({
         success: true,
-        message: "Team member added successfully",
+        message: emailDelivered
+          ? "Team member added successfully"
+          : "Team member added; invitation email could not be sent",
+        emailDelivered,
       });
     } catch (error) {
       console.error("Error adding team member:", error);
-      res.status(500).json({ message: "Unexpected error during team member addition" });
+      return res.status(500).json({ message: "Unexpected error during team member addition" });
     }
   },
 
   editPrivileges: async (req, res) => {
     try {
-      const { ownerId, tutorId, newPrivileges } = req.body;
+      const ownerId = req.user?.id || req.user?._id;
+      const { tutorId, newPrivileges } = req.body;
 
-      console.log(ownerId, tutorId);
+      if (!ownerId || !tutorId || !Array.isArray(newPrivileges)) {
+        return res.status(400).json({ message: "Owner, tutor and privileges are required" });
+      }
 
       // Check if the owner exists and is a tutor
       const owner = await User.findById(ownerId);
-      if (!owner || owner.role !== 'tutor') {
+      if (!owner || !['tutor', 'admin'].includes(owner.role)) {
         return res.status(404).json({ message: "Owner not found or invalid role" });
+      }
+      if (owner.role !== 'admin' && String(owner._id) !== String(req.user?.id || req.user?._id)) {
+        return res.status(403).json({ message: "You can only edit your own team members" });
       }
 
       // Check if the tutor exists
@@ -802,13 +815,13 @@ const authControllers = {
       await tutor.save();
       await owner.save();
 
-      res.status(200).json({
+      return res.status(200).json({
         success: true,
         message: "Privileges updated successfully",
       });
     } catch (error) {
       console.error("Error editing privileges:", error);
-      res.status(500).json({ message: "Unexpected error during privilege update" });
+      return res.status(500).json({ message: "Unexpected error during privilege update" });
     }
   },
 };

@@ -1,6 +1,7 @@
 const express = require('express');
 const authControllers = require('../controllers/authController.js');
 const authenticate = require('../middlewares/auth.js');
+const authorize = require('../middlewares/authorize.js');
 const { validateObjectId } = require('../middlewares/validateRequest.js');
 const { createRateLimiter, generalLimiter } = require('../middlewares/rateLimiter.js');
 const router = express.Router();
@@ -45,7 +46,7 @@ router.post('/email-verification/confirm', authenticate, verificationAttemptLimi
 
 router.put('/forgot-passowrd', verificationSendLimiter, authControllers.forgotPassword);
 router.put('/reset-passowrd', verificationAttemptLimiter, authControllers.resetPassword);
-router.post('/add-team', generalLimiter, authControllers.addTeamMember)
-router.post('/edit-team', generalLimiter, authControllers.editPrivileges)
+router.post('/add-team', authenticate, authorize('tutor', 'admin'), generalLimiter, authControllers.addTeamMember)
+router.post('/edit-team', authenticate, authorize('tutor', 'admin'), generalLimiter, authControllers.editPrivileges)
 
 module.exports = router;

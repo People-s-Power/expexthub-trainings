@@ -643,27 +643,61 @@ const userControllers = {
       return res.status(500).json({ message: 'Unexpected error' });
     }
   },
-  makeGraduate: async (res, req) => {
-    const userId = req.user.id;
-    const user = await User.findById(userId);
+  makeGraduate: async (req, res) => {
     try {
-      if (!user) {
-        return res.status(404).json({ message: 'User not found' });
-      }
-      user.graduate = true;
+      const { userId: studentId } = req.params;
+      const actorId = req.user?.id || req.user?._id;
 
-      await user.save();
+      const student = await User.findById(studentId);
+      if (!student) {
+        return res.status(404).json({ message: 'Student not found' });
+      }
+      if (student.role !== 'student') {
+        return res.status(400).json({ message: 'Only students can be marked as graduates' });
+      }
+
+      // A tutor may only graduate a student enrolled on one of that tutor's
+      // courses. The UI privilege check is not a security boundary.
+      if (req.user.role !== 'admin') {
+        const hasEnrollment = await Course.exists({
+          $and: [
+            {
+              $or: [
+                { instructorId: actorId },
+                { assignedTutors: actorId },
+              ],
+            },
+            {
+              $or: [
+                { enrolledStudents: studentId },
+                { 'enrollments.user': studentId },
+              ],
+            },
+          ],
+        });
+
+        if (!hasEnrollment) {
+          return res.status(403).json({ message: 'You can only graduate students enrolled on your courses' });
+        }
+      }
+
+      if (student.graduate === true) {
+        return res.status(200).json({ message: 'Student is already a graduate', alreadyGraduated: true });
+      }
+
+      student.graduate = true;
+      await student.save();
       await Notification.create({
         title: "User Graduated",
         content: `Congratulations you've been made a graduate. Proceed to your profile to download your certificate.`,
-        userId: userId,
+        userId: studentId,
       });
+
       return res.status(200).json({ message: 'User made a graduate successfully' });
     } catch (error) {
-      console.error(error);
-      return res.status(500).json({ message: 'Unexpected error.' });
+      console.error('Error making student graduate:', error);
+      return res.status(500).json({ message: 'Unexpected error while making student a graduate' });
     }
-
   },
 
   block: async (req, res) => {
@@ -720,9 +754,10 @@ const userControllers = {
           select: 'fullname _id email profilePicture role assignedCourse otherCourse organizationName'
         });
 
-      // If the tutor is not found or doesn't have the correct role, return an error
-      if (!tutor || tutor.role !== 'tutor') {
-        return res.status(404).json({ message: 'Tutor not found or invalid role' });
+      // Admins can also own teams; the endpoint is used by both tutor and admin
+      // dashboard layouts.
+      if (!tutor || !['tutor', 'admin'].includes(tutor.role)) {
+        return res.status(404).json({ message: 'Team owner not found or invalid role' });
       }
 
       // Ensure each team member has a status field
@@ -757,8 +792,8 @@ const userControllers = {
 
 
 
-      if (!tutor || tutor.role !== "tutor") {
-        return res.status(404).json({ message: "Tutor not found or invalid role" });
+      if (!tutor || !['tutor', 'admin'].includes(tutor.role)) {
+        return res.status(404).json({ message: "Team owner not found or invalid role" });
       }
 
       if (!owner) {
