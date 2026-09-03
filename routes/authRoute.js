@@ -1,7 +1,6 @@
 const express = require('express');
 const authControllers = require('../controllers/authController.js');
 const authenticate = require('../middlewares/auth.js');
-const authorize = require('../middlewares/authorize.js');
 const { validateObjectId } = require('../middlewares/validateRequest.js');
 const { createRateLimiter, generalLimiter } = require('../middlewares/rateLimiter.js');
 const router = express.Router();
@@ -46,7 +45,12 @@ router.post('/email-verification/confirm', authenticate, verificationAttemptLimi
 
 router.put('/forgot-passowrd', verificationSendLimiter, authControllers.forgotPassword);
 router.put('/reset-passowrd', verificationAttemptLimiter, authControllers.resetPassword);
-router.post('/add-team', authenticate, authorize('tutor', 'admin'), generalLimiter, authControllers.addTeamMember)
-router.post('/edit-team', authenticate, authorize('tutor', 'admin'), generalLimiter, authControllers.editPrivileges)
+// Team management is authorized inside the controllers via resolveAuthorizedOwner:
+// the signed-in owner, an admin, or an accepted member granted the matching
+// team-management privilege may act. Keeping the middleware to authentication
+// only supports the impersonation flow where a delegated member manages the
+// provider's team using their own JWT.
+router.post('/add-team', authenticate, generalLimiter, authControllers.addTeamMember)
+router.post('/edit-team', authenticate, generalLimiter, authControllers.editPrivileges)
 
 module.exports = router;

@@ -740,12 +740,44 @@ const userControllers = {
     }
   },
 
+  // Fetch a directory of users across every category (role) so a provider can
+  // add any category of user as a team member. The current user is excluded.
+  getUsersByCategory: async (req, res) => {
+    try {
+      const actorId = req.user?.id || req.user?._id;
+
+      const users = await User.find(
+        actorId ? { _id: { $ne: actorId } } : {}
+      )
+        .select('fullname email profilePicture role organizationName blocked')
+        .lean();
+
+      // Group by role so the client can present a category filter while keeping
+      // a single flat list for searching.
+      const categories = {};
+      users.forEach((user) => {
+        const role = user.role || 'student';
+        if (!categories[role]) categories[role] = [];
+        categories[role].push(user);
+      });
+
+      return res.status(200).json({
+        success: true,
+        users,
+        categories,
+      });
+    } catch (error) {
+      console.error('Error fetching users by category:', error);
+      return res.status(500).json({ message: 'Unexpected error!' });
+    }
+  },
+
   getTeamMembers: async (req, res) => {
     try {
       const { tutorId } = req.params;
+      const actorId = req.user?.id || req.user?._id;
 
-
-      const tutor = await User.findById(tutorId).lean().populate({
+      const user = await User.findById(tutorId).lean().populate({
         path: 'teamMembers.tutorId',
         select: 'fullname _id email profilePicture role assignedCourse otherCourse organizationName'
       })
@@ -754,20 +786,40 @@ const userControllers = {
           select: 'fullname _id email profilePicture role assignedCourse otherCourse organizationName'
         });
 
-      // Admins can also own teams; the endpoint is used by both tutor and admin
-      // dashboard layouts.
-      if (!tutor || !['tutor', 'admin'].includes(tutor.role)) {
-        return res.status(404).json({ message: 'Team owner not found or invalid role' });
+      if (!user) {
+        return res.status(404).json({ message: 'User not found' });
       }
 
-      // Ensure each team member has a status field
-      const teamMembersWithStatus = Array.isArray(tutor.teamMembers)
-        ? tutor.teamMembers.map(member => {
-            // Create a proper object with the status preserved
+      // Any authenticated user may read their own team records so that members
+      // of every category can see which provider added them as a team member.
+      // An accepted member acting on behalf of the provider (the sidebar
+      // "Training Provider" impersonation flow) may also view that provider's
+      // team. Only the owner of a team may manage it (edit/delete), enforced in
+      // deleteTeamMembers.
+      if (actorId && String(actorId) !== String(tutorId) && req.user?.role !== 'admin') {
+        const actor = await User.findById(actorId);
+        const isAcceptedMemberOfTeam = Array.isArray(actor?.teamMembers)
+          ? actor.teamMembers.some(
+              (entry) =>
+                String(entry.ownerId) === String(tutorId) &&
+                entry.status === 'accepted'
+            )
+          : false;
+        if (!isAcceptedMemberOfTeam) {
+          return res.status(403).json({ message: 'You can only view your own team records' });
+        }
+      }
+
+      // Ensure each team member has a status field and expose memberRole.
+      const teamMembersWithStatus = Array.isArray(user.teamMembers)
+        ? user.teamMembers.map(member => {
             const memberObj = member.toObject ? member.toObject() : member;
             return {
               ...memberObj,
               status: memberObj.status || 'pending', // fallback to 'pending' if missing
+              // The member's category, stored at invitation time. Fall back to
+              // the member document's role for legacy records.
+              memberRole: memberObj.memberRole || memberObj.tutorId?.role || 'tutor',
             };
           })
         : [];
@@ -785,60 +837,82 @@ const userControllers = {
   deleteTeamMembers: async (req, res) => {
     try {
       const { tutorId, ownerId } = req.params;
+      const actorId = req.user?.id || req.user?._id;
 
-      // Fetch the tutor and owner
-      const tutor = await User.findById(tutorId).populate("teamMembers");
+      // `tutorId` is the invited member (any category), `ownerId` is the
+      // provider that owns the team. Names kept for backward compatibility.
+      const member = await User.findById(tutorId).populate("teamMembers");
       const owner = await User.findById(ownerId).populate("teamMembers");
 
-
-
-      if (!tutor || !['tutor', 'admin'].includes(tutor.role)) {
-        return res.status(404).json({ message: "Team owner not found or invalid role" });
+      if (!member) {
+        return res.status(404).json({ message: "Member not found" });
       }
 
       if (!owner) {
         return res.status(404).json({ message: "Owner not found" });
       }
 
+      // The provider that owns the team (or an admin) may remove a member. A
+      // team member acting on the provider's behalf may also remove members
+      // when their privileges grant "Delete team member".
+      const isOwner = String(actorId) === String(ownerId);
+      const isAdmin = req.user?.role === 'admin';
+      if (!isAdmin && !isOwner) {
+        const actor = await User.findById(actorId);
+        const actorEntry = actor?.teamMembers?.find(
+          (entry) =>
+            String(entry.ownerId) === String(ownerId) && entry.status === 'accepted'
+        );
+        const canDelete = actorEntry?.privileges?.some(
+          (p) => p.value === 'Delete team member' && p.checked
+        );
+        if (!canDelete) {
+          return res.status(403).json({ message: "You can only remove members from your own team" });
+        }
+      }
+
       // Ensure teamMembers exists before checking its content
-      if (!Array.isArray(tutor.teamMembers) || !Array.isArray(owner.teamMembers)) {
+      if (!Array.isArray(member.teamMembers) || !Array.isArray(owner.teamMembers)) {
         return res.status(404).json({ message: "Team member data is missing or invalid" });
       }
 
-      // Check if the team member exists in both tutor and owner
-      const teamMemberInTutor = tutor.teamMembers.some((member) =>
-        member?.ownerId?.toString() === ownerId.toString()
+      // Check if the team relationship exists in both member and owner
+      const teamMemberInMember = member.teamMembers.some((entry) =>
+        entry?.ownerId?.toString() === ownerId.toString()
       );
 
-      const teamMemberInOwner = owner.teamMembers.some((member) =>
-        member?.tutorId?.toString() === tutorId.toString()
+      const teamMemberInOwner = owner.teamMembers.some((entry) =>
+        entry?.tutorId?.toString() === tutorId.toString()
       );
 
-      if (!teamMemberInTutor || !teamMemberInOwner) {
+      if (!teamMemberInMember || !teamMemberInOwner) {
         return res.status(404).json({
-          message: "Team member not found in either tutor or owner teamMembers list",
+          message: "Team member not found in either member or owner teamMembers list",
         });
       }
 
-      // Remove the team member from both tutor and owner
-      tutor.teamMembers = tutor.teamMembers.filter(
-        (member) => member?.ownerId?.toString() !== ownerId.toString()
+      // Remove the relationship from both member and owner
+      member.teamMembers = member.teamMembers.filter(
+        (entry) => entry?.ownerId?.toString() !== ownerId.toString()
       );
 
       owner.teamMembers = owner.teamMembers.filter(
-        (member) => member?.tutorId?.toString() !== tutorId.toString()
+        (entry) => entry?.tutorId?.toString() !== tutorId.toString()
       );
 
-      // Save the updated tutor and owner
-      await tutor.save();
+      await member.save();
       await owner.save();
 
       // Send email notification
-      await sendEmailReminder(
-        tutor.email,
-        `You have been removed from ${owner?.organizationName || owner.fullname}'s team`,
-        "Team Member Removal"
-      );
+      try {
+        await sendEmailReminder(
+          member.email,
+          `You have been removed from ${owner?.organizationName || owner.fullname}'s team`,
+          "Team Member Removal"
+        );
+      } catch (mailError) {
+        console.error("Team removal email failed:", mailError);
+      }
 
       // Create a notification
       await Notification.create({
@@ -849,7 +923,7 @@ const userControllers = {
 
       return res.status(200).json({
         success: true,
-        message: "Team member successfully deleted from both tutor and owner",
+        message: "Team member successfully deleted from both member and owner",
       });
     } catch (error) {
       console.error("Error deleting team member:", error);
@@ -860,15 +934,17 @@ const userControllers = {
   updateTeamMemberStatus: async (req, res) => {
     try {
       const { tutorId, ownerId, status } = req.params;
-
+      const actorId = req.user?.id || req.user?._id;
 
       if (!["accepted", "rejected"].includes(status)) {
         return res.status(400).json({ message: "Invalid status" });
       }
 
-      const tutor = await User.findById(tutorId);
-      if (!tutor) {
-        return res.status(400).json({ message: "Tutor not found" });
+      // `tutorId` is the invited member (any category), `ownerId` is the
+      // provider that owns the team. Names kept for backward compatibility.
+      const member = await User.findById(tutorId);
+      if (!member) {
+        return res.status(400).json({ message: "Member not found" });
       }
 
       const owner = await User.findById(ownerId);
@@ -876,51 +952,59 @@ const userControllers = {
         return res.status(404).json({ message: "Owner not found" });
       }
 
+      // The accept/reject links inside the invitation email are themselves the
+      // bearer of authorization, so anonymous requests (no JWT) are allowed.
+      // When authenticated, only the invited member (or an admin) may respond;
+      // owners cannot self-accept on the member's behalf.
+      if (req.user && req.user.role !== 'admin' && String(actorId) !== String(tutorId)) {
+        return res.status(403).json({ message: "You can only respond to your own team invitation" });
+      }
+
       if (status === "rejected") {
         // Remove from both users' teamMembers arrays
-        tutor.teamMembers = tutor.teamMembers.filter(
-          (member) => member?.ownerId?.toString() !== ownerId
+        member.teamMembers = member.teamMembers.filter(
+          (entry) => entry?.ownerId?.toString() !== ownerId
         );
 
         owner.teamMembers = owner.teamMembers.filter(
-          (member) => member?.tutorId?.toString() !== tutorId
+          (entry) => entry?.tutorId?.toString() !== tutorId
         );
 
         await owner.save();
-        await tutor.save();
+        await member.save();
 
         await Notification.create({
           title: "Team Invitation Rejected",
           userId: ownerId,
-          content: `${tutor.fullname} has rejected your team invitation`,
+          content: `${member.fullname} has rejected your team invitation`,
         });
 
         return res.json({ success: true, message: "Invitation rejected and removed" });
       }
 
       // If accepted, just update the status
-      let tutorTeamMember = tutor.teamMembers.find(
-        (member) => member?.ownerId?.toString() === ownerId.toString()
+      let memberTeamEntry = member.teamMembers.find(
+        (entry) => entry?.ownerId?.toString() === ownerId.toString()
       );
 
-      let ownerTeamMember = owner.teamMembers.find(
-        (member) => member?.tutorId?.toString() === tutorId.toString()
+      let ownerTeamEntry = owner.teamMembers.find(
+        (entry) => entry?.tutorId?.toString() === tutorId.toString()
       );
 
-      if (!tutorTeamMember || !ownerTeamMember) {
+      if (!memberTeamEntry || !ownerTeamEntry) {
         return res.status(400).json({ message: "No invitation found" });
       }
 
-      tutorTeamMember.status = "accepted";
-      ownerTeamMember.status = "accepted";
+      memberTeamEntry.status = "accepted";
+      ownerTeamEntry.status = "accepted";
 
-      await tutor.save();
+      await member.save();
       await owner.save();
 
       await Notification.create({
         title: "Team Invitation Accepted",
         userId: ownerId,
-        content: `${tutor.fullname} has accepted your team invitation`,
+        content: `${member.fullname} has accepted your team invitation`,
       });
 
       res.json({ success: true, message: "Invitation accepted successfully" });

@@ -10,17 +10,25 @@ const transporter = nodemailer.createTransport({
 });
 
 
-const sendTeamInvitation = async (to, senderName, tutorId, ownerId, tutorName) => {
+const sendTeamInvitation = async (to, senderName, tutorId, ownerId, tutorName, memberRole = "team member") => {
 
   const acceptLink = `https://trainings.experthubllc.com/tutor/team/user?tutorId=${tutorId}&ownerId=${ownerId}&status=accepted`;
   const rejectLink = `https://trainings.experthubllc.com/tutor/team/user?tutorId=${tutorId}&ownerId=${ownerId}&status=rejected`;
+
+  // Present the member's category (tutor, client, student, provider, admin)
+  // in a human friendly form: "Team member" -> "Team Member".
+  const roleLabel = (memberRole || "team member")
+    .replace(/_/g, " ")
+    .split(" ")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
 
   const htmlMessage = `
     <div style="font-family: Arial, sans-serif; padding: 20px; background-color: #f4f4f4;">
       <div style="max-width: 600px; margin: auto; background: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);">
         <h2 style="color: #333;">You're Invited to Join <span style="color: #007bff;">${senderName}</span>!</h2>
         <p>Hello, ${tutorName}</p>
-        <p><strong>${senderName}</strong> has invited you to join the team.</p>
+        <p><strong>${senderName}</strong> has invited you to join their team as a <strong>${roleLabel}</strong>.</p>
         <p>Please click below to accept or decline the invitation:</p>
         <div style="margin: 20px 0;">
           <a href="${acceptLink}">

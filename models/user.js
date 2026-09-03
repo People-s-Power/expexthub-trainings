@@ -136,6 +136,13 @@ const userSchema = new mongoose.Schema({
   teamMembers: [{
     ownerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     tutorId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    // The category/role of the invited member (e.g. tutor, client, student,
+    // provider, admin). Kept alongside tutorId so existing integrations keep
+    // working while the platform supports adding any category as a team member.
+    memberRole: {
+      type: String,
+      default: 'tutor',
+    },
     status: String,
     privileges: [{
       checked: Boolean,

@@ -722,53 +722,106 @@ const authControllers = {
     }
   },
 
+  // Resolve and authorize the team owner for any team-management action.
+  //
+  // The owner is normally the signed-in user, but a team member who has been
+  // granted "Add/Edit/Delete team member" privileges may act on behalf of the
+  // provider that added them (the sidebar impersonation flow keeps the member's
+  // JWT while swapping the store's user id). For those cases the client sends
+  // the provider's id explicitly as `ownerId`.
+  resolveAuthorizedOwner: async (req, requiredPrivilege) => {
+    const actorId = req.user?.id || req.user?._id;
+    const requestedOwnerId = req.body.ownerId || actorId;
+
+    const owner = await User.findById(requestedOwnerId);
+    if (!owner || !['tutor', 'admin', 'provider'].includes(owner.role)) {
+      const err = new Error('Owner not found or invalid role');
+      err.status = 404;
+      throw err;
+    }
+
+    const isActualOwner = String(actorId) === String(owner._id);
+    const isAdmin = req.user?.role === 'admin';
+    if (isActualOwner || isAdmin) return owner;
+
+    // Delegated access: the actor must be an accepted member of this owner's
+    // team AND hold the matching team-management privilege.
+    const actor = await User.findById(actorId);
+    const membership = Array.isArray(actor?.teamMembers)
+      ? actor.teamMembers.find(
+          (entry) =>
+            String(entry.ownerId) === String(owner._id) &&
+            entry.status === 'accepted'
+        )
+      : undefined;
+
+    const canManage = membership?.privileges?.some(
+      (p) => p.value === requiredPrivilege && p.checked
+    );
+    if (!canManage) {
+      const err = new Error('You do not have permission to manage this team');
+      err.status = 403;
+      throw err;
+    }
+    return owner;
+  },
+
   addTeamMember: async (req, res) => {
     try {
-      const ownerId = req.user?.id || req.user?._id;
-      const { tutorId, privileges } = req.body;
+      const owner = await authControllers.resolveAuthorizedOwner(req, 'Add team member');
+      const ownerId = owner._id;
+      // Accept both the legacy `tutorId` field and the generic `memberId` so the
+      // endpoint works for any category of user (tutor, client, student, provider,
+      // admin, team_member) without breaking existing clients.
+      const memberId = req.body.memberId || req.body.tutorId;
+      const { privileges } = req.body;
 
-      if (!ownerId || !tutorId) {
-        return res.status(400).json({ message: "Owner and tutor are required" });
+      if (!ownerId || !memberId) {
+        return res.status(400).json({ message: "Owner and member are required" });
       }
       if (!Array.isArray(privileges)) {
         return res.status(400).json({ message: "Privileges must be an array" });
       }
 
-      const owner = await User.findById(ownerId);
-      if (!owner || !['tutor', 'admin'].includes(owner.role)) {
-        return res.status(404).json({ message: "Owner not found or invalid role" });
+      // Any registered user can be added as a team member regardless of category.
+      const member = await User.findById(memberId);
+      if (!member) {
+        return res.status(400).json({ message: "User not found" });
       }
-
-      const tutor = await User.findById(tutorId);
-      if (!tutor || tutor.role !== 'tutor') {
-        return res.status(400).json({ message: "Tutor not found" });
-      }
-      if (owner._id.equals(tutor._id)) {
+      if (owner._id.equals(member._id)) {
         return res.status(400).json({ message: "You cannot add yourself to your team" });
       }
 
       owner.teamMembers = owner.teamMembers || [];
-      tutor.teamMembers = tutor.teamMembers || [];
+      member.teamMembers = member.teamMembers || [];
 
       const isAlreadyAdded = owner.teamMembers.some(
-        (member) => member?.tutorId?.toString() === tutorId.toString()
+        (existing) => existing?.tutorId?.toString() === memberId.toString()
       );
       if (isAlreadyAdded) {
-        return res.status(400).json({ message: "Tutor has already been added by this owner" });
+        return res.status(400).json({ message: "User has already been added by this owner" });
       }
 
-      const newMember = { privileges, ownerId: owner._id, tutorId: tutor._id, status: "pending" };
+      const newMember = {
+        privileges,
+        ownerId: owner._id,
+        tutorId: member._id,
+        // Record the member's category so the UI can label them correctly and
+        // route them to the right experience.
+        memberRole: member.role || 'tutor',
+        status: "pending",
+      };
       owner.teamMembers.push(newMember);
-      tutor.teamMembers.push(newMember);
+      member.teamMembers.push(newMember);
 
       await owner.save();
-      await tutor.save();
+      await member.save();
 
       // Email delivery must not turn a successfully persisted invitation into a
       // false 500. The invite remains visible in the app and can be accepted there.
       let emailDelivered = false;
       try {
-        await sendTeamInvitation(tutor.email, owner.fullname, tutorId, ownerId, tutor.fullname);
+        await sendTeamInvitation(member.email, owner.fullname, memberId, ownerId, member.fullname, member.role);
         emailDelivered = true;
       } catch (mailError) {
         console.error("Team invitation email failed:", mailError);
@@ -783,51 +836,50 @@ const authControllers = {
       });
     } catch (error) {
       console.error("Error adding team member:", error);
-      return res.status(500).json({ message: "Unexpected error during team member addition" });
+      const status = error?.status || 500;
+      return res.status(status).json({
+        message: error?.message || "Unexpected error during team member addition",
+      });
     }
   },
 
   editPrivileges: async (req, res) => {
     try {
-      const ownerId = req.user?.id || req.user?._id;
-      const { tutorId, newPrivileges } = req.body;
+      // The owner (or a delegated member with the "Edit team member"
+      // privilege) is resolved and authorized here.
+      const owner = await authControllers.resolveAuthorizedOwner(req, 'Edit team member');
+      const ownerId = owner._id;
+      // Accept both the legacy `tutorId` field and the generic `memberId`.
+      const memberId = req.body.memberId || req.body.tutorId;
+      const { newPrivileges } = req.body;
 
-      if (!ownerId || !tutorId || !Array.isArray(newPrivileges)) {
-        return res.status(400).json({ message: "Owner, tutor and privileges are required" });
+      if (!ownerId || !memberId || !Array.isArray(newPrivileges)) {
+        return res.status(400).json({ message: "Owner, member and privileges are required" });
       }
 
-      // Check if the owner exists and is a tutor
-      const owner = await User.findById(ownerId);
-      if (!owner || !['tutor', 'admin'].includes(owner.role)) {
-        return res.status(404).json({ message: "Owner not found or invalid role" });
-      }
-      if (owner.role !== 'admin' && String(owner._id) !== String(req.user?.id || req.user?._id)) {
-        return res.status(403).json({ message: "You can only edit your own team members" });
+      // Check if the member exists
+      const member = await User.findById(memberId);
+      if (!member) {
+        return res.status(400).json({ message: "User not found" });
       }
 
-      // Check if the tutor exists
-      const tutor = await User.findById(tutorId);
-      if (!tutor) {
-        return res.status(400).json({ message: "Tutor not found" });
-      }
-
-      // Check if the tutor is a team member of the owner
-      const tutorMember = tutor.teamMembers.find(
-        (member) => member.ownerId?.toString() === ownerId.toString()
+      // Check if the member belongs to the owner's team
+      const memberEntry = member.teamMembers.find(
+        (entry) => entry.ownerId?.toString() === ownerId.toString()
       );
-      const ownerMember = owner.teamMembers.find(
-        (member) => member.tutorId?.toString() === tutorId.toString()
+      const ownerEntry = owner.teamMembers.find(
+        (entry) => entry.tutorId?.toString() === memberId.toString()
       );
 
-      if (!tutorMember || !ownerMember) {
+      if (!memberEntry || !ownerEntry) {
         return res.status(404).json({ message: "Team member relationship not found" });
       }
 
-      // Update privileges for both owner and tutor
-      tutorMember.privileges = newPrivileges;
-      ownerMember.privileges = newPrivileges;
+      // Update privileges for both owner and member
+      memberEntry.privileges = newPrivileges;
+      ownerEntry.privileges = newPrivileges;
 
-      await tutor.save();
+      await member.save();
       await owner.save();
 
       return res.status(200).json({
@@ -836,7 +888,10 @@ const authControllers = {
       });
     } catch (error) {
       console.error("Error editing privileges:", error);
-      return res.status(500).json({ message: "Unexpected error during privilege update" });
+      const status = error?.status || 500;
+      return res.status(status).json({
+        message: error?.message || "Unexpected error during privilege update",
+      });
     }
   },
 };

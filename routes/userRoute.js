@@ -36,9 +36,21 @@ userRouter.put("/assign/:userId", auth, authorize('tutor', 'admin'), validateObj
 userRouter.put("/unassign/:userId", auth, authorize('tutor', 'admin'), validateObjectId('userId'), userControllers.unassignCourse)
 userRouter.put("/signature/:id", auth, authorize('tutor', 'admin'), validateObjectId('id'), userControllers.addSignature)
 
-userRouter.get('/team/:tutorId', auth, authorize('tutor', 'admin'), validateObjectId('tutorId'), userControllers.getTeamMembers)
+// Directory of every user category so a provider can add any category of user
+// as a team member.
+userRouter.get('/users-by-category', auth, userControllers.getUsersByCategory)
 
-userRouter.delete('/team/:tutorId/:ownerId', auth, authorize('tutor', 'admin'), validateObjectId('tutorId', 'ownerId'), userControllers.deleteTeamMembers)
+// Any authenticated user may read their own team records (so members of every
+// category can see which provider added them). Authorization is enforced inside
+// the controllers.
+userRouter.get('/team/:tutorId', auth, validateObjectId('tutorId'), userControllers.getTeamMembers)
+
+// Authorization is enforced inside the controller: the owner, an admin, or an
+// accepted member with the "Delete team member" privilege may remove a member.
+userRouter.delete('/team/:tutorId/:ownerId', auth, validateObjectId('tutorId', 'ownerId'), userControllers.deleteTeamMembers)
+// Public on purpose: the accept/reject links in the invitation email carry the
+// authorization. The controller accepts anonymous requests but still verifies
+// the invitation exists before changing any status.
 userRouter.get('/team/:tutorId/:ownerId/:status', validateObjectId('tutorId', 'ownerId'), userControllers.updateTeamMemberStatus)
 
 userRouter.post('/send-mail', userControllers.sendMail);
