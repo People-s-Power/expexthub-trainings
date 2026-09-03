@@ -8,6 +8,7 @@ const {
 } = require("../utils/verficationCodeGenerator.js");
 const { sendVerificationEmail } = require("../utils/nodeMailer.js");
 const { sendTeamInvitation } = require("../utils/TeamInviteEmail.js");
+const { sendWelcomeEmailOnce } = require("../utils/emails/welcomeEmail.js");
 
 const determineRole = require("../utils/determinUserType.js");
 const { default: axios } = require("axios");
@@ -97,6 +98,11 @@ passport.use(
             isGoogleLinked: true,
           });
           await user.save();
+
+          // Google accounts arrive pre-verified, so welcome them right away.
+          // Fire-and-forget: a mail failure must not fail the OAuth handshake.
+          sendWelcomeEmailOnce(user).catch(err =>
+            console.error("Welcome email failed after Google signup:", err.message));
         }
 
         return done(null, user);
@@ -539,6 +545,11 @@ const authControllers = {
         return res.status(result.status).json({ message: result.message, code: result.code });
       }
 
+      // Onboarding must never fail the verification response — the account is
+      // verified either way. Log failures and keep the request moving.
+      sendWelcomeEmailOnce(user).catch(err =>
+        console.error("Welcome email failed after signup verification:", err.message));
+
       return res.status(201).json({
         message: "Email verified successfully",
         accessToken: issueAccessToken(user),
@@ -631,6 +642,10 @@ const authControllers = {
       if (!result.ok) {
         return res.status(result.status).json({ message: result.message, code: result.code });
       }
+
+      // Fire-and-forget: onboarding must never block the verification response.
+      sendWelcomeEmailOnce(user).catch(err =>
+        console.error("Welcome email failed after in-session verification:", err.message));
 
       return res.json({
         message: "Email verified successfully",

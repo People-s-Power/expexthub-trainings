@@ -91,6 +91,12 @@ const userSchema = new mongoose.Schema({
     type: Boolean,
     default: false,
   },
+  // Set once the account-onboarding email has been delivered, so a replay of a
+  // verification request (or a re-login that confirms an already-verified email)
+  // never spams the user with a second welcome message.
+  welcomeEmailSentAt: {
+    type: Date,
+  },
   graduate: {
     type: Boolean,
     default: false,

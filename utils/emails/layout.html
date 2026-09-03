@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="x-apple-disable-message-reformatting" />
+    <title>{{subject}}</title>
+    <!--[if mso]>
+      <noscript>
+        <xml>
+          <o:OfficeDocumentSettings>
+            <o:PixelsPerInch>96</o:PixelsPerInch>
+          </o:OfficeDocumentSettings>
+        </xml>
+      </noscript>
+    <![endif]-->
+    <style>
+      /* Outlook and older clients ignore embedded <style> partially; the table
+       cells carry their own inline styles as the primary presentation. This
+       block only adds polish for clients that support it. */
+      body,
+      table,
+      td,
+      a {
+        -webkit-text-size-adjust: 100%;
+        -ms-text-size-adjust: 100%;
+      }
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      a {
+        text-decoration: none;
+      }
+      img {
+        border: 0;
+        outline: none;
+        text-decoration: none;
+      }
+      p,
+      h1,
+      h2,
+      h3 {
+        margin: 0;
+      }
+      .btn a {
+        display: inline-block;
+      }
+      @media only screen and (max-width: 620px) {
+        .container {
+          width: 100% !important;
+        }
+        .stack {
+          display: block !important;
+          width: 100% !important;
+        }
+        .gutter {
+          padding: 24px 20px !important;
+        }
+      }
+    </style>
+  </head>
+  <body
+    style="
+      margin: 0;
+      padding: 0;
+      background-color: #f4f2ec;
+      word-spacing: normal;
+    "
+  >
+    <center
+      role="article"
+      aria-roledescription="email"
+      lang="en"
+      style="width: 100%; background-color: #f4f2ec"
+    >
+      <!-- Hidden preheader: a teaser that shows in the inbox preview pane. -->
+      <div
+        style="
+          display: none;
+          font-size: 1px;
+          line-height: 1px;
+          max-height: 0;
+          max-width: 0;
+          opacity: 0;
+          overflow: hidden;
+        "
+      >
+        {{preheader}}
+      </div>
+
+      <table
+        role="presentation"
+        width="100%"
+        cellpadding="0"
+        cellspacing="0"
+        border="0"
+        style="background-color: #f4f2ec; padding: 32px 16px"
+      >
+        <tr>
+          <td align="center" style="padding: 32px 16px">
+            <!-- Outer card -->
+            <table
+              role="presentation"
+              width="600"
+              cellpadding="0"
+              cellspacing="0"
+              border="0"
+              class="container"
+              style="
+                width: 600px;
+                max-width: 600px;
+                background-color: #ffffff;
+                border: 1px solid #eceae2;
+                border-radius: 16px;
+                overflow: hidden;
+                box-shadow: 0 1px 3px rgba(17, 24, 39, 0.06);
+              "
+            >
+              <tr>
+                <td
+                  style="
+                    background-color: #ffffff;
+                    border-bottom: 3px solid #fdc332;
+                    padding: 0;
+                  "
+                >
+                  <!-- Brand header -->
+                  <table
+                    role="presentation"
+                    width="100%"
+                    cellpadding="0"
+                    cellspacing="0"
+                    border="0"
+                  >
+                    <tr>
+                      <td align="center" style="padding: 28px 24px 22px 24px">
+                        <a
+                          href="{{brandHomeUrl}}"
+                          target="_blank"
+                          style="text-decoration: none"
+                        >
+                          <img
+                            src="{{logoUrl}}"
+                            alt="ExpertHub Trainings"
+                            width="168"
+                            height="auto"
+                            border="0"
+                            style="
+                              display: inline-block;
+                              width: 168px;
+                              max-width: 60%;
+                              height: auto;
+                              border: 0;
+                              outline: none;
+                              text-decoration: none;
+                            "
+                          />
+                        </a>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+
+              <tr>
+                <td style="padding: 0">{{{body}}}</td>
+              </tr>
+
+              <!-- Footer -->
+              <tr>
+                <td style="background-color: #111827; padding: 28px 32px">
+                  <table
+                    role="presentation"
+                    width="100%"
+                    cellpadding="0"
+                    cellspacing="0"
+                    border="0"
+                  >
+                    <tr>
+                      <td align="center" style="padding-bottom: 16px">
+                        <a
+                          href="{{brandHomeUrl}}"
+                          target="_blank"
+                          style="text-decoration: none"
+                        >
+                          <span
+                            style="
+                              font-family: Arial, Helvetica, sans-serif;
+                              font-size: 16px;
+                              font-weight: bold;
+                              color: #ffffff;
+                              letter-spacing: 0.3px;
+                            "
+                            >Experthub
+                            <span style="color: #fdc332">Trainings</span></span
+                          >
+                        </a>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td
+                        align="center"
+                        style="
+                          padding: 0 12px 14px 12px;
+                          font-family: Arial, Helvetica, sans-serif;
+                          font-size: 12px;
+                          line-height: 18px;
+                          color: #b9c0cc;
+                        "
+                      >
+                        Skill up. Level up. Move forward with Experthub.
+                      </td>
+                    </tr>
+                    <tr>
+                      <td
+                        align="center"
+                        style="
+                          padding-bottom: 16px;
+                          font-family: Arial, Helvetica, sans-serif;
+                          font-size: 12px;
+                          line-height: 18px;
+                          color: #9aa3b2;
+                        "
+                      >
+                        <a
+                          href="{{supportEmail}}"
+                          style="color: #fdc332; text-decoration: none"
+                          >{{supportEmail}}</a
+                        >
+                      </td>
+                    </tr>
+                    <tr>
+                      <td
+                        align="center"
+                        style="
+                          padding: 0;
+                          font-family: Arial, Helvetica, sans-serif;
+                          font-size: 11px;
+                          line-height: 16px;
+                          color: #7c8698;
+                        "
+                      >
+                        &copy; {{year}} Experthub Trainings LLC &middot; All
+                        rights reserved.
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+
+            <!-- Legal strip under the card -->
+            <table
+              role="presentation"
+              width="600"
+              cellpadding="0"
+              cellspacing="0"
+              border="0"
+              class="container"
+              style="width: 600px; max-width: 600px"
+            >
+              <tr>
+                <td
+                  align="center"
+                  style="
+                    padding: 16px 24px 4px 24px;
+                    font-family: Arial, Helvetica, sans-serif;
+                    font-size: 11px;
+                    line-height: 16px;
+                    color: #8a8f98;
+                  "
+                >
+                  You received this email because of your activity on ExpertHub
+                  Trainings. If this wasn&rsquo;t you, please contact our
+                  support team.
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </center>
+  </body>
+</html>

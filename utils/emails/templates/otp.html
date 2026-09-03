@@ -1,0 +1,47 @@
+<!-- OTP body fragment: rendered inside the shared brand layout. -->
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#FFFFFF;">
+  <tr>
+    <td align="center" class="gutter" style="padding:40px 40px 8px 40px;">
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td width="56" height="56" align="center" valign="middle" style="width:56px; height:56px; background-color:#FFF7E0; border:1px solid #FDEAB0; border-radius:50%; font-family:Arial, Helvetica, sans-serif; font-size:26px; line-height:56px;">&#128273;</td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" class="gutter" style="padding:20px 40px 4px 40px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:20px; color:#6B7280;">VERIFICATION CODE</td>
+  </tr>
+  <tr>
+    <td align="center" class="gutter" style="padding:8px 40px 4px 40px; font-family:Arial, Helvetica, sans-serif; font-size:28px; line-height:36px; font-weight:bold; color:#111827;">{{emailHeading}}</td>
+  </tr>
+  <tr>
+    <td align="center" class="gutter" style="padding:8px 48px 24px 48px; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:23px; color:#4B5563;">
+      {{emailIntro}}<br/>
+      <span style="font-weight:bold; color:#111827;">{{email}}</span>
+    </td>
+  </tr>
+
+  <!-- Code panel -->
+  <tr>
+    <td align="center" class="gutter" style="padding:6px 40px 28px 40px;">
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="background-color:#FBF9F2; border:1px solid #ECE7D8; border-radius:12px;">
+        <tr>
+          <td align="center" style="padding:22px 44px; font-family:Consolas, Menlo, 'Courier New', monospace; font-size:34px; line-height:44px; font-weight:bold; letter-spacing:8px; color:#111827;">{{code}}</td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+
+  <tr>
+    <td align="center" class="gutter" style="padding:0 48px 12px 48px; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; color:#6B7280;">
+      Enter this code on the verification screen to activate your account. For your security, this code expires in <span style="font-weight:bold; color:#111827;">{{expiryMinutes}} minutes</span> and can be used once.
+    </td>
+  </tr>
+
+  <tr>
+    <td align="center" class="gutter" style="padding:0 48px 34px 48px; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; color:#9CA3AF;">
+      If you didn&rsquo;t request this code, you can safely ignore this email.
+    </td>
+  </tr>
+</table>

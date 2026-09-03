@@ -1,0 +1,94 @@
+<!-- Payment receipt body fragment: rendered inside the shared brand layout.
+     Supports both full payments and part/installment receipts. -->
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#FFFFFF;">
+  <tr>
+    <td align="center" class="gutter" style="padding:40px 40px 8px 40px;">
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td width="56" height="56" align="center" valign="middle" style="width:56px; height:56px; background-color:#E9F9EF; border:1px solid #BFE8CD; border-radius:50%; font-family:Arial, Helvetica, sans-serif; font-size:26px; line-height:56px;">&#10003;</td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" class="gutter" style="padding:18px 40px 4px 40px; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:19px; font-weight:bold; letter-spacing:1.5px; color:#16A34A;">PAYMENT RECEIVED</td>
+  </tr>
+  <tr>
+    <td align="center" class="gutter" style="padding:8px 40px 6px 40px; font-family:Arial, Helvetica, sans-serif; font-size:27px; line-height:36px; font-weight:bold; color:#111827;">{{emailHeading}}</td>
+  </tr>
+  <tr>
+    <td align="center" class="gutter" style="padding:4px 52px 20px 52px; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:23px; color:#4B5563;">
+      Hi {{firstName}}, thanks for your payment. Your enrollment is confirmed and your course access is now active.
+    </td>
+  </tr>
+
+  <!-- Amount -->
+  <tr>
+    <td align="center" class="gutter" style="padding:4px 40px 26px 40px;">
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="background-color:#FBF9F2; border:1px solid #ECE7D8; border-radius:12px;">
+        <tr>
+          <td align="center" style="padding:18px 48px; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:22px; color:#6B7280;">Amount paid<br/><span style="font-size:32px; line-height:42px; font-weight:bold; color:#111827;">{{amountPaid}}</span></td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+
+  <!-- Receipt details -->
+  <tr>
+    <td align="center" class="gutter" style="padding:0 40px 8px 40px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #ECE7D8; border-radius:12px;">
+        <tr>
+          <td style="padding:18px 24px; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; color:#6B7280; border-bottom:1px solid #F0EDE4; width:42%;">Course</td>
+          <td style="padding:18px 24px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:20px; font-weight:bold; color:#111827; border-bottom:1px solid #F0EDE4;">{{courseTitle}}</td>
+        </tr>
+        <tr>
+          <td style="padding:14px 24px; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; color:#6B7280; border-bottom:1px solid #F0EDE4;">Reference</td>
+          <td style="padding:14px 24px; font-family:'Courier New', monospace; font-size:12px; line-height:20px; color:#111827; border-bottom:1px solid #F0EDE4; word-break:break-all;">{{txRef}}</td>
+        </tr>
+        <tr>
+          <td style="padding:14px 24px; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; color:#6B7280; border-bottom:1px solid #F0EDE4;">Date</td>
+          <td style="padding:14px 24px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:20px; color:#111827; border-bottom:1px solid #F0EDE4;">{{paidAt}}</td>
+        </tr>
+        <tr>
+          <td style="padding:14px 24px; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; color:#6B7280;">Payment method</td>
+          <td style="padding:14px 24px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:20px; color:#111827;">{{paymentMethod}}</td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+
+  {{#if installmentNote}}
+  <tr>
+    <td align="center" class="gutter" style="padding:18px 40px 6px 40px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:22px; color:#111827; font-weight:bold;">{{installmentNote}}</td>
+  </tr>
+  {{/if}}
+
+  {{#if balanceRemaining}}
+  <tr>
+    <td align="center" class="gutter" style="padding:4px 48px 14px 48px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:22px; color:#4B5563;">
+      Remaining balance: <span style="font-weight:bold; color:#111827;">{{balanceRemaining}}</span>. Please clear this before {{settlementDueAt}} to keep your access active.
+    </td>
+  </tr>
+  {{/if}}
+
+  <!-- CTA -->
+  <tr>
+    <td align="center" class="gutter" style="padding:20px 40px 10px 40px;">
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td align="center" bgcolor="#FDC332" style="border-radius:8px; background-color:#FDC332;">
+            <a href="{{ctaUrl}}" target="_blank" style="display:inline-block; padding:14px 32px; font-family:Arial, Helvetica, sans-serif; font-size:15px; font-weight:bold; line-height:20px; color:#111827; text-decoration:none; border-radius:8px;">{{ctaLabel}}</a>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+
+  {{#if showSupport}}
+  <tr>
+    <td align="center" class="gutter" style="padding:18px 48px 40px 48px; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; color:#6B7280;">
+      Questions about this payment? Reply to this email or reach our team at <a href="mailto:{{supportEmail}}" style="color:#111827; text-decoration:underline;">{{supportEmail}}</a>.
+    </td>
+  </tr>
+  {{/if}}
+</table>

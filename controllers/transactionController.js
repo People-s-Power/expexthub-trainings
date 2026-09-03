@@ -5,6 +5,7 @@ const Course = require("../models/courses.js");
 const crypto = require("crypto");
 const CoursePaymentPlan = require('../models/coursePaymentPlans.js');
 const PaymentWebhookEvent = require('../models/paymentWebhookEvents.js');
+const { sendPaymentReceiptOnce } = require('../utils/emails/receiptDispatcher.js');
 const { isValidObjectId, parseAmount } = require('../middlewares/validateRequest.js');
 const {
   finalizeFullCoursePayment,
@@ -370,6 +371,11 @@ const transactionController = {
         await Transaction.updateOne({ _id: transaction._id }, { $set: { status: 'failed' } });
         throw error;
       }
+
+      // Wallet full-payments never touch the gateway finalizer, so the receipt
+      // is dispatched here. Fire-and-forget; never fail a completed purchase on
+      // a mail error.
+      sendPaymentReceiptOnce({ transaction, settledInFull: true, paymentMethod: 'Wallet' });
 
       return res.json({ message: 'Payment successful and course enrollment confirmed', courseId });
     } catch (error) {

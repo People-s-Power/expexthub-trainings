@@ -4,6 +4,7 @@ const Course = require('../models/courses.js');
 const User = require('../models/user.js');
 const Transaction = require('../models/transactions.js');
 const CoursePaymentPlan = require('../models/coursePaymentPlans.js');
+const { sendPaymentReceiptOnce } = require('../utils/emails/receiptDispatcher.js');
 const {
   MINOR_UNIT,
   FULL_PAYMENT_TYPES,
@@ -461,6 +462,22 @@ const paymentRecordController = {
       await grantCourseAccess({ userId: student._id, courseId: course._id, plan: currentPlan });
       if (updatedPlan) {
         await creditInstructor(transaction, amountMajor);
+      }
+
+      // Offline settlements write their own transaction row, so the receipt is
+      // dispatched here rather than in the gateway finalizer. Fire-and-forget.
+      const freshTx = await Transaction.findById(transaction._id);
+      if (freshTx) {
+        const outstanding = toMajorUnits(planOutstandingMinor(currentPlan));
+        sendPaymentReceiptOnce({
+          transaction: freshTx,
+          user: student,
+          course,
+          plan: currentPlan,
+          settledInFull: isSettled,
+          balanceRemaining: outstanding,
+          paymentMethod: 'Bank transfer (offline)',
+        });
       }
 
       return res.status(200).json({

@@ -5,6 +5,7 @@ const User = require('../models/user.js');
 const Transaction = require('../models/transactions.js');
 const Notification = require('../models/notifications.js');
 const CoursePaymentPlan = require('../models/coursePaymentPlans.js');
+const { sendPaymentReceiptOnce } = require('../utils/emails/receiptDispatcher.js');
 
 const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
@@ -395,6 +396,11 @@ async function finalizeFullCoursePayment(transaction, gatewayPayment) {
 
   await grantCourseAccess({ userId: current.userId, courseId: current.courseId });
   await creditInstructor(current, Number(current.amount));
+
+  // Receipt is fire-and-forget and idempotent per transaction; the webhook and
+  // the redirect both land here, so this is the one safe choke point for full
+  // payments. Never block finalization on the mailer.
+  sendPaymentReceiptOnce({ transaction: current, settledInFull: true });
   return current;
 }
 
@@ -462,6 +468,20 @@ async function finalizeInstallmentPayment(transaction, gatewayPayment) {
   // otherwise a replay would pay the instructor twice for one payment.
   if (updatedPlan) {
     await creditInstructor(transaction, Number(transaction.amount));
+  }
+
+  // Receipt is fire-and-forget and idempotent per transaction. The dispatcher
+  // refetches the live transaction for its guard, so this call is safe to make
+  // even on replays that did not win the plan update.
+  const settledTransaction = await Transaction.findById(transaction._id);
+  if (settledTransaction) {
+    const outstanding = toMajorUnits(planOutstandingMinor(currentPlan));
+    sendPaymentReceiptOnce({
+      transaction: settledTransaction,
+      plan: currentPlan,
+      settledInFull: isSettled,
+      balanceRemaining: outstanding,
+    });
   }
 
   return currentPlan;

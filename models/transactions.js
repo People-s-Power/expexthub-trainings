@@ -17,6 +17,10 @@ const transactionSchema = new mongoose.Schema({
   status: { type: String, enum: ['pending', 'successful', 'failed'], default: 'pending', index: true },
   currency: { type: String, default: 'NGN' },
   metadata: { type: mongoose.Schema.Types.Mixed },
+  // Set when the payment-receipt email has been delivered for this transaction.
+  // Guards the webhook/redirect replay paths so a student only ever receives one
+  // receipt per payment.
+  receiptEmailSentAt: { type: Date },
 });
 
 // Serves the "has this student paid for this course?" entitlement check and the
