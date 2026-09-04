@@ -22,6 +22,61 @@ const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
 
 /**
+ * Resolves the user whose courses a caller may view payment records for.
+ *
+ * Admins scope the whole platform. A tutor/provider scopes their own courses.
+ * A team member acting for a provider keeps their own JWT while the dashboard
+ * shows the provider, so the acting owner arrives explicitly as `ownerId`
+ * (mirroring /auth/add-team's ownerId). The member is allowed only when the
+ * owner added them, the invitation was accepted, and the membership grants the
+ * "View Payments" privilege — and the scope is the owner's courses, never the
+ * member's own.
+ *
+ * Returns `{ ok, status, message, caller, scoper }`.
+ */
+async function authorizePaymentView(callerId, requestedOwnerId) {
+  const caller = await User.findById(callerId).select('role teamMembers');
+  if (!caller) {
+    return { ok: false, status: 401, message: 'Authentication required' };
+  }
+  if (caller.role === 'admin') return { ok: true, caller, scoper: caller };
+
+  // The acting owner id normally equals the caller, except when a team member
+  // is impersonating the provider that added them.
+  const actorId = String(caller._id);
+  const ownerId = requestedOwnerId && String(requestedOwnerId) !== actorId
+    ? String(requestedOwnerId)
+    : actorId;
+
+  // Admin is handled above. Anyone asking for a different owner must be an
+  // accepted member of that owner holding the "View Payments" privilege.
+  if (ownerId !== actorId) {
+    if (caller.role !== 'team_member') {
+      return { ok: false, status: 403, message: 'You do not have permission to view these payments' };
+    }
+    const ownerEntry = (caller.teamMembers || []).find(
+      (entry) =>
+        String(entry.ownerId) === ownerId && entry.status === 'accepted'
+    );
+    const granted = ownerEntry && Array.isArray(ownerEntry.privileges)
+      && ownerEntry.privileges.some(p => p.value === 'View Payments' && p.checked);
+    if (!granted) {
+      return { ok: false, status: 403, message: 'You do not have permission to view payments' };
+    }
+    const owner = await User.findById(ownerId).select('role');
+    if (!owner) {
+      return { ok: false, status: 404, message: 'Owner not found' };
+    }
+    // The scope is built from the owner's own role/id.
+    return { ok: true, caller, scoper: owner };
+  }
+
+  // tutor/provider (and team_member acting on their own record — no courses,
+  // so an empty scope) keep the historical behaviour.
+  return { ok: true, caller, scoper: caller };
+}
+
+/**
  * Who this caller is allowed to see payment records for.
  *
  * Admins see the whole platform. A tutor sees only courses they own or are
@@ -241,15 +296,16 @@ const paymentRecordController = {
   listPaymentRecords: async (req, res) => {
     try {
       const callerId = req.user?.id || req.user?._id;
-      const caller = await User.findById(callerId).select('role');
-      if (!caller) return res.status(401).json({ message: 'Authentication required' });
+      const authz = await authorizePaymentView(callerId, req.query.ownerId);
+      if (!authz.ok) return res.status(authz.status).json({ message: authz.message });
+      const scoper = authz.scoper;
 
       const { courseId } = req.query;
       if (courseId && !mongoose.Types.ObjectId.isValid(String(courseId))) {
         return res.status(400).json({ message: 'Invalid course id' });
       }
 
-      const rows = await Course.aggregate(recordPipeline(courseScopeFor(caller, courseId)));
+      const rows = await Course.aggregate(recordPipeline(courseScopeFor(scoper, courseId)));
       const records = rows.map(buildRecord);
 
       // Totals describe the whole scope, not the page — an admin monitoring what
@@ -314,10 +370,11 @@ const paymentRecordController = {
   listPaymentRecordCourses: async (req, res) => {
     try {
       const callerId = req.user?.id || req.user?._id;
-      const caller = await User.findById(callerId).select('role');
-      if (!caller) return res.status(401).json({ message: 'Authentication required' });
+      const authz = await authorizePaymentView(callerId, req.query.ownerId);
+      if (!authz.ok) return res.status(authz.status).json({ message: authz.message });
+      const scoper = authz.scoper;
 
-      const courses = await Course.find(courseScopeFor(caller))
+      const courses = await Course.find(courseScopeFor(scoper))
         .select('title fee partPaymentEnabled')
         .sort({ createdAt: -1 })
         .lean();

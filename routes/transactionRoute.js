@@ -35,12 +35,14 @@ transactionRouter.get('/course-payment-plans/:planId', authenticate, authorize('
 transactionRouter.post('/course-payment-plans/:planId/payments', authenticate, authorize('student', 'client'), paymentLimiter, validateObjectId('planId'), paymentPlanController.initializePayment);
 transactionRouter.post('/course-payment-plans/:planId/payments/wallet', authenticate, authorize('student', 'client'), walletLimiter, validateObjectId('planId'), paymentPlanController.payWithWallet);
 
-// Payment records for the admissions view. Tutors and admins both reach this;
+// Payment records for the payments menu. Tutors and admins both reach this;
 // the controller scopes rows by course ownership, so a tutor only ever sees the
-// money owed on their own courses.
+// money owed on their own courses. Team members pass the role gate but the
+// controller still requires the owner's "View Payments" privilege before any
+// row is returned.
 const paymentRecordController = require('../controllers/paymentRecordController.js');
-transactionRouter.get('/payment-records', authenticate, authorize('tutor', 'admin'), generalLimiter, paymentRecordController.listPaymentRecords);
-transactionRouter.get('/payment-records/courses', authenticate, authorize('tutor', 'admin'), generalLimiter, paymentRecordController.listPaymentRecordCourses);
+transactionRouter.get('/payment-records', authenticate, authorize('tutor', 'admin', 'team_member'), generalLimiter, paymentRecordController.listPaymentRecords);
+transactionRouter.get('/payment-records/courses', authenticate, authorize('tutor', 'admin', 'team_member'), generalLimiter, paymentRecordController.listPaymentRecordCourses);
 // Admin-only: record an offline settlement of a student's outstanding balance.
 transactionRouter.post('/payment-records/settle-balance', authenticate, authorize('admin'), paymentLimiter, paymentRecordController.settleStudentBalance);
 
