@@ -70,17 +70,68 @@ async function addEnrollment(course, studentId, status = 'active') {
 }
 
 /**
+ * True when the caller is an accepted member of `ownerId`'s team and that
+ * membership grants `privilege`. Used for delegated team access — the member
+ * keeps their own JWT/id while acting for the provider that added them.
+ */
+function hasTeamPrivilege(caller, ownerId, privilege) {
+    if (!Array.isArray(caller?.teamMembers)) return false;
+    return caller.teamMembers.some(
+        (entry) =>
+            String(entry.ownerId) === String(ownerId) &&
+            entry.status === 'accepted' &&
+            Array.isArray(entry.privileges) &&
+            entry.privileges.some((p) => p.value === privilege && p.checked)
+    );
+}
+
+/**
+ * True when the caller is an accepted member of `ownerId`'s team (regardless of
+ * privilege — the privilege check is done by the callers of this function).
+ */
+function isAcceptedTeamMemberOf(caller, ownerId) {
+    if (!Array.isArray(caller?.teamMembers)) return false;
+    return caller.teamMembers.some(
+        (entry) =>
+            String(entry.ownerId) === String(ownerId) && entry.status === 'accepted'
+    );
+}
+
+/**
  * True when the caller may administer this course.
  *
  * Read from the stored user rather than the token claims, so a role changed
  * after a token was issued takes effect immediately.
+ *
+ * Ownership is one path in. A team member added by the course owner can also
+ * act when their membership is accepted (privilege labelling is enforced by
+ * canPerformCourseAction) — this is what lets an owner delegate day-to-day
+ * management to their team without exposing every course on the platform.
  */
 function canManageCourse(course, caller) {
     if (!course || !caller) return false;
     if (caller.role === 'admin') return true;
     const callerId = String(caller._id);
     if (String(course.instructorId) === callerId) return true;
-    return (course.assignedTutors || []).some(tutorId => String(tutorId) === callerId);
+    if ((course.assignedTutors || []).some((tutorId) => String(tutorId) === callerId)) return true;
+    return isAcceptedTeamMemberOf(caller, course.instructorId);
+}
+
+/**
+ * Course-level permission check that also requires a specific privilege when
+ * the caller is neither the course owner/admin nor an assigned tutor — i.e. a
+ * team member acting for the provider that owns the course (for example
+ * "Enroll students", "Delete Course").
+ */
+function canPerformCourseAction(course, caller, privilege) {
+    if (!course || !caller) return false;
+    if (caller.role === 'admin') return true;
+    const callerId = String(caller._id);
+    // Owner and assigned tutors keep their full management access.
+    if (String(course.instructorId) === callerId) return true;
+    if ((course.assignedTutors || []).some((tutorId) => String(tutorId) === callerId)) return true;
+    // Everyone else must be an accepted team member holding the privilege.
+    return hasTeamPrivilege(caller, course.instructorId, privilege);
 }
 
 /** Tells the student they were added. Never fails the enrollment it reports. */
@@ -720,7 +771,10 @@ const courseController = {
                 return res.status(404).json({ message: 'Course not found' });
             }
             if (!canManageCourse(course, caller)) {
-                return res.status(403).json({ message: 'You can only enroll students on your own courses' });
+                return res.status(403).json({ message: 'You can only enroll students on courses you own or manage' });
+            }
+            if (!canPerformCourseAction(course, caller, 'Enroll students')) {
+                return res.status(403).json({ message: 'You do not have the permission to enroll students on this course' });
             }
             if (!student) {
                 return res.status(404).json({ message: 'Student not found' });
@@ -1336,9 +1390,11 @@ const courseController = {
             }
             // Ownership, not just role: the route lets tutors through so they can
             // waive their own course's fee, and this is what stops one tutor
-            // granting free places on another's course.
-            if (!canManageCourse(course, caller)) {
-                return res.status(403).json({ message: 'You can only grant scholarships on your own courses' });
+            // granting free places on another's course. An accepted team member
+            // needs the "Enroll students" privilege to waive a seat on the owner's
+            // behalf — the same gate the enroll-student endpoint uses.
+            if (!canPerformCourseAction(course, caller, 'Enroll students')) {
+                return res.status(403).json({ message: 'You can only grant scholarships on courses you own or manage' });
             }
             if (!course.approved) {
                 return res.status(403).json({ message: 'Cannot grant scholarships for an unapproved course' });

@@ -33,7 +33,7 @@ courseRouter.post("/add-course/:userId", authenticate, authorize('tutor', 'admin
 courseRouter.get("/admissions/:courseId", authenticate, authorize('tutor', 'admin'), validateObjectId('courseId'), courseController.getEnrolledStudents);
 // Enrolling somebody else needs its own endpoint: /enroll deliberately ignores
 // any student id in the body so a student cannot enroll another account.
-courseRouter.post("/enroll-student/:courseId", authenticate, authorize('tutor', 'admin'), validateObjectId('courseId'), courseController.enrollStudentByInstructor);
+courseRouter.post("/enroll-student/:courseId", authenticate, authorize('tutor', 'admin', 'team_member'), validateObjectId('courseId'), courseController.enrollStudentByInstructor);
 courseRouter.post("/assign/:courseId", authenticate, authorize('tutor', 'admin'), validateObjectId('courseId'), courseController.assignTutor);
 courseRouter.delete("/delete/:id", authenticate, authorize('tutor', 'admin'), validateObjectId('id'), courseController.deleteCourse);
 courseRouter.put("/edit/:id", authenticate, authorize('tutor', 'admin'), validateObjectId('id'), courseController.editCourse);
@@ -49,8 +49,9 @@ courseRouter.get('/renew/:courseId/:id', authenticate, authorize('admin'), valid
 
 // Waiving a fee is the only way to give a free place — the enroll-student flow
 // deliberately has no free branch. Tutors are allowed through the role gate
-// because it is their own course's revenue they are waiving; the controller
-// still checks ownership, so a tutor cannot grant on someone else's course.
-courseRouter.post('/give-scholarship/:courseId', authenticate, authorize('tutor', 'admin'), validateObjectId('courseId'), courseController.giveScholarship);
+// because it is their own course's revenue they are waiving; team_member is
+// admitted because the controller enforces the "Enroll students" privilege, so
+// neither a tutor nor a member can grant on a course they do not manage.
+courseRouter.post('/give-scholarship/:courseId', authenticate, authorize('tutor', 'admin', 'team_member'), validateObjectId('courseId'), courseController.giveScholarship);
 
 module.exports = courseRouter;

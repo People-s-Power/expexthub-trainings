@@ -16,7 +16,9 @@ userRouter.get("/profile/:id", auth, validateObjectId('id'), userControllers.get
 userRouter.post("/premium", userControllers.updateTutorLevel);
 
 userRouter.get("/instructors", auth, authorize('tutor', 'admin'), userControllers.getInstructors);
-userRouter.get("/students", auth, authorize('tutor', 'admin'), userControllers.getStudents);
+// Team members (impersonating a provider) also need the student directory to
+// enrol students on the provider's courses.
+userRouter.get("/students", auth, authorize('tutor', 'admin', 'team_member'), userControllers.getStudents);
 userRouter.put("/updateProfile/:id", userControllers.upDateprofile);
 userRouter.put("/updateProfilePicture/:id", userControllers.updateProfilePhote);
 
