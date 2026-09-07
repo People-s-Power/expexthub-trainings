@@ -339,22 +339,12 @@ const eventsController = {
     const userId = req.params.userId;
 
     try {
-      // Find the user by ID
-      // const user = await User.findById(userId);
-
-      // if (!user) {
-      //     return res.status(404).json({ message: 'User not found' });
-      // }
-
-      // Get the enrolled courses using the user's enrolledCourses array
-      const enrolledCourses2 = await LearningEvent.find()
-      console.log(enrolledCourses2)
-      const enrolledCourses = await LearningEvent.find({ enrolledStudents: { _id: userId } }).populate({ path: 'enrolledStudents', select: "profilePicture fullname _id" }).lean();
-      // console.log(enrolledCourses)
-
-      if (!enrolledCourses || enrolledCourses.length === 0) {
-        return res.status(404).json({ message: 'No enrolled courses found for this user' });
-      }
+      // `enrolledStudents` is an array of ObjectIds, so the match is a plain
+      // equality on the field — not `{ _id: userId }` which never matches and
+      // silently emptied the calendar's events section.
+      const enrolledCourses = await LearningEvent.find({ enrolledStudents: userId })
+        .populate({ path: 'enrolledStudents', select: "profilePicture fullname _id" })
+        .lean();
 
       return res.status(200).json({ message: 'Enrolled courses retrieved successfully', enrolledCourses });
     } catch (error) {

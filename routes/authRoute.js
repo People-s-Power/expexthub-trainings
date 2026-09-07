@@ -53,4 +53,10 @@ router.put('/reset-passowrd', verificationAttemptLimiter, authControllers.resetP
 router.post('/add-team', authenticate, generalLimiter, authControllers.addTeamMember)
 router.post('/edit-team', authenticate, generalLimiter, authControllers.editPrivileges)
 
+// Registration-time course category. Intentionally unauthenticated: the account
+// was just created and has no session yet (the signup step-3 picker runs before
+// verification). Only a not-yet-verified account may use it, which bounds the
+// window and keeps the endpoint from becoming a way to edit arbitrary accounts.
+router.put('/category/:userId', validateObjectId('userId'), authControllers.setSignupCategory)
+
 module.exports = router;

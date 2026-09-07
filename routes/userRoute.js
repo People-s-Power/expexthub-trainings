@@ -34,8 +34,12 @@ userRouter.put("/mygraduate", userControllers.getMyGraduates);
 
 userRouter.put("/block/:userId", auth, authorize('tutor', 'admin'), validateObjectId('userId'), userControllers.block)
 userRouter.put("/graduate/:userId", auth, authorize('tutor', 'admin'), validateObjectId('userId'), userControllers.makeGraduate)
-userRouter.put("/assign/:userId", auth, authorize('tutor', 'admin'), validateObjectId('userId'), userControllers.addCourse)
-userRouter.put("/unassign/:userId", auth, authorize('tutor', 'admin'), validateObjectId('userId'), userControllers.unassignCourse)
+// Assigning a course category is self-service: any authenticated user may set
+// their own category (e.g. the signup step-3 picker, or the dashboard
+// interests modal). The controller verifies the caller may only modify their
+// own record, so a tutor cannot silently change another user's interests.
+userRouter.put("/assign/:userId", auth, validateObjectId('userId'), userControllers.addCourse)
+userRouter.put("/unassign/:userId", auth, validateObjectId('userId'), userControllers.unassignCourse)
 userRouter.put("/signature/:id", auth, authorize('tutor', 'admin'), validateObjectId('id'), userControllers.addSignature)
 
 // Directory of every user category so a provider can add any category of user

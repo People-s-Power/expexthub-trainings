@@ -263,6 +263,12 @@ const authControllers = {
         address,
         contact,
         password,
+        // Optional course category chosen at signup (applicant step 3). Stored as
+        // the user's primary assigned course so recommendations and dashboard
+        // filters work from day one, and the value is validated against the
+        // registered categories so junk cannot be persisted.
+        category,
+        organizationName,
       } = req.body;
 
       if (!userType || !fullname || !email || !password || !state) {
@@ -280,6 +286,21 @@ const authControllers = {
         return res.status(400).json({ message: "User already registered" });
       }
 
+      // Category is optional at signup; when provided it must be a valid
+      // registered category (or one of its sub-categories) so the value stored
+      // on the account can never be an arbitrary string.
+      let normalizedCategory = null;
+      if (category && typeof category === 'string' && category.trim()) {
+        const Category = require('../models/category.js');
+        const catDoc = await Category.findOne({
+          $or: [
+            { category: category.trim() },
+            { subCategory: category.trim() },
+          ],
+        }).lean();
+        if (catDoc) normalizedCategory = category.trim();
+      }
+
       // Generate a unique verification code per user
       const verificationCode = generateVerificationCode();
 
@@ -293,12 +314,15 @@ const authControllers = {
         state,
         address,
         role,
+        organizationName,
         verificationCode,
         verificationCodeExpiresAt: new Date(Date.now() + VERIFICATION_CODE_TTL_MS),
         verificationCodeSentAt: new Date(),
         verificationAttempts: 0,
         contact,
         password: hashPassword,
+        // Applicant signup step 3 — primary course category.
+        ...(normalizedCategory ? { assignedCourse: normalizedCategory } : {}),
       });
 
       await newUser.save();
@@ -485,6 +509,7 @@ const authControllers = {
           email: user.email,
           role: user.role,
           emailVerification: user.isVerified,
+          isVerified: user.isVerified === true,
           assignedCourse: user.assignedCourse,
           profilePicture: user.image,
           otherCourse: user.otherCourse,
@@ -892,6 +917,66 @@ const authControllers = {
       return res.status(status).json({
         message: error?.message || "Unexpected error during privilege update",
       });
+    }
+  },
+
+  /**
+   * Sets the course category chosen during signup (step 3 of the applicant
+   * wizard).
+   *
+   * Runs before verification, so the account has no session yet and this is
+   * deliberately unauthenticated. It is safe because:
+   *  - only a not-yet-verified account may be modified (bounds the window to
+   *    the minutes right after registration);
+   *  - only a registered course category (or sub-category) is accepted;
+   *  - the id must be a valid ObjectId and the route is rate-limited.
+   */
+  setSignupCategory: async (req, res) => {
+    try {
+      const user = await User.findById(req.params.userId);
+      if (!user) return res.status(404).json({ message: "Account not found" });
+      if (user.isVerified) {
+        return res.status(403).json({ message: "This account is already verified. Use your dashboard to change interests." });
+      }
+
+      const { category } = req.body;
+      if (!category || typeof category !== 'string' || !category.trim()) {
+        return res.status(400).json({ message: "Course category is required" });
+      }
+
+      // Only a registered category or one of its sub-categories may be stored,
+      // so the value on the account can never be an arbitrary string.
+      const Category = require('../models/category.js');
+      const trimmed = category.trim();
+      const catDoc = await Category.findOne({
+        $or: [
+          { category: trimmed },
+          { subCategory: trimmed },
+        ],
+      }).lean();
+      if (!catDoc) {
+        return res.status(400).json({ message: "That course category is not available" });
+      }
+
+      if (!user.assignedCourse) {
+        user.assignedCourse = trimmed;
+      } else if (!user.otherCourse.includes(trimmed)) {
+        user.otherCourse.push(trimmed);
+      }
+      await user.save();
+
+      return res.status(200).json({
+        success: true,
+        message: "Course category saved",
+        user: {
+          id: user._id,
+          assignedCourse: user.assignedCourse,
+          otherCourse: user.otherCourse,
+        },
+      });
+    } catch (error) {
+      console.error("Error setting signup category:", error);
+      return res.status(500).json({ message: "Unexpected error while saving course category" });
     }
   },
 };

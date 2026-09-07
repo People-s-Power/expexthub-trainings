@@ -21,6 +21,14 @@ const {
     creditInstructor,
     initializeGatewayCheckout,
     serializePlan,
+    resolvePartPaymentPolicy,
+    openPlanForStudent,
+    validatePaymentAmount,
+    planOutstandingMinor,
+    minimumPaymentMinor,
+    nextPaymentNumber,
+    toMinorUnits,
+    toMajorUnits,
     FULL_PAYMENT_TYPES,
 } = require("../services/coursePaymentService.js");
 
@@ -869,6 +877,158 @@ const courseController = {
             // fee. Enrolment happens in the webhook/verify path, the same way it
             // does when a student pays for themselves — so an unpaid checkout can
             // never hand out a seat.
+            //
+            // Part payment: when the instructor consented to it, the tutor may
+            // open (or reuse) the student's part-payment plan and collect an
+            // initial installment instead of the full fee. This mirrors the
+            // student-facing plan flow and reuses the same plan ledger so the
+            // payments menu and the student's payment-plans page always agree.
+            const partPaymentRequested = req.body?.partPayment === true
+                || req.body?.paymentMethod === 'part'
+                || req.body?.paymentMethod === 'installment';
+
+            const policy = resolvePartPaymentPolicy(course);
+            const partAllowed = partPaymentRequested && policy.partPaymentEnabled;
+
+            if (partAllowed) {
+                try {
+                    const plan = await openPlanForStudent({
+                        user: student,
+                        course,
+                        createdBy: caller._id,
+                    });
+                    const policy2 = resolvePartPaymentPolicy(course);
+                    const totalMinor = Number(plan.totalAmountMinor || 0);
+                    const paidMinor = Number(plan.amountPaidMinor || 0);
+                    const outstandingMinor = Math.max(0, totalMinor - paidMinor);
+
+                    if (outstandingMinor <= 0) {
+                        const { enrolled, reason } = await addEnrollment(course, student._id, 'active');
+                        if (!enrolled) {
+                            return res.status(409).json({ message: 'Student is already enrolled in the course' });
+                        }
+                        await notifyEnrolledStudent(student, course);
+                        return res.status(200).json({
+                            message: 'Student is already fully paid and was enrolled successfully',
+                            courseId: course._id,
+                            plan: serializePlan(plan),
+                        });
+                    }
+
+                    const minimumMinor = minimumPaymentMinor(totalMinor, outstandingMinor);
+                    const amountMinor = Math.max(minimumMinor, Math.min(outstandingMinor, policy2.minimumFirstPaymentMinor));
+
+                    const { amountMinor: validatedMinor, error } = validatePaymentAmount(plan, toMajorUnits(amountMinor));
+                    if (error) {
+                        return res.status(400).json({ message: error, plan: serializePlan(plan) });
+                    }
+
+                    // Reuse a still-open checkout for the same amount.
+                    const openPayment = (plan.installments || []).find(
+                        (entry) => entry.status === 'processing' && Number(entry.amountMinor) === validatedMinor
+                    );
+                    if (openPayment?.txRef) {
+                        const existing = await Transaction.findOne({ txRef: openPayment.txRef, status: 'pending' });
+                        if (existing?.metadata?.checkoutLink) {
+                            return res.status(200).json({
+                                message: 'A checkout is already open for this student. Share this payment link to complete the first part payment.',
+                                code: 'PART_PAYMENT_PENDING',
+                                link: existing.metadata.checkoutLink,
+                                txRef: existing.txRef,
+                                reused: true,
+                                fee: toMajorUnits(validatedMinor),
+                                plan: serializePlan(plan),
+                                student: { id: student._id, fullname: student.fullname, email: student.email },
+                            });
+                        }
+                    }
+
+                    const paymentNumber = nextPaymentNumber(plan);
+                    const txRef = `course-plan-${plan._id}-${paymentNumber}-${crypto.randomUUID()}`;
+                    let transaction;
+                    try {
+                        transaction = await Transaction.create({
+                            userId: student._id,
+                            courseId: course._id,
+                            paymentPlanId: plan._id,
+                            installmentNumber: paymentNumber,
+                            amount: toMajorUnits(validatedMinor),
+                            txRef,
+                            type: 'course_installment',
+                            status: 'pending',
+                            currency: 'NGN',
+                            soldBy: caller._id,
+                            metadata: {
+                                title: course.title,
+                                paymentNumber,
+                                // Records that a tutor started this part payment on
+                                // the student's behalf.
+                                initiatedBy: String(caller._id),
+                                channel: 'instructor_enrollment',
+                            },
+                        });
+
+                        plan.installments.push({
+                            number: paymentNumber,
+                            amountMinor: validatedMinor,
+                            status: 'processing',
+                            txRef,
+                            attempts: 1,
+                            lastAttemptAt: new Date(),
+                        });
+                        await plan.save();
+
+                        const link = await initializeGatewayCheckout({
+                            txRef,
+                            amount: transaction.amount,
+                            currency: 'NGN',
+                            customer: { email: student.email, name: student.fullname, phone: student.phone },
+                            description: `Part payment for ${course.title}`,
+                            meta: {
+                                userId: String(student._id),
+                                courseId: String(course._id),
+                                paymentPlanId: String(plan._id),
+                                installmentNumber: paymentNumber,
+                            },
+                            redirectUrl: req.body?.redirect_url,
+                        });
+
+                        transaction.metadata = { ...(transaction.metadata || {}), checkoutLink: link };
+                        await transaction.save();
+                        return res.status(201).json({
+                            message: 'Share this payment link with the student to complete the first part payment.',
+                            code: 'PART_PAYMENT_PENDING',
+                            link,
+                            txRef,
+                            fee: transaction.amount,
+                            plan: serializePlan(plan),
+                            student: { id: student._id, fullname: student.fullname, email: student.email },
+                        });
+                    } catch (gatewayError) {
+                        if (transaction) {
+                            await Transaction.updateOne(
+                                { _id: transaction._id, status: 'pending' },
+                                { $set: { status: 'failed' } },
+                            );
+                            const fresh = await CoursePaymentPlan.findById(plan._id);
+                            const freshPayment = fresh?.installments.find((item) => item.number === paymentNumber);
+                            if (freshPayment?.status === 'processing') {
+                                freshPayment.status = 'failed';
+                                await fresh.save();
+                            }
+                        }
+                        console.error('Instructor part-payment checkout failed:', gatewayError.response?.data || gatewayError.message);
+                        return res.status(502).json({ message: 'Unable to start part payment. Please try again.' });
+                    }
+                } catch (planError) {
+                    if (planError?.status) {
+                        return res.status(planError.status).json({ message: planError.message, code: planError.code });
+                    }
+                    console.error('Instructor part-payment plan failed:', planError);
+                    return res.status(500).json({ message: 'Unable to start part payment for this student' });
+                }
+            }
+
             const openTransaction = await Transaction.findOne({
                 userId: student._id,
                 courseId: course._id,

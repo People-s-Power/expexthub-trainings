@@ -60,14 +60,44 @@ const userControllers = {
   // to add aditional category
   addCourse: async (req, res) => {
     const id = req.params.userId;
-    const { course } = req.body
-    const user = await User.findById(id);
+    const { course } = req.body;
+    const callerId = req.user?.id || req.user?._id;
+
     try {
-      if (user.otherCourse.includes(course) || user.assignedCourse === course) {
+      // Self-service guard: an authenticated user may only set their own
+      // categories. A tutor/admin may still set a category on a student's
+      // behalf (the legacy behaviour), but a random user cannot modify another
+      // account's interests.
+      const caller = req.user;
+      const isSelf = String(callerId) === String(id);
+      const isStaff = caller && (caller.role === 'tutor' || caller.role === 'admin');
+      if (!isSelf && !isStaff) {
+        return res.status(403).json({ message: 'You can only update your own course categories' });
+      }
+
+      if (!course || typeof course !== 'string' || !course.trim()) {
+        return res.status(400).json({ message: 'Course category is required' });
+      }
+
+      const user = await User.findById(id);
+      if (!user) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+
+      // The value is stored either as the primary assignedCourse (when the
+      // account has none yet) or appended to otherCourse. This keeps the
+      // signup step-3 picker and the dashboard interests modal consistent:
+      // a user with no category gets their first choice as assignedCourse.
+      const trimmedCourse = course.trim();
+      if (user.otherCourse.includes(trimmedCourse) || user.assignedCourse === trimmedCourse) {
         return res.status(400).json({ message: 'Student is already assigned course' });
       }
 
-      user.otherCourse.push(course);
+      if (!user.assignedCourse) {
+        user.assignedCourse = trimmedCourse;
+      } else {
+        user.otherCourse.push(trimmedCourse);
+      }
       await user.save();
       return res.status(200).json({
         message: 'Assigned successfully', user: {
@@ -93,8 +123,22 @@ const userControllers = {
   unassignCourse: async (req, res) => {
     const id = req.params.userId;
     const { course } = req.body;
+    const callerId = req.user?.id || req.user?._id;
 
     try {
+      // Self-service guard: an authenticated user may only remove their own
+      // categories; a tutor/admin may still manage a student's interests.
+      const caller = req.user;
+      const isSelf = String(callerId) === String(id);
+      const isStaff = caller && (caller.role === 'tutor' || caller.role === 'admin');
+      if (!isSelf && !isStaff) {
+        return res.status(403).json({ message: 'You can only update your own course categories' });
+      }
+
+      if (!course || typeof course !== 'string' || !course.trim()) {
+        return res.status(400).json({ message: 'Course category is required' });
+      }
+
       // Find the user by ID
       const user = await User.findById(id);
       if (!user) {
@@ -224,11 +268,18 @@ const userControllers = {
 
   getStudents: async (req, res) => {
     try {
-      // Find all users with the role 'student'
-      const students = await User.find({ role: 'student' });
+      // Learners register as either `student` or `client` (the signup form posts
+      // userType "client" for applicants), so both roles must be returned or the
+      // Enrol Student list stays empty while real users exist on the platform.
+      // The signed-in caller is excluded — a tutor cannot enrol themselves.
+      const actorId = req.user?.id || req.user?._id;
+      const filter = { role: { $in: ['student', 'client'] }, blocked: { $ne: true } };
+      if (actorId) filter._id = { $ne: actorId };
+
+      const students = await User.find(filter).lean();
 
       if (!students || students.length === 0) {
-        return res.status(404).json({ message: 'No students found' });
+        return res.status(200).json({ message: 'No students found', students: [] });
       }
 
       // Extract relevant student information
@@ -244,10 +295,13 @@ const userControllers = {
         state: student.state,
         address: student.address,
         course: student.assignedCourse,
-        profilePicture: student.profilePicture,
+        // The user model historically writes the avatar to `image` and
+        // sometimes `profilePicture`; fall back so cards always render one.
+        profilePicture: student.profilePicture || student.image || null,
         graduate: student.graduate,
         blocked: student.blocked,
-        contact: student.contact
+        contact: student.contact,
+        isVerified: student.isVerified === true,
       }));
 
       return res.status(200).json({ message: 'Students retrieved successfully', students: studentProfiles });
@@ -852,12 +906,16 @@ const userControllers = {
         return res.status(404).json({ message: "Owner not found" });
       }
 
-      // The provider that owns the team (or an admin) may remove a member. A
-      // team member acting on the provider's behalf may also remove members
-      // when their privileges grant "Delete team member".
+      // Authorization: the provider that owns the team (or an admin) may remove
+      // a member. A team member acting on the provider's behalf may also remove
+      // members when their privileges grant "Delete team member". In addition,
+      // the invited member may remove THEMSELVES from the team at any time — no
+      // privilege is required to leave, and the member's own id is the gate so
+      // nobody can leave on another member's behalf.
+      const isSelfRemoval = String(actorId) === String(tutorId);
       const isOwner = String(actorId) === String(ownerId);
       const isAdmin = req.user?.role === 'admin';
-      if (!isAdmin && !isOwner) {
+      if (!isAdmin && !isOwner && !isSelfRemoval) {
         const actor = await User.findById(actorId);
         const actorEntry = actor?.teamMembers?.find(
           (entry) =>
@@ -867,7 +925,7 @@ const userControllers = {
           (p) => p.value === 'Delete team member' && p.checked
         );
         if (!canDelete) {
-          return res.status(403).json({ message: "You can only remove members from your own team" });
+          return res.status(403).json({ message: "You can only remove members from your own team, or leave a team you belong to" });
         }
       }
 
