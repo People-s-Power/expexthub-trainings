@@ -276,11 +276,25 @@ const userControllers = {
       const filter = { role: { $in: ['student', 'client'] }, blocked: { $ne: true } };
       if (actorId) filter._id = { $ne: actorId };
 
-      // Project only the fields the Enrol Student list renders. Without this,
-      // Mongo returns whole user documents — surveys, team-member arrays, daily
-      // schedules, OAuth tokens, assessment answers, the password hash — for
-      // every learner on the platform, which is what made this list slow to
-      // load. Fetching ~15 fields keeps the query and the JSON payload small.
+      // A dropdown picker (Enrol Student, scholarship) only needs enough to
+      // search and label a row, so it asks for the compact shape via ?compact=1:
+      // three fields instead of ~18. That keeps the query and the JSON payload
+      // tiny, which is what lets the picker load almost instantly.
+      const compact = req.query.compact === '1' || req.query.fields === 'basic';
+      if (compact) {
+        const picks = await User.find(filter).select('name fullname email').lean();
+        const studentProfiles = picks.map(student => ({
+          studentId: student._id,
+          fullname: student.name || student.fullname,
+          email: student.email,
+        }));
+        return res.status(200).json({ message: 'Students retrieved successfully', students: studentProfiles });
+      }
+
+      // Full shape for the admin admissions table and other rich consumers.
+      // Project only the fields those render — without this, Mongo returns whole
+      // user documents (surveys, team arrays, schedules, OAuth tokens, the
+      // password hash) for every learner on the platform.
       const students = await User.find(filter)
         .select('name fullname email phone gender age skillLevel country state address assignedCourse profilePicture image graduate blocked contact isVerified')
         .lean();
