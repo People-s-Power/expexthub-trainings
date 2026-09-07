@@ -219,13 +219,20 @@ const assessmentControllers = {
           employmentStatus,
           trainingHours,
           age,
-          preferedCourse,
+          // Category is chosen once at signup (step 3) and saved to
+          // assignedCourse. The survey no longer asks again, so fall back to the
+          // already-chosen course instead of recording a blank on the survey.
+          preferedCourse: preferedCourse || foundUser.assignedCourse,
           yearsOfExperience,
           currentEducation,
           joiningAccomplishment,
         };
 
-        foundUser.assignedCourse = preferedCourse
+        // Never let an empty survey value wipe the category picked at signup —
+        // only an explicitly-provided course updates it.
+        if (preferedCourse) {
+          foundUser.assignedCourse = preferedCourse
+        }
 
         // Save the user document with the updated survey data
         await foundUser.save();
