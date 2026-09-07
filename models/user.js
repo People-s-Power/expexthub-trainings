@@ -46,13 +46,20 @@ const userSchema = new mongoose.Schema({
     default: ""
   },
   password: String,
-  role: String,
+  // Indexed: the platform filters by role constantly (the Enrol Student list,
+  // instructor lists, admin dashboards), and without an index each of those is
+  // a full collection scan.
+  role: { type: String, index: true },
   googleId: String,
   bankCode: String,
   profilePicture: String,
   image: String,
 
   assignedWorkspace: String,
+  // Primary course category chosen at signup (applicant step 3) or in the
+  // survey. Declared here so Mongoose persists it — under strict mode a write to
+  // an undeclared path is silently dropped, which previously lost the category.
+  assignedCourse: String,
   otherCourse: [{
     type: String
   }],

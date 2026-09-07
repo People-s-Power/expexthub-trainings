@@ -43,7 +43,11 @@ passport.use(
             decodedState = {};
           }
         }
-        const { role = "student", link } = decodedState;
+        // Normalize the requested role through the same mapping the form uses,
+        // so a Google signup can never store an off-list role (which would then
+        // fail role-gated routes). Defaults to "student".
+        const { role: requestedRole = "student", link } = decodedState;
+        const role = determineRole(String(requestedRole).toLowerCase());
 
         const email = profile.emails?.[0]?.value?.toLowerCase();
         if (!email) return done(new Error("No email from Google"), null);
@@ -79,6 +83,10 @@ passport.use(
           user.isGoogleLinked = true;
           if (!user.signInType) user.signInType = "google";
           if (!user.fullname && profile.displayName) user.fullname = profile.displayName;
+          // Backfill a role only when the account has none (legacy/partial
+          // signups). Never overwrite an existing role — a returning admin or
+          // tutor must not be silently downgraded by a login.
+          if (!user.role) user.role = role;
           await user.save();
         } else {
           // 🔵 New user registration
@@ -275,11 +283,22 @@ const authControllers = {
         return res.status(400).json({ message: "Please fill all required fields" });
       }
 
+      // Validate email shape and password strength up front, so the frontend and
+      // backend agree on what a valid account looks like.
+      const normalizedEmail = String(email).trim().toLowerCase();
+      const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailPattern.test(normalizedEmail)) {
+        return res.status(400).json({ message: "Please enter a valid email address" });
+      }
+      if (typeof password !== 'string' || password.length < 8) {
+        return res.status(400).json({ message: "Password must be at least 8 characters long" });
+      }
+
       const lowercasedUserType = userType.toLowerCase();
       const role = determineRole(lowercasedUserType);
 
       const alreadyExistingUser = await User.findOne({
-        email: email.toLowerCase(),
+        email: normalizedEmail,
       });
 
       if (alreadyExistingUser) {
@@ -306,8 +325,8 @@ const authControllers = {
 
       const hashPassword = bcrypt.hashSync(password, 10);
       const newUser = new User({
-        username: email.toLowerCase(),
-        email: email.toLowerCase(),
+        username: normalizedEmail,
+        email: normalizedEmail,
         fullname,
         phone,
         country,

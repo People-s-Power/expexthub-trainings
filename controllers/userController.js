@@ -276,7 +276,14 @@ const userControllers = {
       const filter = { role: { $in: ['student', 'client'] }, blocked: { $ne: true } };
       if (actorId) filter._id = { $ne: actorId };
 
-      const students = await User.find(filter).lean();
+      // Project only the fields the Enrol Student list renders. Without this,
+      // Mongo returns whole user documents — surveys, team-member arrays, daily
+      // schedules, OAuth tokens, assessment answers, the password hash — for
+      // every learner on the platform, which is what made this list slow to
+      // load. Fetching ~15 fields keeps the query and the JSON payload small.
+      const students = await User.find(filter)
+        .select('name fullname email phone gender age skillLevel country state address assignedCourse profilePicture image graduate blocked contact isVerified')
+        .lean();
 
       if (!students || students.length === 0) {
         return res.status(200).json({ message: 'No students found', students: [] });
