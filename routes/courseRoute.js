@@ -2,6 +2,7 @@ const express = require('express');
 const courseController = require('../controllers/courseController.js');
 const authenticate = require('../middlewares/auth.js');
 const authorize = require('../middlewares/authorize.js');
+const { TUTOR_ROLES, TUTOR_ONLY } = require('../utils/roles.js');
 const { validateObjectId } = require('../middlewares/validateRequest.js');
 const { generalLimiter } = require('../middlewares/rateLimiter.js');
 
@@ -29,18 +30,18 @@ courseRouter.post("/enroll/:courseId", authenticate, authorize('student', 'clien
 courseRouter.get("/enrolled-courses/:userId", authenticate, validateObjectId('userId'), courseController.getEnrolledCourses);
 
 // Instructor/admin course management
-courseRouter.post("/add-course/:userId", authenticate, authorize('tutor', 'admin'), validateObjectId('userId'), courseController.addCourse);
-courseRouter.get("/admissions/:courseId", authenticate, authorize('tutor', 'admin'), validateObjectId('courseId'), courseController.getEnrolledStudents);
+courseRouter.post("/add-course/:userId", authenticate, authorize(...TUTOR_ONLY), validateObjectId('userId'), courseController.addCourse);
+courseRouter.get("/admissions/:courseId", authenticate, authorize(...TUTOR_ONLY), validateObjectId('courseId'), courseController.getEnrolledStudents);
 // Enrolling somebody else needs its own endpoint: /enroll deliberately ignores
 // any student id in the body so a student cannot enroll another account.
-courseRouter.post("/enroll-student/:courseId", authenticate, authorize('tutor', 'admin', 'team_member'), validateObjectId('courseId'), courseController.enrollStudentByInstructor);
-courseRouter.post("/assign/:courseId", authenticate, authorize('tutor', 'admin'), validateObjectId('courseId'), courseController.assignTutor);
-courseRouter.delete("/delete/:id", authenticate, authorize('tutor', 'admin'), validateObjectId('id'), courseController.deleteCourse);
-courseRouter.put("/edit/:id", authenticate, authorize('tutor', 'admin'), validateObjectId('id'), courseController.editCourse);
-courseRouter.get("/notify-live/:id", authenticate, authorize('tutor', 'admin'), validateObjectId('id'), courseController.notifyLive);
-courseRouter.post("/upload/:courseId", authenticate, authorize('tutor', 'admin'), validateObjectId('courseId'), courseController.videoUpload);
-courseRouter.get("/cloudinary/signed-url", authenticate, authorize('tutor', 'admin'), courseController.getSignedURL);
-courseRouter.put('/update-status/:courseId', authenticate, authorize('tutor', 'admin'), validateObjectId('courseId', 'id'), courseController.updateStatus);
+courseRouter.post("/enroll-student/:courseId", authenticate, authorize(...TUTOR_ROLES), validateObjectId('courseId'), courseController.enrollStudentByInstructor);
+courseRouter.post("/assign/:courseId", authenticate, authorize(...TUTOR_ONLY), validateObjectId('courseId'), courseController.assignTutor);
+courseRouter.delete("/delete/:id", authenticate, authorize(...TUTOR_ONLY), validateObjectId('id'), courseController.deleteCourse);
+courseRouter.put("/edit/:id", authenticate, authorize(...TUTOR_ONLY), validateObjectId('id'), courseController.editCourse);
+courseRouter.get("/notify-live/:id", authenticate, authorize(...TUTOR_ONLY), validateObjectId('id'), courseController.notifyLive);
+courseRouter.post("/upload/:courseId", authenticate, authorize(...TUTOR_ONLY), validateObjectId('courseId'), courseController.videoUpload);
+courseRouter.get("/cloudinary/signed-url", authenticate, authorize(...TUTOR_ONLY), courseController.getSignedURL);
+courseRouter.put('/update-status/:courseId', authenticate, authorize(...TUTOR_ONLY), validateObjectId('courseId', 'id'), courseController.updateStatus);
 
 // Admin-only operations
 courseRouter.get("/unapproved", authenticate, authorize('admin'), courseController.getUnaproved);
@@ -52,6 +53,6 @@ courseRouter.get('/renew/:courseId/:id', authenticate, authorize('admin'), valid
 // because it is their own course's revenue they are waiving; team_member is
 // admitted because the controller enforces the "Enroll students" privilege, so
 // neither a tutor nor a member can grant on a course they do not manage.
-courseRouter.post('/give-scholarship/:courseId', authenticate, authorize('tutor', 'admin', 'team_member'), validateObjectId('courseId'), courseController.giveScholarship);
+courseRouter.post('/give-scholarship/:courseId', authenticate, authorize(...TUTOR_ROLES), validateObjectId('courseId'), courseController.giveScholarship);
 
 module.exports = courseRouter;

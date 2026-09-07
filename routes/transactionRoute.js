@@ -3,6 +3,7 @@ const transactionRouter = express.Router();
 const transactionController = require('../controllers/transactionController.js');
 const authenticate = require('../middlewares/auth.js');
 const authorize = require('../middlewares/authorize.js');
+const { TUTOR_ROLES } = require('../utils/roles.js');
 const { validateObjectId } = require('../middlewares/validateRequest.js');
 const { paymentLimiter, walletLimiter, generalLimiter } = require('../middlewares/rateLimiter.js');
 
@@ -41,8 +42,8 @@ transactionRouter.post('/course-payment-plans/:planId/payments/wallet', authenti
 // controller still requires the owner's "View Payments" privilege before any
 // row is returned.
 const paymentRecordController = require('../controllers/paymentRecordController.js');
-transactionRouter.get('/payment-records', authenticate, authorize('tutor', 'admin', 'team_member'), generalLimiter, paymentRecordController.listPaymentRecords);
-transactionRouter.get('/payment-records/courses', authenticate, authorize('tutor', 'admin', 'team_member'), generalLimiter, paymentRecordController.listPaymentRecordCourses);
+transactionRouter.get('/payment-records', authenticate, authorize(...TUTOR_ROLES), generalLimiter, paymentRecordController.listPaymentRecords);
+transactionRouter.get('/payment-records/courses', authenticate, authorize(...TUTOR_ROLES), generalLimiter, paymentRecordController.listPaymentRecordCourses);
 // Admin-only: record an offline settlement of a student's outstanding balance.
 transactionRouter.post('/payment-records/settle-balance', authenticate, authorize('admin'), paymentLimiter, paymentRecordController.settleStudentBalance);
 

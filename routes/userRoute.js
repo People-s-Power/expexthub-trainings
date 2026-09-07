@@ -3,6 +3,7 @@ const userControllers = require('../controllers/userController.js');
 const userRouter = express.Router();
 const auth = require("../middlewares/auth.js");
 const authorize = require("../middlewares/authorize.js");
+const { TUTOR_ROLES, TUTOR_ONLY } = require("../utils/roles.js");
 const { validateObjectId } = require('../middlewares/validateRequest.js');
 
 
@@ -15,10 +16,10 @@ userRouter.get("/", (req, res) => {
 userRouter.get("/profile/:id", auth, validateObjectId('id'), userControllers.getProfile);
 userRouter.post("/premium", userControllers.updateTutorLevel);
 
-userRouter.get("/instructors", auth, authorize('tutor', 'admin'), userControllers.getInstructors);
+userRouter.get("/instructors", auth, authorize(...TUTOR_ONLY), userControllers.getInstructors);
 // Team members (impersonating a provider) also need the student directory to
 // enrol students on the provider's courses.
-userRouter.get("/students", auth, authorize('tutor', 'admin', 'team_member'), userControllers.getStudents);
+userRouter.get("/students", auth, authorize(...TUTOR_ROLES), userControllers.getStudents);
 userRouter.put("/updateProfile/:id", userControllers.upDateprofile);
 userRouter.put("/updateProfilePicture/:id", userControllers.updateProfilePhote);
 
@@ -32,15 +33,15 @@ userRouter.put("/mymentees", userControllers.getMyMentees);
 userRouter.put("/graduate", userControllers.getGraduates);
 userRouter.put("/mygraduate", userControllers.getMyGraduates);
 
-userRouter.put("/block/:userId", auth, authorize('tutor', 'admin'), validateObjectId('userId'), userControllers.block)
-userRouter.put("/graduate/:userId", auth, authorize('tutor', 'admin'), validateObjectId('userId'), userControllers.makeGraduate)
+userRouter.put("/block/:userId", auth, authorize(...TUTOR_ONLY), validateObjectId('userId'), userControllers.block)
+userRouter.put("/graduate/:userId", auth, authorize(...TUTOR_ONLY), validateObjectId('userId'), userControllers.makeGraduate)
 // Assigning a course category is self-service: any authenticated user may set
 // their own category (e.g. the signup step-3 picker, or the dashboard
 // interests modal). The controller verifies the caller may only modify their
 // own record, so a tutor cannot silently change another user's interests.
 userRouter.put("/assign/:userId", auth, validateObjectId('userId'), userControllers.addCourse)
 userRouter.put("/unassign/:userId", auth, validateObjectId('userId'), userControllers.unassignCourse)
-userRouter.put("/signature/:id", auth, authorize('tutor', 'admin'), validateObjectId('id'), userControllers.addSignature)
+userRouter.put("/signature/:id", auth, authorize(...TUTOR_ONLY), validateObjectId('id'), userControllers.addSignature)
 
 // Directory of every user category so a provider can add any category of user
 // as a team member.
