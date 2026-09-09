@@ -27,15 +27,16 @@ const {
     planOutstandingMinor,
     minimumPaymentMinor,
     nextPaymentNumber,
+    releaseStalePayments,
     toMinorUnits,
     toMajorUnits,
     FULL_PAYMENT_TYPES,
+    // How long a hosted checkout stays worth reusing before it is treated as
+    // abandoned. Shared with the student flow so the tutor re-opening the dialog
+    // gets the same link rather than stacking charges on one seat, and the reaper
+    // uses the same threshold everywhere.
+    CHECKOUT_REUSE_WINDOW_MS,
 } = require("../services/coursePaymentService.js");
-
-// How long a hosted checkout link stays worth reusing. Matches the student-facing
-// window so a tutor re-opening the dialog gets the same link rather than stacking
-// charges on one seat.
-const CHECKOUT_REUSE_WINDOW_MS = 30 * 60 * 1000;
 
 dayjs.extend(isBetween)
 dayjs.extend(isSameOrAfter)
@@ -860,7 +861,18 @@ const courseController = {
             // away. A stale client still sending paymentMethod: 'scholarship' now
             // falls through to the gateway rather than being honoured.
 
-            // A checkout the student already has open is real money in flight.
+            // Release any checkout the tutor (or student) opened and walked away
+            // from before testing the guard below. Without this a single abandoned
+            // Flutterwave page pins the plan's installment in `processing` forever,
+            // and the guard would then block re-enrollment for good — the exact
+            // lockout the student-facing initializePayment already prevents by
+            // calling the same reaper. It only touches attempts older than the reuse
+            // window, so a payment that might still be completing is left alone.
+            if (existingPlan) {
+                await releaseStalePayments(existingPlan);
+            }
+
+            // A checkout the student still has open is real money in flight.
             // Cancelling the plan under it would charge them twice for one seat,
             // so send the tutor to that balance instead of opening a new charge.
             if ((existingPlan?.installments || []).some(entry => entry.status === 'processing')) {
@@ -916,9 +928,20 @@ const courseController = {
                     }
 
                     const minimumMinor = minimumPaymentMinor(totalMinor, outstandingMinor);
-                    const amountMinor = Math.max(minimumMinor, Math.min(outstandingMinor, policy2.minimumFirstPaymentMinor));
+                    const fallbackMinor = Math.max(minimumMinor, Math.min(outstandingMinor, policy2.minimumFirstPaymentMinor));
 
-                    const { amountMinor: validatedMinor, error } = validatePaymentAmount(plan, toMajorUnits(amountMinor));
+                    // The tutor may name the first-payment amount, exactly as a
+                    // student does in the shared PaymentModal. When they don't send
+                    // one, fall back to the minimum first payment so an older client
+                    // (and the free/already-paid short-circuits above) still work.
+                    // Either way validatePaymentAmount is the single authority on the
+                    // bounds — the client figure is never trusted.
+                    const requestedAmount = Number(req.body?.amount);
+                    const amountToValidate = Number.isFinite(requestedAmount) && requestedAmount > 0
+                        ? requestedAmount
+                        : toMajorUnits(fallbackMinor);
+
+                    const { amountMinor: validatedMinor, error } = validatePaymentAmount(plan, amountToValidate);
                     if (error) {
                         return res.status(400).json({ message: error, plan: serializePlan(plan) });
                     }

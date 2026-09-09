@@ -32,6 +32,14 @@ const MIN_PART_PAYMENT_RATE = 0.2;
 // would cost more to collect than they are worth.
 const MAX_PAYMENTS_PER_PLAN = 24;
 
+// A hosted checkout left unpaid for longer than this is treated as abandoned, so
+// its slot is released and a fresh charge can start. Kept deliberately generous:
+// within the window the payment may still be completing (a bank transfer clears
+// out of band), so blocking is the correct, no-double-charge answer; only past it
+// do we assume the tutor or student walked away. Shared by every entry point that
+// opens a part payment so the definition of "abandoned" cannot drift between them.
+const CHECKOUT_REUSE_WINDOW_MS = 30 * 60 * 1000;
+
 // Transaction types that each, on their own, mean the course fee was settled in
 // full. Anything checking "has this student already paid?" must consider all of
 // them or it will let a paid student be charged twice.
@@ -245,6 +253,42 @@ function planInFlightMinor(plan) {
   return (plan?.installments || [])
     .filter(entry => entry.status === 'processing')
     .reduce((sum, entry) => sum + (Number(entry.amountMinor) || 0), 0);
+}
+
+/**
+ * Releases checkout slots that were opened but never completed.
+ *
+ * A `processing` installment holds part of the balance and blocks a fresh charge.
+ * That is correct while a payment might still be completing, but a checkout the
+ * payer walked away from would otherwise pin the slot forever — an abandoned
+ * tutor checkout was locking students out of re-enrollment (see the stale-checkout
+ * lockout fix). So any `processing` installment older than the reuse window is
+ * flipped to `failed`, along with its still-pending Transaction.
+ *
+ * The gateway charge itself is not cancelled — it cannot be — but the webhook and
+ * verify paths settle by payment number regardless of the local status, so a late
+ * completion still credits correctly. `failed` is excluded from the in-flight sum,
+ * the payments-per-plan budget, and the reuse/guard checks, so releasing here
+ * unblocks all of them at once.
+ *
+ * Returns true when the plan was modified (and saved).
+ */
+async function releaseStalePayments(plan) {
+  const stale = (plan?.installments || []).filter(entry => {
+    if (entry.status !== 'processing') return false;
+    const startedAt = entry.lastAttemptAt ? new Date(entry.lastAttemptAt).getTime() : 0;
+    return Date.now() - startedAt > CHECKOUT_REUSE_WINDOW_MS;
+  });
+  if (!stale.length) return false;
+
+  for (const entry of stale) {
+    entry.status = 'failed';
+    if (entry.txRef) {
+      await Transaction.updateOne({ txRef: entry.txRef, status: 'pending' }, { $set: { status: 'failed' } });
+    }
+  }
+  await plan.save();
+  return true;
 }
 
 /**
@@ -636,6 +680,7 @@ module.exports = {
   SETTLEMENT_WINDOW_DAYS,
   MIN_PART_PAYMENT_RATE,
   MAX_PAYMENTS_PER_PLAN,
+  CHECKOUT_REUSE_WINDOW_MS,
   toMinorUnits,
   toMajorUnits,
   addDays,
@@ -645,6 +690,7 @@ module.exports = {
   resolvePartPaymentPolicy,
   planOutstandingMinor,
   planInFlightMinor,
+  releaseStalePayments,
   nextPaymentNumber,
   minimumPaymentMinor,
   validatePaymentAmount,

@@ -14,13 +14,10 @@ const {
   validatePaymentAmount,
   openPlanForStudent,
   resolvePartPaymentPolicy,
+  releaseStalePayments,
   FULL_PAYMENT_TYPES,
   initializeGatewayCheckout,
 } = require('../services/coursePaymentService.js');
-
-// A checkout link older than this is assumed abandoned, so the slot is released
-// and a fresh charge can be started.
-const CHECKOUT_REUSE_WINDOW_MS = 30 * 60 * 1000;
 
 function authenticatedUserId(req) {
   return req.user?.id || req.user?._id;
@@ -51,31 +48,6 @@ async function validateStudent(userId) {
     throw Object.assign(new Error('Please verify your email before paying'), { status: 403, code: 'EMAIL_NOT_VERIFIED' });
   }
   return user;
-}
-
-/**
- * Releases checkout slots the student walked away from.
- *
- * The gateway charge itself is not cancelled — it cannot be — but the webhook
- * settles by payment number regardless of the local status, so a late completion
- * still credits correctly. Returns true when the plan was modified.
- */
-async function releaseStalePayments(plan) {
-  const stale = (plan.installments || []).filter(entry => {
-    if (entry.status !== 'processing') return false;
-    const startedAt = entry.lastAttemptAt ? new Date(entry.lastAttemptAt).getTime() : 0;
-    return Date.now() - startedAt > CHECKOUT_REUSE_WINDOW_MS;
-  });
-  if (!stale.length) return false;
-
-  for (const entry of stale) {
-    entry.status = 'failed';
-    if (entry.txRef) {
-      await Transaction.updateOne({ txRef: entry.txRef, status: 'pending' }, { $set: { status: 'failed' } });
-    }
-  }
-  await plan.save();
-  return true;
 }
 
 const paymentPlanController = {
