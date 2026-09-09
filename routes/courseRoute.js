@@ -35,6 +35,9 @@ courseRouter.get("/admissions/:courseId", authenticate, authorize(...TUTOR_ONLY)
 // Enrolling somebody else needs its own endpoint: /enroll deliberately ignores
 // any student id in the body so a student cannot enroll another account.
 courseRouter.post("/enroll-student/:courseId", authenticate, authorize(...TUTOR_ROLES), validateObjectId('courseId'), courseController.enrollStudentByInstructor);
+// Force-release a student's in-flight payment attempt so the tutor can start a
+// fresh one without waiting out the checkout reuse window.
+courseRouter.post("/enroll-student/:courseId/cancel-attempt", authenticate, authorize(...TUTOR_ROLES), validateObjectId('courseId'), courseController.cancelStudentPaymentAttempt);
 courseRouter.post("/assign/:courseId", authenticate, authorize(...TUTOR_ONLY), validateObjectId('courseId'), courseController.assignTutor);
 courseRouter.delete("/delete/:id", authenticate, authorize(...TUTOR_ONLY), validateObjectId('id'), courseController.deleteCourse);
 courseRouter.put("/edit/:id", authenticate, authorize(...TUTOR_ONLY), validateObjectId('id'), courseController.editCourse);

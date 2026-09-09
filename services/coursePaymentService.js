@@ -292,6 +292,33 @@ async function releaseStalePayments(plan) {
 }
 
 /**
+ * Force-releases every in-flight attempt on a plan, regardless of age.
+ *
+ * Unlike releaseStalePayments — which only reaps attempts past the reuse window
+ * because the payer might still be completing one — this acts on an explicit
+ * human "cancel this attempt" decision, so there is no waiting period. The
+ * settlement safety is identical: the gateway charge cannot be recalled, but the
+ * webhook and verify paths settle by payment number regardless of the local
+ * status, so a payment that lands after this still credits and enrolls correctly.
+ *
+ * Returns the number of attempts released (0 when there was nothing in flight, so
+ * the caller can treat "already clear" as success).
+ */
+async function releaseInFlightPayments(plan) {
+  const inFlight = (plan?.installments || []).filter(entry => entry.status === 'processing');
+  if (!inFlight.length) return 0;
+
+  for (const entry of inFlight) {
+    entry.status = 'failed';
+    if (entry.txRef) {
+      await Transaction.updateOne({ txRef: entry.txRef, status: 'pending' }, { $set: { status: 'failed' } });
+    }
+  }
+  await plan.save();
+  return inFlight.length;
+}
+
+/**
  * Validates a student-chosen payment amount against the plan.
  *
  * Returns { amountMinor } on success, or { error } with a message the client can
@@ -691,6 +718,7 @@ module.exports = {
   planOutstandingMinor,
   planInFlightMinor,
   releaseStalePayments,
+  releaseInFlightPayments,
   nextPaymentNumber,
   minimumPaymentMinor,
   validatePaymentAmount,

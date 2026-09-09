@@ -28,6 +28,7 @@ const {
     minimumPaymentMinor,
     nextPaymentNumber,
     releaseStalePayments,
+    releaseInFlightPayments,
     toMinorUnits,
     toMajorUnits,
     FULL_PAYMENT_TYPES,
@@ -1137,6 +1138,92 @@ const courseController = {
             }
             console.error('Instructor enrollment failed:', error);
             return res.status(500).json({ message: 'Unexpected error during enrollment' });
+        }
+    },
+
+    /**
+     * Force-releases a student's in-flight payment attempt on a course so the
+     * tutor can start a fresh one immediately.
+     *
+     * enrollStudentByInstructor blocks with PLAN_EXISTS while a checkout is still
+     * open, and releaseStalePayments only clears it automatically once the reuse
+     * window has passed — correct for a payment that might still be completing.
+     * But a tutor who cancelled the checkout and is sitting in the dialog is a
+     * clear, deliberate "I walked away" signal, so this lets them release the slot
+     * now rather than waiting out the window.
+     *
+     * No money can be lost: the gateway charge is never recalled, and the
+     * webhook/verify paths settle by reference regardless of local status, so a
+     * payment that lands after this still enrolls the student.
+     */
+    cancelStudentPaymentAttempt: async (req, res) => {
+        const courseId = req.params.courseId;
+        const callerId = req.user?.id || req.user?._id;
+        const studentId = req.body?.studentId || req.body?.id;
+
+        try {
+            if (!callerId) {
+                return res.status(401).json({ message: 'Authentication required' });
+            }
+            if (!mongoose.Types.ObjectId.isValid(String(studentId || ''))) {
+                return res.status(400).json({ message: 'Select the student whose payment you want to cancel' });
+            }
+
+            const [course, caller] = await Promise.all([
+                Course.findById(courseId),
+                User.findById(callerId),
+            ]);
+
+            if (!course) {
+                return res.status(404).json({ message: 'Course not found' });
+            }
+            // Same ownership + privilege gate as enrolling: you can only touch a
+            // payment on a course you own or manage, and a delegated team member
+            // needs the same "Enroll students" privilege.
+            if (!canManageCourse(course, caller)) {
+                return res.status(403).json({ message: 'You can only manage payments on courses you own or manage' });
+            }
+            if (!canPerformCourseAction(course, caller, 'Enroll students')) {
+                return res.status(403).json({ message: 'You do not have the permission to manage enrollments on this course' });
+            }
+
+            let released = 0;
+
+            // Release any in-flight part-payment attempt on the student's live plan.
+            const plan = await CoursePaymentPlan.findOne({
+                userId: studentId,
+                courseId: course._id,
+                status: { $in: ['pending', 'active', 'overdue'] },
+            });
+            if (plan) {
+                released += await releaseInFlightPayments(plan);
+            }
+
+            // Release any pending full-payment checkout (the full branch reuses an
+            // open one within the window, which would otherwise keep handing back
+            // the same stale link).
+            const fullPaymentResult = await Transaction.updateMany(
+                {
+                    userId: studentId,
+                    courseId: course._id,
+                    type: 'course_payment',
+                    status: 'pending',
+                },
+                { $set: { status: 'failed' } },
+            );
+            released += Number(fullPaymentResult?.modifiedCount || 0);
+
+            // Idempotent by design: nothing in flight is still success, so the
+            // tutor can retry immediately either way.
+            return res.status(200).json({
+                message: released > 0
+                    ? 'The pending payment attempt was cancelled. You can start a new one.'
+                    : 'There was no payment attempt to cancel. You can start a new one.',
+                released,
+            });
+        } catch (error) {
+            console.error('Cancel student payment attempt failed:', error);
+            return res.status(500).json({ message: 'Unable to cancel the payment attempt. Please try again.' });
         }
     },
 
