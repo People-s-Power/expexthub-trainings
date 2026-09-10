@@ -428,6 +428,12 @@ async function creditInstructor(transaction, amountMajor) {
   const netAmount = Number((amountMajor * (1 - PLATFORM_FEE_RATE)).toFixed(2));
   const creditRef = `course-credit-${transaction.txRef}`;
 
+  // The instructor's pre-credit balance, captured so the ledger row records the
+  // running balance after the credit — this is what makes the wallet ledger
+  // reconcilable line-by-line.
+  const instructor = await User.findById(course.instructorId).select('balance');
+  const balanceAfter = (Number(instructor?.balance) || 0) + netAmount;
+
   try {
     // The ledger row records the net amount actually credited, so the sum of an
     // instructor's credit transactions reconciles against their balance.
@@ -436,6 +442,8 @@ async function creditInstructor(transaction, amountMajor) {
       courseId: transaction.courseId,
       amount: netAmount,
       type: 'credit',
+      direction: 'credit',
+      balanceAfter,
       status: 'successful',
       txRef: creditRef,
       metadata: {

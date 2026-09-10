@@ -13,6 +13,7 @@ const {
   grantCourseAccess,
   creditInstructor,
   initializeGatewayCheckout,
+  CHECKOUT_REUSE_WINDOW_MS,
 } = require('../services/coursePaymentService.js');
 
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
@@ -20,6 +21,12 @@ const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
 
 const flwHeaders = { Authorization: `Bearer ${flutterwaveSecretKey}` };
 const GATEWAY_TIMEOUT_MS = 20000;
+
+// Wallet ledger policy. Amounts are stored in major units (naira), matching the
+// course-payment convention and what the wallet history renders.
+const WALLET_MIN_WITHDRAWAL = 500;
+const WALLET_MAX_WITHDRAWAL = 5000000;
+const WALLET_MAX_FUNDING = 5000000;
 
 /** Constant-time string comparison that tolerates unequal lengths. */
 function safeCompare(a, b) {
@@ -31,6 +38,178 @@ function safeCompare(a, b) {
     return false;
   }
   return crypto.timingSafeEqual(bufferA, bufferB);
+}
+
+/**
+ * Wallet access for team members is delegated: the member's privileges are stored
+ * on their OWN user document in teamMembers[] (authController's add-team flow
+ * pushes the same { ownerId, tutorId, memberRole, status, privileges } object onto
+ * both the owner's and the member's docs). The member keeps their own JWT while
+ * acting for the provider that added them, so the wallet controllers read the
+ * requester's stored user rather than the token claims.
+ *
+ * Admin and the wallet owner (tutor/provider) always pass. A team_member passes
+ * only when an accepted membership grants the privilege. Every other role manages
+ * their own wallet and is unaffected.
+ */
+function walletPrivilegeGranted(user, privilege) {
+  if (!user) return false;
+  if (user.role === 'admin') return true;
+  if (user.role !== 'team_member') return true; // tutor/provider/student/client self-service
+  return (user.teamMembers || []).some(
+    (entry) =>
+      entry?.status === 'accepted' &&
+      Array.isArray(entry?.privileges) &&
+      entry.privileges.some((p) => p?.value === privilege && p?.checked === true),
+  );
+}
+
+function canAccessWallet(user) {
+  return walletPrivilegeGranted(user, 'View Wallet');
+}
+
+function canWithdrawWallet(user) {
+  return walletPrivilegeGranted(user, 'Withdraw from Wallet');
+}
+
+function canFundWallet(user) {
+  return walletPrivilegeGranted(user, 'Fund Wallet');
+}
+
+/**
+ * Resolves the user whose wallet this request may act on, and loads that user.
+ *
+ * Self-service is the default: no target supplied (or a target matching the
+ * actor) acts on the caller's own wallet, and their own stored privileges are
+ * the gate. A delegated team member impersonating a provider (the sidebar flow
+ * swaps the dashboard's user id to the provider's while the member keeps their
+ * own JWT) may act on that provider's wallet, and only that provider's: the
+ * request must name the owner, the actor must hold an accepted membership with
+ * that owner, and the membership must grant `privilege`. Every other role
+ * acting on somebody else's id is rejected, so a body-supplied userId can
+ * never redirect a wallet operation onto a stranger.
+ *
+ * Returns { ok: true, user } with the target owner document, or { ok: false }.
+ */
+async function resolveWalletTarget(req, privilege, requestedTargetId) {
+  const actorId = String(req.user?.id || req.user?._id);
+  const targetId = requestedTargetId && String(requestedTargetId) !== actorId
+    ? String(requestedTargetId)
+    : actorId;
+
+  if (targetId === actorId) {
+    const user = await User.findById(actorId);
+    return user ? { ok: true, user } : { ok: false };
+  }
+
+  const actor = await User.findById(actorId).select('role teamMembers');
+  if (!actor || actor.role !== 'team_member') return { ok: false };
+
+  const membership = (actor.teamMembers || []).find(
+    (entry) => String(entry.ownerId) === targetId && entry.status === 'accepted',
+  );
+  const granted = membership && Array.isArray(membership.privileges)
+    && membership.privileges.some((p) => p?.value === privilege && p?.checked === true);
+  if (!granted) return { ok: false };
+
+  const owner = await User.findById(targetId);
+  return owner ? { ok: true, user: owner } : { ok: false };
+}
+
+/**
+ * Resolves an ambiguous transfer failure (timeout/5xx where the gateway may
+ * still have accepted the transfer) without paying out twice.
+ *
+ * The transfer is looked up by reference: confirmed-successful marks the
+ * withdrawal complete; confirmed-failed (or no transfer row, i.e. the request
+ * was rejected before a transfer existed) refunds the hold; anything still
+ * pending keeps the hold so reconciliation can finish the job.
+ *
+ * Returns 'successful' | 'refunded' | 'pending'.
+ */
+async function settleAmbiguousTransfer(userId, transaction, amount, reference) {
+  try {
+    const statusResponse = await axios.get(`${flutterwaveBaseURL}transfers`, {
+      params: { reference },
+      headers: flwHeaders,
+      timeout: GATEWAY_TIMEOUT_MS,
+    });
+    const rows = statusResponse.data?.data;
+    const transfer = Array.isArray(rows) ? rows.find((row) => row?.reference === reference) : null;
+
+    if (transfer?.status === 'SUCCESSFUL') {
+      await Transaction.updateOne({ _id: transaction._id }, {
+        $set: { status: 'successful', gatewayTransactionId: transfer.id ? String(transfer.id) : undefined },
+      });
+      return 'successful';
+    }
+    if (transfer && ['FAILED', 'FAILED_FUNDS', 'FAILED_DISBURSE'].includes(transfer.status)) {
+      await User.findByIdAndUpdate(userId, { $inc: { balance: amount } });
+      await Transaction.updateOne({ _id: transaction._id }, { $set: { status: 'failed' } });
+      return 'refunded';
+    }
+    if (!transfer) {
+      // No row exists for this reference: the original call never created a
+      // transfer, so releasing the hold cannot double-pay.
+      await User.findByIdAndUpdate(userId, { $inc: { balance: amount } });
+      await Transaction.updateOne({ _id: transaction._id }, { $set: { status: 'failed' } });
+      return 'refunded';
+    }
+    return 'pending';
+  } catch (error) {
+    console.error('Withdrawal status check failed:', error.response?.data || error.message);
+    return 'pending';
+  }
+}
+
+/**
+ * Finalizes a wallet-funding payment: flips the still-pending Transaction to
+ * successful and credits the wallet once.
+ *
+ * Idempotency comes from the conditional status update — only the first caller
+ * (webhook or redirect verification) whose filter still matches performs the
+ * write, and only that winner increments the balance. Replays no-op.
+ *
+ * The amount/currency cross-check against Flutterwave happens in the caller
+ * (verifyWalletFunding / the webhook branch) before this is invoked.
+ */
+async function finalizeWalletFunding(txRef, gatewayPayment) {
+  const transaction = await Transaction.findOne({ txRef });
+  if (!transaction || transaction.type !== 'wallet_funding') {
+    console.error('Wallet funding: transaction not found for', txRef);
+    return false;
+  }
+
+  const updated = await Transaction.findOneAndUpdate(
+    { _id: transaction._id, status: 'pending' },
+    {
+      $set: {
+        status: 'successful',
+        paidAt: transaction.paidAt || new Date(),
+        ...(gatewayPayment?.id ? { gatewayTransactionId: String(gatewayPayment.id) } : {}),
+      },
+    },
+    { new: true },
+  );
+  if (!updated) return true; // Already finalized (webhook/redirect replay).
+
+  const user = await User.findById(updated.userId);
+  if (!user) {
+    console.error('Wallet funding: user not found for', String(updated.userId), 'txRef', txRef);
+    return true;
+  }
+
+  const preCredit = Number(user.balance) || 0;
+  const credited = await User.findByIdAndUpdate(
+    updated.userId,
+    { $inc: { balance: Number(updated.amount) } },
+    { new: true },
+  );
+  // Record the running balance so the ledger reconciles line-by-line.
+  await Transaction.updateOne({ _id: updated._id }, { $set: { balanceAfter: preCredit + Number(updated.amount) } });
+
+  console.log('Wallet funded:', txRef, 'amount', updated.amount, 'balanceAfter', credited?.balance);
+  return true;
 }
 
 /**
@@ -271,6 +450,41 @@ const transactionController = {
         }
       }
 
+      // Wallet funding uses its own txRef prefix so the webhook can route it to
+      // the wallet finalizer without touching the course-payment path. Same dedupe
+      // (PaymentWebhookEvent above), same amount/currency cross-check, and the
+      // credit itself is guarded by the conditional status update.
+      if (String(payment.tx_ref).startsWith('wallet-fund-')) {
+        const walletTransaction = await Transaction.findOne({
+          txRef: payment.tx_ref,
+          type: 'wallet_funding',
+        });
+        if (walletTransaction) {
+          const isWalletConfirmed = payment.status === 'successful'
+            && Number(payment.amount) >= Number(walletTransaction.amount)
+            && payment.currency === walletTransaction.currency;
+          if (isWalletConfirmed) {
+            await finalizeWalletFunding(walletTransaction.txRef, payment);
+          } else if (payment.status === 'failed' || payment.status === 'cancelled') {
+            await Transaction.updateOne({ _id: walletTransaction._id, status: 'pending' }, { $set: { status: 'failed' } });
+          } else {
+            console.error('Webhook wallet funding did not match our record:', {
+              txRef: payment.tx_ref,
+              gatewayAmount: payment.amount,
+              expectedAmount: walletTransaction.amount,
+              gatewayCurrency: payment.currency,
+              expectedCurrency: walletTransaction.currency,
+            });
+          }
+        }
+        if (event) {
+          event.status = 'processed';
+          event.processedAt = new Date();
+          await event.save();
+        }
+        return res.sendStatus(200);
+      }
+
       const transaction = await Transaction.findOne({
         txRef: payment.tx_ref,
         type: { $in: ['course_payment', 'course_installment'] },
@@ -354,6 +568,8 @@ const transactionController = {
         courseId,
         amount,
         type: 'course_payment_wallet',
+        direction: 'debit',
+        balanceAfter: chargedUser.balance,
         status: 'successful',
         currency: 'NGN',
         txRef,
@@ -383,19 +599,165 @@ const transactionController = {
       return res.status(500).json({ message: 'Wallet payment failed. Please try again.' });
     }
   },
+  fundWallet: async (req, res) => {
+    let transaction;
+    try {
+      const amount = parseAmount(req.body.amount);
+
+      if (amount === null) {
+        return res.status(400).json({ message: 'Enter a valid amount' });
+      }
+      if (amount > WALLET_MAX_FUNDING) {
+        return res.status(400).json({ message: `Amount cannot exceed ${WALLET_MAX_FUNDING}` });
+      }
+
+      // The wallet being funded. Self-service by default; a delegated team
+      // member impersonating a provider may fund that provider's wallet when
+      // the membership grants "Fund Wallet".
+      const { ok, user } = await resolveWalletTarget(req, 'Fund Wallet', req.body.userId);
+      if (!ok || !canFundWallet(user)) {
+        return res.status(403).json({ message: 'You do not have permission to fund the wallet' });
+      }
+      const userId = user._id;
+
+      // Reuse a still-open checkout so repeated clicks or a tab return do not
+      // stack several pending charges for the same amount.
+      const openTransaction = await Transaction.findOne({
+        userId,
+        type: 'wallet_funding',
+        status: 'pending',
+        amount,
+        'metadata.checkoutLink': { $exists: true },
+        date: { $gte: new Date(Date.now() - CHECKOUT_REUSE_WINDOW_MS) },
+      }).sort({ date: -1 });
+      if (openTransaction?.metadata?.checkoutLink) {
+        return res.status(200).json({ link: openTransaction.metadata.checkoutLink, txRef: openTransaction.txRef, reused: true });
+      }
+
+      const txRef = `wallet-fund-${userId}-${crypto.randomUUID()}`;
+      transaction = await Transaction.create({
+        userId,
+        amount,
+        type: 'wallet_funding',
+        direction: 'credit',
+        status: 'pending',
+        currency: 'NGN',
+        txRef,
+        metadata: { purpose: 'wallet_funding', redirect_url: req.body.redirect_url },
+      });
+
+      const link = await initializeGatewayCheckout({
+        txRef,
+        amount,
+        customer: { email: user.email, name: user.fullname, phone: user.phone },
+        description: 'Wallet funding',
+        meta: { userId: String(userId), purpose: 'wallet_funding' },
+        redirectUrl: req.body.redirect_url,
+      });
+
+      await Transaction.updateOne({ _id: transaction._id }, { $set: { 'metadata.checkoutLink': link } });
+      return res.status(201).json({ link, txRef });
+    } catch (error) {
+      if (transaction) await Transaction.updateOne({ _id: transaction._id, status: 'pending' }, { $set: { status: 'failed' } });
+      console.error('Wallet funding initialization failed:', error.response?.data || error.message);
+      return res.status(502).json({ message: 'Unable to start payment. Please try again.' });
+    }
+  },
+
+  verifyWalletFunding: async (req, res) => {
+    try {
+      const { txRef } = req.params;
+      if (!txRef || typeof txRef !== 'string' || txRef.length > 200 || !txRef.startsWith('wallet-fund-')) {
+        return res.status(400).json({ message: 'Invalid payment reference' });
+      }
+
+      const transaction = await Transaction.findOne({ txRef });
+      if (!transaction || transaction.type !== 'wallet_funding') {
+        return res.status(404).json({ message: 'Payment not found' });
+      }
+
+      if (transaction.status === 'failed') {
+        return res.status(400).json({ message: 'This payment did not go through. Please start a new payment.' });
+      }
+      if (transaction.status === 'successful') {
+        const current = await User.findById(transaction.userId);
+        return res.json({ message: 'Payment confirmed', balance: current?.balance ?? null });
+      }
+
+      const gatewayId = req.query.transaction_id || req.query.id || transaction.gatewayTransactionId;
+      let payment;
+      let gatewayOk = false;
+      try {
+        const response = gatewayId
+          ? await axios.get(`${flutterwaveBaseURL}transactions/${encodeURIComponent(gatewayId)}/verify`, {
+              headers: flwHeaders,
+              timeout: GATEWAY_TIMEOUT_MS,
+            })
+          : await axios.get(`${flutterwaveBaseURL}transactions/verify_by_reference`, {
+              params: { tx_ref: transaction.txRef },
+              headers: flwHeaders,
+              timeout: GATEWAY_TIMEOUT_MS,
+            });
+        payment = response.data?.data;
+        gatewayOk = response.data?.status === 'success';
+      } catch (lookupError) {
+        if (lookupError.response?.status === 404) {
+          return res.status(409).json({ message: 'Payment is still pending confirmation', code: 'PENDING' });
+        }
+        throw lookupError;
+      }
+
+      const isConfirmed = gatewayOk
+        && payment?.status === 'successful'
+        && payment?.tx_ref === transaction.txRef
+        && Number(payment.amount) >= Number(transaction.amount)
+        && payment.currency === transaction.currency;
+
+      if (!isConfirmed) {
+        if (payment?.status === 'failed' || payment?.status === 'cancelled') {
+          await Transaction.updateOne({ _id: transaction._id, status: 'pending' }, { $set: { status: 'failed' } });
+          return res.status(400).json({ message: 'This payment did not go through. Please start a new payment.' });
+        }
+        return res.status(409).json({ message: 'Payment is still pending confirmation', code: 'PENDING' });
+      }
+
+      await finalizeWalletFunding(transaction.txRef, payment);
+      const user = await User.findById(transaction.userId);
+      return res.json({ message: 'Payment confirmed', balance: user?.balance ?? null });
+    } catch (error) {
+      console.error('Wallet funding verification failed:', error.response?.data || error.message);
+      return res.status(502).json({ message: 'Payment confirmation is temporarily unavailable. Please try again.' });
+    }
+  },
+
   getBalance: async (req, res) => {
     const { userId } = req.params;
     const authenticatedUserId = req.user?.id || req.user?._id;
 
     try {
-      // Users can only view their own balance unless they're admin
-      if (String(authenticatedUserId) !== String(userId) && req.user?.role !== 'admin') {
-        return res.status(403).json({ message: 'You can only view your own balance' });
+      // Users can only view their own wallet unless they're an admin (admin
+      // keeps the historical any-wallet view). A delegated team member acting
+      // for the provider that added them may view that provider's wallet, but
+      // only when the membership grants "View Wallet".
+      const isAdmin = req.user?.role === 'admin';
+      if (String(authenticatedUserId) !== String(userId) && !isAdmin) {
+        const delegated = await resolveWalletTarget(req, 'View Wallet', userId);
+        if (!delegated.ok) {
+          return res.status(403).json({ message: 'You can only view your own wallet' });
+        }
       }
 
-      const user = await User.findById(userId);
+      const [user, requester] = await Promise.all([
+        User.findById(userId),
+        User.findById(authenticatedUserId).select('role teamMembers'),
+      ]);
       if (!user) {
         return res.status(404).json({ message: 'User not found' });
+      }
+
+      // Team members must hold the "View Wallet" privilege to see their wallet.
+      if (!canAccessWallet(requester)) {
+        return res.status(403).json({ message: 'You do not have permission to view the wallet' });
       }
 
       const transactions = await Transaction.find({ userId: user._id }).sort({ date: -1 }).limit(100);
@@ -405,7 +767,8 @@ const transactionController = {
         transactions,
         user: {
           bankCode: user.bankCode,
-          accountNumber: user.accountNumber
+          accountNumber: user.accountNumber,
+          accountName: user.accountName
         }
       });
     } catch (error) {
@@ -523,10 +886,12 @@ const transactionController = {
     }
   },
   createRecipient: async (req, res) => {
-    // Bank details are always written to the authenticated user's own account.
-    // Trusting a body-supplied userId here would let anyone repoint another
-    // user's payout account at their own bank account.
-    const userId = req.user?.id || req.user?._id;
+    // Bank details are written to the wallet owner this request acts on.
+    // Self-service by default. A delegated team member impersonating a provider
+    // may save the provider's payout account, but only when the request names
+    // that provider and the membership grants "Withdraw from Wallet" — a
+    // body-supplied userId can never repoint someone else's payout account at
+    // the actor's own bank details.
     const { bankCode, accountNumber } = req.body;
 
     try {
@@ -537,9 +902,9 @@ const transactionController = {
         return res.status(400).json({ message: 'Account number must be 10 digits' });
       }
 
-      const user = await User.findById(userId);
-      if (!user) {
-        return res.status(404).json({ message: 'User not found' });
+      const { ok, user } = await resolveWalletTarget(req, 'Withdraw from Wallet', req.body.userId);
+      if (!ok || !canWithdrawWallet(user)) {
+        return res.status(403).json({ message: 'You do not have permission to manage the payout account' });
       }
 
       // Confirm the account actually exists and belongs to a real name before
@@ -561,6 +926,7 @@ const transactionController = {
 
       user.bankCode = String(bankCode);
       user.accountNumber = String(accountNumber);
+      user.accountName = resolvedName;
       await user.save();
 
       return res.status(200).json({ message: 'Payout account saved', accountName: resolvedName });
@@ -571,21 +937,31 @@ const transactionController = {
   },
 
   withdraw: async (req, res) => {
-    const userId = req.user?.id || req.user?._id;
     const amount = parseAmount(req.body.amount);
 
     try {
       if (amount === null) {
         return res.status(400).json({ message: 'Invalid withdrawal amount' });
       }
+      if (amount < WALLET_MIN_WITHDRAWAL) {
+        return res.status(400).json({ message: `Minimum withdrawal is ${WALLET_MIN_WITHDRAWAL}` });
+      }
+      if (amount > WALLET_MAX_WITHDRAWAL) {
+        return res.status(400).json({ message: `Maximum withdrawal is ${WALLET_MAX_WITHDRAWAL}` });
+      }
 
-      const user = await User.findById(userId);
-      if (!user) {
-        return res.status(404).json({ message: 'User not found' });
+      // The wallet the money leaves. Self-service by default; a delegated team
+      // member impersonating a provider may withdraw from that provider's
+      // wallet when the membership grants "Withdraw from Wallet".
+      const { ok, user } = await resolveWalletTarget(req, 'Withdraw from Wallet', req.body.userId);
+      if (!ok || !canWithdrawWallet(user)) {
+        return res.status(403).json({ message: 'You do not have permission to withdraw from the wallet' });
       }
       if (!user.bankCode || !user.accountNumber) {
         return res.status(400).json({ message: 'Please add your payout bank account first' });
       }
+
+      const userId = user._id;
 
       // Debit first, conditionally on sufficient funds, so two concurrent
       // withdrawal requests cannot both pass a balance check and overdraw.
@@ -598,14 +974,17 @@ const transactionController = {
         return res.status(400).json({ message: 'Insufficient balance' });
       }
 
-      const reference = `withdraw-${userId}-${crypto.randomUUID()}`;
+      const reference = `wd-${crypto.randomUUID()}`;
       const transaction = await Transaction.create({
         userId: user._id,
         amount,
         type: 'debit',
+        direction: 'debit',
+        balanceAfter: debited.balance,
         status: 'pending',
         txRef: reference,
-        metadata: { purpose: 'withdrawal' },
+        reference,
+        metadata: { purpose: 'withdrawal', accountName: user.accountName || null, bankCode: user.bankCode, accountNumber: user.accountNumber },
       });
 
       try {
@@ -627,11 +1006,21 @@ const transactionController = {
         });
         return res.status(200).json({ message: 'Withdrawal successful' });
       } catch (transferError) {
-        // Refund the hold so a failed transfer never silently eats the balance.
-        await User.findByIdAndUpdate(userId, { $inc: { balance: amount } });
-        await Transaction.updateOne({ _id: transaction._id }, { $set: { status: 'failed' } });
+        // A timeout or 5xx does not prove the transfer failed — the gateway may
+        // have accepted it and lost the response on the way back, in which case
+        // refunding the hold would pay the amount out twice. Resolve the
+        // transfer by reference before releasing the funds.
+        const outcome = await settleAmbiguousTransfer(userId, transaction, amount, reference);
         console.error('Withdrawal transfer failed:', transferError.response?.data || transferError.message);
-        return res.status(502).json({ message: 'Withdrawal could not be completed. Your balance was not affected.' });
+        if (outcome === 'successful') {
+          return res.status(200).json({ message: 'Withdrawal successful' });
+        }
+        if (outcome === 'refunded') {
+          return res.status(502).json({ message: 'Withdrawal could not be completed. Your balance was not affected.' });
+        }
+        // Still settling at the gateway: keep the hold and let reconciliation
+        // finish it rather than risking a double payout.
+        return res.status(202).json({ message: 'Your withdrawal is being processed. It will reflect shortly.' });
       }
     } catch (error) {
       console.error('Error during withdrawal:', error.response?.data || error.message);
@@ -661,6 +1050,8 @@ const transactionController = {
         userId: user._id,
         amount,
         type: 'credit',
+        direction: 'credit',
+        balanceAfter: user.balance,
         status: 'successful',
         txRef: `admin-credit-${userId}-${crypto.randomUUID()}`,
         metadata: { creditedBy: String(req.user?.id || req.user?._id), purpose: 'manual_credit' },
@@ -694,6 +1085,8 @@ const transactionController = {
         userId: user._id,
         amount,
         type: 'debit',
+        direction: 'debit',
+        balanceAfter: user.balance,
         status: 'successful',
         txRef: `wallet-debit-${userId}-${crypto.randomUUID()}`,
       });

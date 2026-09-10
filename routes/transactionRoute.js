@@ -23,6 +23,13 @@ transactionRouter.post('/create-recipient', authenticate, walletLimiter, transac
 transactionRouter.post('/withdraw', authenticate, walletLimiter, transactionController.withdraw);
 transactionRouter.post('/pay-with', authenticate, walletLimiter, transactionController.payWith);
 
+// Wallet funding: starts a gateway checkout that credits the wallet on success.
+// `/initialize-payment` is the alias the deployed frontend already calls — both
+// paths resolve to the same controller so the existing contract keeps working.
+transactionRouter.post('/fund-wallet', authenticate, walletLimiter, transactionController.fundWallet);
+transactionRouter.post('/initialize-payment', authenticate, walletLimiter, transactionController.fundWallet);
+transactionRouter.get('/verify-wallet-funding/:txRef', transactionController.verifyWalletFunding);
+
 // Course payment endpoints (student/client only)
 transactionRouter.post('/initialize-course-payment', authenticate, authorize('student', 'client'), paymentLimiter, validateObjectId('courseId'), transactionController.initializeCoursePayment);
 transactionRouter.post('/pay-course-with-wallet', authenticate, authorize('student', 'client'), walletLimiter, validateObjectId('courseId'), transactionController.payCourseWithWallet);

@@ -67,6 +67,9 @@ const userSchema = new mongoose.Schema({
     type: String
   }],
   accountNumber: String,
+  // Name the bank reports for `accountNumber`, captured when the payout account is
+  // saved. Stored so a withdrawal can show the destination without a re-resolve.
+  accountName: String,
   assessmentAnswers: {
     type: [String], // Array to store user's assessment answers
   },

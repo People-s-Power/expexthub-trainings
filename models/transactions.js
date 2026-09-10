@@ -9,6 +9,18 @@ const transactionSchema = new mongoose.Schema({
   installmentNumber: { type: Number, required: false, min: 1, max: 100 },
   amount: Number,
   type: String,
+  // Which way the money moved, as a plain ledger fact independent of the free-form
+  // `type` string. Deliberately NOT `required`: rows written before this field
+  // existed (course payments, admin credits, …) have no direction and must still
+  // load. New wallet ledger rows always set it explicitly.
+  direction: { type: String, enum: ['credit', 'debit'], required: false, default: null, index: true },
+  // The wallet balance the user held after this row was applied, so the ledger
+  // can be reconciled line-by-line without replaying every earlier transaction.
+  // Null on course payments to instructors/students, which do not touch the wallet.
+  balanceAfter: { type: Number, required: false },
+  // External leg of an operation (e.g. the Flutterwave transfer reference echoed
+  // back by the bank). Kept separate from `txRef`, which is our own unique key.
+  reference: { type: String, required: false, index: true },
   soldBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: false },
   date: { type: Date, default: Date.now },
   paidAt: { type: Date },

@@ -286,6 +286,11 @@ const paymentPlanController = {
           amount,
           txRef,
           type: 'course_installment_wallet',
+          // Ledger facts, matching payCourseWithWallet: this row is a wallet
+          // debit whose running balance is the post-debit balance captured by
+          // the atomic debit above.
+          direction: 'debit',
+          balanceAfter: user.balance,
           status: 'successful',
           currency: plan.currency,
           paidAt: new Date(),
