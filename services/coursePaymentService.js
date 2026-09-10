@@ -366,6 +366,15 @@ function validatePaymentAmount(plan, requestedAmount) {
  * push two enrollment rows. The conditional update makes the winner decidable
  * by the database: only the request whose filter still matches performs the
  * write, and it reports whether it was the one that did.
+ *
+ * The guard is keyed on the `enrollments` row — the thing this function
+ * actually creates — not on `enrolledStudents` membership. Keying it on
+ * `enrolledStudents` left two gaps: a student already in `enrolledStudents` but
+ * missing from `enrollments` (drift from an older code path) could never be
+ * repaired, and an `$ne`/`$addToSet` against an ObjectId misfired when the
+ * stored ids were plain strings. Matching `enrollments.user` against both id
+ * forms closes both — it still writes at most one row, and it now backfills a
+ * missing enrollment row for an already-listed student.
  */
 async function grantCourseAccess({ userId, courseId, plan, session }) {
   const options = session ? { session } : {};
@@ -377,7 +386,7 @@ async function grantCourseAccess({ userId, courseId, plan, session }) {
 
   const enrollmentStatus = plan ? 'payment_plan_active' : 'active';
   const result = await Course.updateOne(
-    { _id: course._id, enrolledStudents: { $ne: user._id } },
+    { _id: course._id, 'enrollments.user': { $nin: [user._id, String(user._id)] } },
     {
       $addToSet: { enrolledStudents: user._id },
       $push: {
@@ -392,8 +401,8 @@ async function grantCourseAccess({ userId, courseId, plan, session }) {
   );
 
   if (result.modifiedCount === 0) {
-    // Already enrolled — another concurrent finalizer won the race, or this is
-    // a replayed webhook. Nothing further to do.
+    // Already has an enrollment row — another concurrent finalizer won the race,
+    // or this is a replayed webhook. Nothing further to do.
     return false;
   }
 

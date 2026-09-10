@@ -20,6 +20,8 @@ const {
   handleTransferEvent,
   TRANSFER_FAILURES,
 } = require('../services/withdrawalService.js');
+const { finalizeWalletFunding } = require('../services/walletFundingService.js');
+const { verifyCharge, isChargeConfirmed } = require('../services/flutterwaveGateway.js');
 
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
 const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
@@ -125,55 +127,9 @@ async function resolveWalletTarget(req, privilege, requestedTargetId) {
 // and the reconciliation sweep) lives in services/withdrawalService.js so the
 // cron can reuse it without importing this HTTP controller.
 
-/**
- * Finalizes a wallet-funding payment: flips the still-pending Transaction to
- * successful and credits the wallet once.
- *
- * Idempotency comes from the conditional status update — only the first caller
- * (webhook or redirect verification) whose filter still matches performs the
- * write, and only that winner increments the balance. Replays no-op.
- *
- * The amount/currency cross-check against Flutterwave happens in the caller
- * (verifyWalletFunding / the webhook branch) before this is invoked.
- */
-async function finalizeWalletFunding(txRef, gatewayPayment) {
-  const transaction = await Transaction.findOne({ txRef });
-  if (!transaction || transaction.type !== 'wallet_funding') {
-    console.error('Wallet funding: transaction not found for', txRef);
-    return false;
-  }
-
-  const updated = await Transaction.findOneAndUpdate(
-    { _id: transaction._id, status: 'pending' },
-    {
-      $set: {
-        status: 'successful',
-        paidAt: transaction.paidAt || new Date(),
-        ...(gatewayPayment?.id ? { gatewayTransactionId: String(gatewayPayment.id) } : {}),
-      },
-    },
-    { new: true },
-  );
-  if (!updated) return true; // Already finalized (webhook/redirect replay).
-
-  const user = await User.findById(updated.userId);
-  if (!user) {
-    console.error('Wallet funding: user not found for', String(updated.userId), 'txRef', txRef);
-    return true;
-  }
-
-  const preCredit = Number(user.balance) || 0;
-  const credited = await User.findByIdAndUpdate(
-    updated.userId,
-    { $inc: { balance: Number(updated.amount) } },
-    { new: true },
-  );
-  // Record the running balance so the ledger reconciles line-by-line.
-  await Transaction.updateOne({ _id: updated._id }, { $set: { balanceAfter: preCredit + Number(updated.amount) } });
-
-  console.log('Wallet funded:', txRef, 'amount', updated.amount, 'balanceAfter', credited?.balance);
-  return true;
-}
+// Wallet-funding settlement (finalizeWalletFunding) lives in
+// services/walletFundingService.js for the same reason — the webhook branch, the
+// redirect verifier below, and the payment reconciliation sweep all share it.
 
 /**
  * Shared gate for "may this user start paying for this course right now?".
@@ -315,37 +271,22 @@ const transactionController = {
         // dead-end just because a query parameter was named differently.
         const gatewayId = req.query.transaction_id || req.query.id || transaction.gatewayTransactionId;
 
-        let payment;
-        let gatewayOk = false;
-        try {
-          const response = gatewayId
-            ? await axios.get(`${flutterwaveBaseURL}transactions/${encodeURIComponent(gatewayId)}/verify`, {
-                headers: flwHeaders,
-                timeout: GATEWAY_TIMEOUT_MS,
-              })
-            : await axios.get(`${flutterwaveBaseURL}transactions/verify_by_reference`, {
-                params: { tx_ref: transaction.txRef },
-                headers: flwHeaders,
-                timeout: GATEWAY_TIMEOUT_MS,
-              });
-          payment = response.data?.data;
-          gatewayOk = response.data?.status === 'success';
-        } catch (lookupError) {
-          // 404 means Flutterwave has no record of this charge yet: genuinely
-          // pending rather than an outage, so let the client keep polling.
-          if (lookupError.response?.status === 404) {
-            return res.status(409).json({ message: 'Payment is still pending confirmation', code: 'PENDING' });
-          }
-          throw lookupError;
+        // Verify against the gateway through the shared helper (see
+        // services/flutterwaveGateway.js) so the redirect path, the webhook, and
+        // the reconciliation sweep all confirm a charge identically.
+        const { ok: gatewayOk, payment, notFound } = await verifyCharge({
+          gatewayTransactionId: gatewayId,
+          txRef: transaction.txRef,
+        });
+        // 404 means Flutterwave has no record of this charge yet: genuinely
+        // pending rather than an outage, so let the client keep polling.
+        if (notFound) {
+          return res.status(409).json({ message: 'Payment is still pending confirmation', code: 'PENDING' });
         }
 
         // Every field is re-checked against our own record: a matching reference is
         // not enough, the amount and currency must also be what we charged.
-        const isConfirmed = gatewayOk
-          && payment?.status === 'successful'
-          && payment?.tx_ref === transaction.txRef
-          && Number(payment.amount) >= Number(transaction.amount)
-          && payment.currency === transaction.currency;
+        const isConfirmed = gatewayOk && isChargeConfirmed(payment, transaction);
 
         if (!isConfirmed) {
           if (payment?.status === 'failed' || payment?.status === 'cancelled') {
@@ -666,33 +607,15 @@ const transactionController = {
       }
 
       const gatewayId = req.query.transaction_id || req.query.id || transaction.gatewayTransactionId;
-      let payment;
-      let gatewayOk = false;
-      try {
-        const response = gatewayId
-          ? await axios.get(`${flutterwaveBaseURL}transactions/${encodeURIComponent(gatewayId)}/verify`, {
-              headers: flwHeaders,
-              timeout: GATEWAY_TIMEOUT_MS,
-            })
-          : await axios.get(`${flutterwaveBaseURL}transactions/verify_by_reference`, {
-              params: { tx_ref: transaction.txRef },
-              headers: flwHeaders,
-              timeout: GATEWAY_TIMEOUT_MS,
-            });
-        payment = response.data?.data;
-        gatewayOk = response.data?.status === 'success';
-      } catch (lookupError) {
-        if (lookupError.response?.status === 404) {
-          return res.status(409).json({ message: 'Payment is still pending confirmation', code: 'PENDING' });
-        }
-        throw lookupError;
+      const { ok: gatewayOk, payment, notFound } = await verifyCharge({
+        gatewayTransactionId: gatewayId,
+        txRef: transaction.txRef,
+      });
+      if (notFound) {
+        return res.status(409).json({ message: 'Payment is still pending confirmation', code: 'PENDING' });
       }
 
-      const isConfirmed = gatewayOk
-        && payment?.status === 'successful'
-        && payment?.tx_ref === transaction.txRef
-        && Number(payment.amount) >= Number(transaction.amount)
-        && payment.currency === transaction.currency;
+      const isConfirmed = gatewayOk && isChargeConfirmed(payment, transaction);
 
       if (!isConfirmed) {
         if (payment?.status === 'failed' || payment?.status === 'cancelled') {

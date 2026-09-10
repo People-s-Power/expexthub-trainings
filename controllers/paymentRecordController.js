@@ -88,11 +88,16 @@ function courseScopeFor(caller, courseId) {
   const scope = {};
   if (courseId) scope._id = new mongoose.Types.ObjectId(String(courseId));
   if (caller.role === 'admin') return scope;
+  // instructorId/assignedTutors are typed ObjectId, but some legacy course
+  // documents stored them as plain strings. Course.aggregate does NOT cast
+  // $match values the way Course.find does, so matching only the ObjectId form
+  // silently returns zero rows for those string-stored courses — which is
+  // exactly how a tutor's whole payments view goes blank. Match both forms.
   return {
     ...scope,
     $or: [
-      { instructorId: caller._id },
-      { assignedTutors: caller._id },
+      { instructorId: { $in: [caller._id, String(caller._id)] } },
+      { assignedTutors: { $in: [caller._id, String(caller._id)] } },
     ],
   };
 }
@@ -178,6 +183,12 @@ function buildRecord(row) {
  *
  * Cancelled plans are excluded: an abandoned intent is not a balance, and
  * counting one would show money owed that nobody agreed to pay.
+ *
+ * Every id comparison is wrapped in $toString because course/plan/transaction
+ * ids drifted between ObjectId and string across the data set; comparing raw
+ * values silently drops a join whenever the two sides were stored as different
+ * BSON types. $toString of two equal ids is the same hex string, so matches are
+ * preserved while the type mismatch stops hiding rows.
  */
 function recordPipeline(scope) {
   return [
@@ -201,8 +212,8 @@ function recordPipeline(scope) {
               status: { $ne: 'cancelled' },
               $expr: {
                 $and: [
-                  { $eq: ['$courseId', '$$courseId'] },
-                  { $eq: ['$userId', '$$studentId'] },
+                  { $eq: [{ $toString: '$courseId' }, { $toString: '$$courseId' }] },
+                  { $eq: [{ $toString: '$userId' }, { $toString: '$$studentId' }] },
                 ],
               },
             },
@@ -234,8 +245,8 @@ function recordPipeline(scope) {
               type: { $in: FULL_PAYMENT_TYPES },
               $expr: {
                 $and: [
-                  { $eq: ['$courseId', '$$courseId'] },
-                  { $eq: ['$userId', '$$studentId'] },
+                  { $eq: [{ $toString: '$courseId' }, { $toString: '$$courseId' }] },
+                  { $eq: [{ $toString: '$userId' }, { $toString: '$$studentId' }] },
                 ],
               },
             },
@@ -256,7 +267,7 @@ function recordPipeline(scope) {
         from: 'users',
         let: { studentId: '$enrollments.user' },
         pipeline: [
-          { $match: { $expr: { $eq: ['$_id', '$$studentId'] } } },
+          { $match: { $expr: { $eq: [{ $toString: '$_id' }, { $toString: '$$studentId' }] } } },
           { $project: { fullname: 1, email: 1, phone: 1, profilePicture: 1, graduate: 1 } },
         ],
         as: 'student',
@@ -374,10 +385,15 @@ const paymentRecordController = {
       if (!authz.ok) return res.status(authz.status).json({ message: authz.message });
       const scoper = authz.scoper;
 
-      const courses = await Course.find(courseScopeFor(scoper))
-        .select('title fee partPaymentEnabled')
-        .sort({ createdAt: -1 })
-        .lean();
+      // Mirror listPaymentRecords: aggregate (not find) so the type-agnostic
+      // scope in courseScopeFor is honored. Course.find would cast the $in
+      // elements back to ObjectId and drop string-stored courses, leaving the
+      // selector out of step with the records it is meant to filter.
+      const courses = await Course.aggregate([
+        { $match: courseScopeFor(scoper) },
+        { $project: { title: 1, fee: 1, partPaymentEnabled: 1, createdAt: 1 } },
+        { $sort: { createdAt: -1 } },
+      ]);
 
       return res.json({
         courses: courses.map(course => ({
