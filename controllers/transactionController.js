@@ -15,6 +15,11 @@ const {
   initializeGatewayCheckout,
   CHECKOUT_REUSE_WINDOW_MS,
 } = require('../services/coursePaymentService.js');
+const {
+  settleAmbiguousTransfer,
+  handleTransferEvent,
+  TRANSFER_FAILURES,
+} = require('../services/withdrawalService.js');
 
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
 const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
@@ -116,51 +121,9 @@ async function resolveWalletTarget(req, privilege, requestedTargetId) {
   return owner ? { ok: true, user: owner } : { ok: false };
 }
 
-/**
- * Resolves an ambiguous transfer failure (timeout/5xx where the gateway may
- * still have accepted the transfer) without paying out twice.
- *
- * The transfer is looked up by reference: confirmed-successful marks the
- * withdrawal complete; confirmed-failed (or no transfer row, i.e. the request
- * was rejected before a transfer existed) refunds the hold; anything still
- * pending keeps the hold so reconciliation can finish the job.
- *
- * Returns 'successful' | 'refunded' | 'pending'.
- */
-async function settleAmbiguousTransfer(userId, transaction, amount, reference) {
-  try {
-    const statusResponse = await axios.get(`${flutterwaveBaseURL}transfers`, {
-      params: { reference },
-      headers: flwHeaders,
-      timeout: GATEWAY_TIMEOUT_MS,
-    });
-    const rows = statusResponse.data?.data;
-    const transfer = Array.isArray(rows) ? rows.find((row) => row?.reference === reference) : null;
-
-    if (transfer?.status === 'SUCCESSFUL') {
-      await Transaction.updateOne({ _id: transaction._id }, {
-        $set: { status: 'successful', gatewayTransactionId: transfer.id ? String(transfer.id) : undefined },
-      });
-      return 'successful';
-    }
-    if (transfer && ['FAILED', 'FAILED_FUNDS', 'FAILED_DISBURSE'].includes(transfer.status)) {
-      await User.findByIdAndUpdate(userId, { $inc: { balance: amount } });
-      await Transaction.updateOne({ _id: transaction._id }, { $set: { status: 'failed' } });
-      return 'refunded';
-    }
-    if (!transfer) {
-      // No row exists for this reference: the original call never created a
-      // transfer, so releasing the hold cannot double-pay.
-      await User.findByIdAndUpdate(userId, { $inc: { balance: amount } });
-      await Transaction.updateOne({ _id: transaction._id }, { $set: { status: 'failed' } });
-      return 'refunded';
-    }
-    return 'pending';
-  } catch (error) {
-    console.error('Withdrawal status check failed:', error.response?.data || error.message);
-    return 'pending';
-  }
-}
+// Withdrawal settlement (settleAmbiguousTransfer, the transfer-webhook handler,
+// and the reconciliation sweep) lives in services/withdrawalService.js so the
+// cron can reuse it without importing this HTTP controller.
 
 /**
  * Finalizes a wallet-funding payment: flips the still-pending Transaction to
@@ -427,8 +390,26 @@ const transactionController = {
       return res.sendStatus(401);
     }
 
-    const payment = req.body?.data;
-    if (!payment?.tx_ref) return res.sendStatus(200); // Nothing actionable; don't ask for a retry.
+    const body = req.body || {};
+    const eventType = String(body.event || '');
+    const payment = body.data;
+    if (!payment) return res.sendStatus(200); // Nothing actionable; don't ask for a retry.
+
+    // Transfer (withdrawal payout) events are asynchronous and carry `reference`
+    // plus an uppercase status instead of the `tx_ref` a charge carries, so they
+    // must be routed to the withdrawal reconciler before the charge path below —
+    // which keys on tx_ref and would otherwise drop them.
+    if (eventType.startsWith('transfer') || (!payment.tx_ref && payment.reference && payment.status)) {
+      try {
+        await handleTransferEvent(body);
+        return res.sendStatus(200);
+      } catch (error) {
+        console.error('Flutterwave transfer webhook processing failed:', error);
+        return res.sendStatus(500); // Let Flutterwave retry transient failures.
+      }
+    }
+
+    if (!payment.tx_ref) return res.sendStatus(200); // Nothing actionable; don't ask for a retry.
 
     const eventId = payment.id ? `flutterwave-${payment.id}` : `flutterwave-${payment.tx_ref}`;
     let event;
@@ -1001,10 +982,32 @@ const transactionController = {
           throw new Error(response.data?.message || 'Transfer was not accepted');
         }
 
-        await Transaction.updateOne({ _id: transaction._id }, {
-          $set: { status: 'successful', gatewayTransactionId: response.data?.data?.id ? String(response.data.data.id) : undefined },
-        });
-        return res.status(200).json({ message: 'Withdrawal successful' });
+        // `POST /transfers` only QUEUES the payout; Flutterwave confirms the real
+        // outcome asynchronously via the transfer webhook. The wallet is already
+        // debited as a hold, so record the gateway id and keep the withdrawal
+        // pending until the webhook (or the reconciliation sweep) settles it —
+        // marking it successful here would strand the user if the payout later
+        // failed at the bank, with no event to trigger a refund.
+        const transfer = response.data?.data;
+        if (transfer?.id) {
+          await Transaction.updateOne({ _id: transaction._id }, { $set: { gatewayTransactionId: String(transfer.id) } });
+        }
+
+        const transferStatus = String(transfer?.status || '').toUpperCase();
+        if (transferStatus === 'SUCCESSFUL') {
+          // Some rails settle instantly and report it right in the response.
+          await Transaction.updateOne({ _id: transaction._id, status: 'pending' }, { $set: { status: 'successful', paidAt: new Date() } });
+          return res.status(200).json({ message: 'Withdrawal successful' });
+        }
+        if (TRANSFER_FAILURES.includes(transferStatus)) {
+          // Rejected outright: release the hold once, guarded by the transition.
+          const failed = await Transaction.findOneAndUpdate({ _id: transaction._id, status: 'pending' }, { $set: { status: 'failed' } }, { new: true });
+          if (failed) await User.findByIdAndUpdate(userId, { $inc: { balance: amount } });
+          return res.status(502).json({ message: 'Withdrawal could not be completed. Your balance was not affected.' });
+        }
+
+        // Queued (NEW/PENDING): the transfer webhook finalizes or refunds it.
+        return res.status(202).json({ message: 'Your withdrawal is being processed. It will reflect shortly.' });
       } catch (transferError) {
         // A timeout or 5xx does not prove the transfer failed — the gateway may
         // have accepted it and lost the response on the way back, in which case
