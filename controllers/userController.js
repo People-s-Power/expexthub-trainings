@@ -266,6 +266,57 @@ const userControllers = {
     }
   },
 
+  /**
+   * Searchable directory of every account on the platform.
+   *
+   * Backs the Users filter in the admissions menu. Deliberately not a "return
+   * everything" endpoint: the user collection is unbounded, so the query is
+   * always capped and the client searches server-side rather than downloading
+   * the table to filter it in the browser. With no query it returns the most
+   * recently created accounts, so the dropdown is useful before typing.
+   */
+  searchUsers: async (req, res) => {
+    try {
+      const term = String(req.query.q || req.query.search || '').trim();
+      const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
+
+      const filter = { blocked: { $ne: true } };
+
+      // Roles are stored lowercase; an unknown value would silently match
+      // nothing, so it is simply ignored rather than returning an empty list.
+      const role = String(req.query.role || '').trim().toLowerCase();
+      if (role && role !== 'all') filter.role = role;
+
+      if (term) {
+        // Escape before building the regex: an unescaped search box is a path to
+        // a catastrophic-backtracking DoS, and a stray "(" would 500 the route.
+        const safe = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const pattern = new RegExp(safe, 'i');
+        filter.$or = [{ fullname: pattern }, { name: pattern }, { email: pattern }, { organizationName: pattern }];
+      }
+
+      const users = await User.find(filter)
+        .select('fullname name email role profilePicture image organizationName')
+        .sort({ _id: -1 })
+        .limit(limit)
+        .lean();
+
+      return res.status(200).json({
+        users: users.map((user) => ({
+          id: user._id,
+          fullname: user.fullname || user.name || user.email || 'Unnamed user',
+          email: user.email || null,
+          role: user.role || 'student',
+          organizationName: user.organizationName || null,
+          profilePicture: user.profilePicture || user.image || null,
+        })),
+      });
+    } catch (error) {
+      console.error('User directory search failed:', error);
+      return res.status(500).json({ message: 'Unable to search users' });
+    }
+  },
+
   getStudents: async (req, res) => {
     try {
       // Learners register as either `student` or `client` (the signup form posts
@@ -332,103 +383,165 @@ const userControllers = {
     }
   },
 
+  /**
+   * The people a provider may email: every student enrolled on any course they
+   * own or are assigned to.
+   *
+   * Two things kept this list empty in production. Course ownership ids drifted
+   * between ObjectId and String, so matching on one form silently dropped
+   * courses; both forms are matched now. And a tutor with no courses — or courses
+   * with no enrollments yet — got a 404, which the client rendered as a failure
+   * rather than as "nobody yet". An empty audience is a valid answer, so it is a
+   * 200 with an empty list.
+   *
+   * `approved` is deliberately not filtered on: a course awaiting approval still
+   * has real students who are entitled to hear from their provider.
+   */
   getMyStudents: async (req, res) => {
     try {
-      const userId = req.body.id;
+      const callerId = String(req.user?.id || req.user?._id || '');
+      const requested = String(req.body?.id || req.body?.ownerId || callerId || '');
+      if (!callerId) {
+        return res.status(401).json({ message: 'Authentication required' });
+      }
+      if (!mongoose.Types.ObjectId.isValid(requested)) {
+        return res.status(400).json({ message: 'Invalid user id' });
+      }
 
-      // Fetch the tutor's courses with both enrollment types populated
+      // Reading someone else's audience is only for an admin or an accepted team
+      // member of that provider — a body-supplied id can never widen the scope.
+      if (requested !== callerId && req.user?.role !== 'admin') {
+        const actor = await User.findById(callerId).select('teamMembers').lean();
+        const isMember = (actor?.teamMembers || []).some(
+          (entry) => String(entry.ownerId) === requested && entry.status === 'accepted',
+        );
+        if (!isMember) {
+          return res.status(403).json({ message: 'You can only view your own students' });
+        }
+      }
+
+      // Match both id forms: prod stores course ownership as strings on some
+      // documents and ObjectIds on others, and $in against a single form hides
+      // whichever half does not match.
+      const idVariants = [requested, new mongoose.Types.ObjectId(requested)];
+
       const courses = await Course.find({
-        approved: true,
         $or: [
-          { assignedTutors: { $in: [userId] } },
-          { instructorId: userId }
-        ]
+          { instructorId: { $in: idVariants } },
+          { assignedTutors: { $in: idVariants } },
+        ],
       })
+        .select('title enrollments enrolledStudents')
         .populate({
           path: 'enrollments.user',
-          select: "profilePicture fullname email phone gender age skillLevel country state address graduate blocked contact"
+          select: "profilePicture fullname email phone gender age skillLevel country state address graduate blocked contact",
         })
         .populate({
           path: 'enrolledStudents',
-          select: "profilePicture fullname email phone gender age skillLevel country state address graduate blocked contact"
+          select: "profilePicture fullname email phone gender age skillLevel country state address graduate blocked contact",
         })
         .lean();
 
-      if (!courses || courses.length === 0) {
-        return res.status(404).json({ message: 'No courses found for this tutor' });
-      }
-
-      // Extract unique users from both enrollments and enrolledStudents using a Map
       const uniqueUsersMap = new Map();
-
-      courses.forEach(course => {
-        // Process enrollments array
-        if (Array.isArray(course.enrollments)) {
-          course.enrollments.forEach(enrollment => {
-            const student = enrollment.user;
-            if (student && !uniqueUsersMap.has(student._id.toString())) {
-              uniqueUsersMap.set(student._id.toString(), {
-                _id: student._id,
-                fullname: student.fullname,
-                email: student.email,
-                phone: student.phone,
-                gender: student.gender,
-                age: student.age,
-                skillLevel: student.skillLevel,
-                country: student.country,
-                state: student.state,
-                address: student.address,
-                profilePicture: student.profilePicture,
-                graduate: student.graduate,
-                blocked: student.blocked,
-                contact: student.contact,
-              });
-            }
-          });
+      const add = (student, courseTitle) => {
+        if (!student || !student._id || !student.email) return;
+        const key = String(student._id);
+        const existing = uniqueUsersMap.get(key);
+        if (existing) {
+          if (courseTitle && !existing.courses.includes(courseTitle)) existing.courses.push(courseTitle);
+          return;
         }
+        uniqueUsersMap.set(key, {
+          _id: student._id,
+          fullname: student.fullname,
+          email: student.email,
+          phone: student.phone,
+          gender: student.gender,
+          age: student.age,
+          skillLevel: student.skillLevel,
+          country: student.country,
+          state: student.state,
+          address: student.address,
+          profilePicture: student.profilePicture,
+          graduate: student.graduate,
+          blocked: student.blocked,
+          contact: student.contact,
+          courses: courseTitle ? [courseTitle] : [],
+        });
+      };
 
-        // Process enrolledStudents array
-        if (Array.isArray(course.enrolledStudents)) {
-          course.enrolledStudents.forEach(student => {
-            if (student && !uniqueUsersMap.has(student._id.toString())) {
-              uniqueUsersMap.set(student._id.toString(), {
-                _id: student._id,
-                fullname: student.fullname,
-                email: student.email,
-                phone: student.phone,
-                gender: student.gender,
-                age: student.age,
-                skillLevel: student.skillLevel,
-                country: student.country,
-                state: student.state,
-                address: student.address,
-                profilePicture: student.profilePicture,
-                graduate: student.graduate,
-                blocked: student.blocked,
-                contact: student.contact,
-                // Include course info if available
-                course: student.assignedCourse
-              });
-            }
-          });
-        }
+      courses.forEach((course) => {
+        (course.enrollments || []).forEach((enrollment) => add(enrollment?.user, course.title));
+        (course.enrolledStudents || []).forEach((student) => add(student, course.title));
       });
 
-      // Convert unique users to an array
-      const uniqueUsers = Array.from(uniqueUsersMap.values());
+      // Blocked accounts are excluded: they cannot sign in, so mailing them is
+      // sending a campaign nobody can act on.
+      const students = Array.from(uniqueUsersMap.values())
+        .filter((student) => student.blocked !== true)
+        .sort((a, b) => String(a.fullname || '').localeCompare(String(b.fullname || '')));
 
-      if (uniqueUsers.length === 0) {
-        return res.status(404).json({ message: 'No students enrolled in your courses' });
-      }
-
-      // Return the unique users' data
       return res.status(200).json({
         message: 'Students retrieved successfully',
-        students: uniqueUsers,
+        students,
+        courses: courses.length,
       });
     } catch (error) {
       console.error(error);
       return res.status(500).json({ message: 'Unexpected error during student retrieval' });
+    }
+  },
+
+  /**
+   * Change the signed-in user's password from Settings.
+   *
+   * Always requires the current password, including for accounts a training
+   * provider created with a generated password — the onboarding email hands that
+   * password to the account owner, and "I know the current one" is what proves
+   * the person at the keyboard is them and not someone on a shared machine.
+   *
+   * Failures deliberately do not distinguish "wrong password" from anything else
+   * beyond what the user needs to correct, and every other session keeps working:
+   * revoking tokens here would sign the user out mid-change with no way back.
+   */
+  changePassword: async (req, res) => {
+    try {
+      const bcrypt = require('bcryptjs');
+      const userId = req.user?.id || req.user?._id;
+      if (!userId) {
+        return res.status(401).json({ message: 'Authentication required' });
+      }
+
+      const currentPassword = String(req.body?.currentPassword || '');
+      const newPassword = String(req.body?.newPassword || '');
+
+      if (!currentPassword || !newPassword) {
+        return res.status(400).json({ message: 'Enter your current password and a new password' });
+      }
+      if (newPassword.length < 8) {
+        return res.status(400).json({ message: 'Your new password must be at least 8 characters' });
+      }
+      if (newPassword === currentPassword) {
+        return res.status(400).json({ message: 'Your new password must be different from the current one' });
+      }
+
+      const user = await User.findById(userId).select('password email fullname');
+      if (!user || !user.password) {
+        return res.status(404).json({ message: 'Account not found' });
+      }
+
+      const matches = await bcrypt.compare(currentPassword, user.password);
+      if (!matches) {
+        return res.status(401).json({ message: 'Your current password is incorrect' });
+      }
+
+      user.password = await bcrypt.hash(newPassword, 10);
+      await user.save();
+
+      return res.status(200).json({ message: 'Password updated' });
+    } catch (error) {
+      console.error('Change password failed:', error);
+      return res.status(500).json({ message: 'Unable to update your password' });
     }
   },
 

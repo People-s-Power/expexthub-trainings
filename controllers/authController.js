@@ -258,6 +258,38 @@ function issueAccessToken(user) {
   }, process.env.JWT_SECRET, { expiresIn: '24h' });
 }
 
+// Roles allowed to register somebody else and have their credentials emailed.
+const REGISTRAR_ROLES = ['admin', 'tutor', 'provider', 'team_member'];
+
+/**
+ * Resolves the signed-in training provider behind an assisted registration.
+ *
+ * /auth/register is public by necessity — self-signup has no session — so the
+ * provider-registers-a-student branch cannot rely on route middleware. Instead
+ * the bearer token is verified here and the account behind it re-read from the
+ * database, so a token whose role claim was minted before a demotion (or for a
+ * deleted account) grants nothing. Returns null for anonymous or unauthorized
+ * callers, which makes the caller fall back to ordinary self-signup.
+ */
+async function resolveRegistrar(req) {
+  try {
+    if (!process.env.JWT_SECRET) return null;
+    const rawToken = req.headers?.authorization || req.cookies?.accessToken;
+    if (!rawToken) return null;
+    const token = rawToken.startsWith('Bearer ') ? rawToken.slice(7) : rawToken;
+
+    const claims = jwt.verify(token, process.env.JWT_SECRET);
+    const actor = await User.findById(claims?.id).select('role fullname organizationName blocked');
+    if (!actor || actor.blocked === true) return null;
+    if (!REGISTRAR_ROLES.includes(String(actor.role || '').toLowerCase())) return null;
+    return actor;
+  } catch (error) {
+    // An invalid or expired token is simply "not a registrar" — the request
+    // still succeeds as a normal self-signup.
+    return null;
+  }
+}
+
 const authControllers = {
   register: async (req, res) => {
     try {
@@ -323,6 +355,15 @@ const authControllers = {
       // Generate a unique verification code per user
       const verificationCode = generateVerificationCode();
 
+      // A training provider may register a prospective student and hand them
+      // their credentials. That branch is only ever taken for a caller whose
+      // bearer token resolves to a live tutor/admin account — `sendCredentials`
+      // from an anonymous request is ignored, so the public endpoint cannot be
+      // used to mint pre-verified accounts or to have the API mail a password
+      // to an address the requester does not control.
+      const registrar = req.body?.sendCredentials === true ? await resolveRegistrar(req) : null;
+      const createdByProvider = Boolean(registrar) && role !== 'admin';
+
       const hashPassword = bcrypt.hashSync(password, 10);
       const newUser = new User({
         username: normalizedEmail,
@@ -340,11 +381,56 @@ const authControllers = {
         verificationAttempts: 0,
         contact,
         password: hashPassword,
+        // The provider vouched for this person in the admissions flow and the
+        // student never receives a code, so holding the account in an unverified
+        // state would only block them from paying later with no way to clear it.
+        ...(createdByProvider ? { isVerified: true, registeredBy: registrar._id } : {}),
         // Applicant signup step 3 — primary course category.
         ...(normalizedCategory ? { assignedCourse: normalizedCategory } : {}),
       });
 
       await newUser.save();
+
+      if (createdByProvider) {
+        // Onboarding mail carries the sign-in details and a link straight to the
+        // Settings page where the student can replace the generated password.
+        // The plaintext password exists only for the life of this request — it is
+        // never persisted, and the account already stores only the bcrypt hash.
+        try {
+          await sendWelcomeEmailOnce(newUser, {
+            credentials: { email: normalizedEmail, password },
+            registeredByName: registrar.organizationName || registrar.fullname || null,
+          });
+        } catch (mailError) {
+          console.error('Onboarding email failed for provider-registered user:', mailError.message);
+          // The account exists either way, so the caller still gets it back —
+          // the admissions UI shows the credentials on screen for the provider
+          // to pass on, and an enrolment in progress can still select them.
+          return res.status(200).json({
+            message: 'Student registered, but we could not send their onboarding email.',
+            id: newUser._id,
+            emailDelivered: false,
+            createdByProvider: true,
+            student: {
+              id: newUser._id,
+              fullname: newUser.fullname,
+              email: newUser.email,
+            },
+          });
+        }
+
+        return res.status(200).json({
+          message: 'Student registered and their sign-in details were emailed to them',
+          id: newUser._id,
+          emailDelivered: true,
+          createdByProvider: true,
+          student: {
+            id: newUser._id,
+            fullname: newUser.fullname,
+            email: newUser.email,
+          },
+        });
+      }
 
       // A mail failure must not present as a failed registration: the account
       // exists, so reporting 500 would leave the user unable to re-register and

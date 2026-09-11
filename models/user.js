@@ -86,6 +86,43 @@ const userSchema = new mongoose.Schema({
     joiningAccomplishment: String,
   },
   balance: { type: Number, default: 0 },
+  // Set when a training provider created this account from the admissions flow
+  // rather than the person signing themselves up. Kept for audit: it is the only
+  // record of who vouched for an account that was marked verified on creation.
+  registeredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  // Scheduled payouts. Manual withdrawal is untouched by this — auto payout is an
+  // extra trigger that runs the same debit-then-transfer path, never a replacement.
+  //
+  // `nextRunAt` is the only field the scheduler queries on: it is recomputed from
+  // the schedule every time the settings change and after every run, so a sweep is
+  // one indexed range scan instead of evaluating a cron rule per user. A payout
+  // that fires is deliberately *not* retried before the following slot — a failed
+  // transfer already releases the hold, and retrying inside the same window is how
+  // one bad bank response turns into a stream of duplicate attempts.
+  autoPayout: {
+    enabled: { type: Boolean, default: false },
+    // daily → every day at the chosen time; weekly → `dayOfWeek`; monthly → `dayOfMonth`.
+    frequency: { type: String, enum: ['daily', 'weekly', 'monthly'], default: 'weekly' },
+    // 0 = Sunday … 6 = Saturday, matching Date#getDay.
+    dayOfWeek: { type: Number, min: 0, max: 6, default: 5 },
+    // Capped at 28 so every month has the day — a 31st schedule would silently skip February.
+    dayOfMonth: { type: Number, min: 1, max: 28, default: 1 },
+    hour: { type: Number, min: 0, max: 23, default: 9 },
+    minute: { type: Number, min: 0, max: 59, default: 0 },
+    // Fixed offset in minutes east of UTC for the user's payout clock. Nigeria (WAT)
+    // is +60 and observes no DST, which is why a plain offset is enough here.
+    utcOffsetMinutes: { type: Number, min: -720, max: 840, default: 60 },
+    // Skip the run when the wallet holds less than this (naira). Stops a schedule
+    // from firing a string of near-empty transfers and burning gateway fees.
+    minimumAmount: { type: Number, min: 500, default: 5000 },
+    // Blank/0 means "sweep the whole balance". Otherwise pay out at most this much.
+    maximumAmount: { type: Number, min: 0, default: 0 },
+    nextRunAt: { type: Date, index: true },
+    lastRunAt: Date,
+    lastStatus: { type: String, enum: ['queued', 'successful', 'failed', 'skipped', null], default: null },
+    lastMessage: String,
+    lastAmount: Number,
+  },
   contact: {
     type: Boolean,
     default: true

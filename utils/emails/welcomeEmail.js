@@ -26,11 +26,17 @@ function firstNameOf(fullname) {
 }
 
 /**
- * Sends the account-onboarding email.
- *
- * @param {Object} user - { email, fullname, role }
- * @returns {Promise} nodemailer send result
+ * Where a user changes their password. The trainings app routes Settings by
+ * role, so the link has to match the account being onboarded or the recipient
+ * lands on a dashboard they cannot open.
  */
+function settingsUrlFor(role) {
+  const normalized = String(role || '').toLowerCase();
+  if (normalized === 'admin') return `${trainingUrl}/admin/profile#password`;
+  if (['tutor', 'provider', 'team_member'].includes(normalized)) return `${trainingUrl}/tutor/profile#password`;
+  return `${trainingUrl}/applicant/profile#password`;
+}
+
 /**
  * Sends the account-onboarding email.
  *
@@ -41,6 +47,12 @@ function firstNameOf(fullname) {
  *   a "verify to finish signing up" variant.
  * @param {string} [opts.ctaUrl] - overrides the default call-to-action link.
  * @param {string} [opts.ctaLabel] - overrides the default CTA label.
+ * @param {{email: string, password: string}} [opts.credentials] - present only
+ *   when a training provider created the account on the recipient's behalf, so
+ *   the recipient has no password of their own yet. The email then leads with the
+ *   sign-in details and a button to Settings to replace the password. The value
+ *   is used for this one send and is never stored.
+ * @param {string} [opts.registeredByName] - provider that created the account.
  * @returns {Promise} nodemailer send result
  */
 async function sendWelcomeEmail(user, opts = {}) {
@@ -48,12 +60,22 @@ async function sendWelcomeEmail(user, opts = {}) {
 
   const role = String(user.role || '').toLowerCase();
   const isTutor = role === 'tutor' || role === 'provider' || role === 'team_member';
-  const activationPending = opts.activationPending === true;
+  const credentials = opts.credentials?.password ? opts.credentials : null;
+  // A provider-created account is already usable, so the "enter your code"
+  // variant would be wrong for it whatever the caller passed.
+  const activationPending = opts.activationPending === true && !credentials;
+
+  const changePasswordUrl = settingsUrlFor(user.role);
 
   // Different CTAs per role/state (front-end routes mirror the role dashboards).
   let ctaUrl;
   let ctaLabel;
-  if (activationPending) {
+  if (credentials) {
+    // The one action that matters on a first sign-in with a password somebody
+    // else generated: replace it.
+    ctaUrl = opts.ctaUrl || changePasswordUrl;
+    ctaLabel = opts.ctaLabel || 'Change your password';
+  } else if (activationPending) {
     ctaUrl = opts.ctaUrl || `${trainingUrl}/auth/login`;
     ctaLabel = opts.ctaLabel || 'Go to my dashboard';
   } else if (isTutor) {
@@ -65,20 +87,30 @@ async function sendWelcomeEmail(user, opts = {}) {
   }
 
   const data = {
-    subject: activationPending
-      ? 'Welcome to Experthub Trainings — verify your email'
-      : isTutor
-        ? 'Welcome to Experthub Trainings — let\'s get you teaching'
-        : 'Welcome to Experthub Trainings — let\'s get started',
-    preheader: activationPending
-      ? 'Your account is almost ready. Enter the code we emailed you to activate it.'
-      : isTutor
-        ? 'Your trainer account is ready. Set up your profile and publish your first course.'
-        : 'Your account is ready. Explore courses and start learning today.',
+    subject: credentials
+      ? 'Your Experthub Trainings account is ready — here are your sign-in details'
+      : activationPending
+        ? 'Welcome to Experthub Trainings — verify your email'
+        : isTutor
+          ? 'Welcome to Experthub Trainings — let\'s get you teaching'
+          : 'Welcome to Experthub Trainings — let\'s get started',
+    preheader: credentials
+      ? 'Sign in with the details below, then change your password from Settings.'
+      : activationPending
+        ? 'Your account is almost ready. Enter the code we emailed you to activate it.'
+        : isTutor
+          ? 'Your trainer account is ready. Set up your profile and publish your first course.'
+          : 'Your account is ready. Explore courses and start learning today.',
     firstName: firstNameOf(user.fullname),
-    heading: isTutor ? 'Welcome, Trainer!' : 'Welcome to Experthub!',
+    heading: credentials
+      ? 'Your account is ready'
+      : isTutor ? 'Welcome, Trainer!' : 'Welcome to Experthub!',
     isTutor,
     activationPending,
+    credentials,
+    registeredByName: opts.registeredByName || null,
+    loginUrl: `${trainingUrl}/auth/login`,
+    changePasswordUrl,
     expiryMinutes: opts.expiryMinutes || 15,
     email: user.email,
     brandHomeUrl,
@@ -89,7 +121,18 @@ async function sendWelcomeEmail(user, opts = {}) {
   };
 
   const html = renderLayout('welcome', data);
-  const text = plainTextFallback([
+  const text = credentials ? plainTextFallback([
+    `Hi ${data.firstName},`,
+    opts.registeredByName
+      ? `${opts.registeredByName} created an Experthub Trainings account for you. Here are your sign-in details:`
+      : 'An Experthub Trainings account has been created for you. Here are your sign-in details:',
+    `Email: ${credentials.email}`,
+    `Password: ${credentials.password}`,
+    `Sign in: ${data.loginUrl}`,
+    `For your security, change this password from Settings once you are in: ${changePasswordUrl}`,
+    `If you have any questions, reach us at ${supportEmail}.`,
+    'The Experthub Trainings Team',
+  ]) : plainTextFallback([
     `Hi ${data.firstName},`,
     activationPending
       ? `Thanks for creating your Experthub account. To activate it, enter the code emailed to ${user.email}. It expires in ${data.expiryMinutes} minutes.`
@@ -144,6 +187,7 @@ async function sendWelcomeEmailOnce(user, opts = {}) {
 module.exports = {
   sendWelcomeEmail,
   sendWelcomeEmailOnce,
+  settingsUrlFor,
   firstNameOf,
   brandHomeUrl,
   trainingUrl,

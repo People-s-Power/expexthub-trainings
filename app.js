@@ -32,6 +32,7 @@ const { sendEmail } = require("./utils/sendEmail");
 const { startCronJobs } = require("./utils/ReminderSetupEmail");
 const { startWithdrawalReconciliation } = require("./utils/withdrawalReconciler");
 const { startPaymentReconciliation } = require("./utils/paymentReconciler");
+const { startAutoPayouts } = require("./services/autoPayoutService");
 
 const bodyParser = require("body-parser");
 const { connect } = require("./config/connectionState");
@@ -79,6 +80,7 @@ const PORT = process.env.PORT || 3002;
 startCronJobs();
 startWithdrawalReconciliation();
 startPaymentReconciliation();
+startAutoPayouts();
 // Middleware
 app.use(cors(corsOptions));
 

@@ -23,6 +23,11 @@ transactionRouter.post('/create-recipient', authenticate, walletLimiter, transac
 transactionRouter.post('/withdraw', authenticate, walletLimiter, transactionController.withdraw);
 transactionRouter.post('/pay-with', authenticate, walletLimiter, transactionController.payWith);
 
+// Scheduled payouts. Reading the schedule needs only wallet visibility; changing
+// it moves money, so the controller gates writes on "Withdraw from Wallet".
+transactionRouter.get('/auto-payout', authenticate, generalLimiter, transactionController.getAutoPayout);
+transactionRouter.put('/auto-payout', authenticate, walletLimiter, transactionController.updateAutoPayout);
+
 // Wallet funding: starts a gateway checkout that credits the wallet on success.
 // `/initialize-payment` is the alias the deployed frontend already calls — both
 // paths resolve to the same controller so the existing contract keeps working.

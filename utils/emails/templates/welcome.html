@@ -19,6 +19,67 @@
     <td align="center" class="gutter" style="padding:6px 40px 12px 40px; font-family:Arial, Helvetica, sans-serif; font-size:30px; line-height:38px; font-weight:bold; color:#111827;">{{heading}}</td>
   </tr>
 
+  {{#if credentials}}
+  <!-- Provider-created account: the recipient never chose a password, so the
+       sign-in details lead, and the primary action is replacing them. -->
+  <tr>
+    <td align="center" class="gutter" style="padding:8px 52px 22px 52px; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:24px; color:#4B5563;">
+      Hi {{firstName}}, {{#if registeredByName}}<span style="font-weight:bold; color:#111827;">{{registeredByName}}</span> has created an Experthub Trainings account for you{{else}}an Experthub Trainings account has been created for you{{/if}}. Use the details below to sign in &mdash; then change your password from Settings so only you know it.
+    </td>
+  </tr>
+
+  <tr>
+    <td align="center" class="gutter" style="padding:0 40px 22px 40px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#FFF9E8; border:1px solid #F2E2AE; border-radius:12px;">
+        <tr>
+          <td style="padding:22px 24px;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+              <tr>
+                <td align="center" style="padding-bottom:14px; font-family:Arial, Helvetica, sans-serif; font-size:12px; line-height:18px; font-weight:bold; letter-spacing:1px; color:#6B7280;">YOUR SIGN-IN DETAILS</td>
+              </tr>
+              <tr>
+                <td style="padding-bottom:4px; font-family:Arial, Helvetica, sans-serif; font-size:12px; line-height:18px; color:#6B7280;">Email</td>
+              </tr>
+              <tr>
+                <td style="padding-bottom:14px; font-family:'Courier New', Courier, monospace; font-size:15px; line-height:22px; font-weight:bold; color:#111827; word-break:break-all;">{{credentials.email}}</td>
+              </tr>
+              <tr>
+                <td style="padding-bottom:4px; font-family:Arial, Helvetica, sans-serif; font-size:12px; line-height:18px; color:#6B7280;">Password</td>
+              </tr>
+              <tr>
+                <td style="font-family:'Courier New', Courier, monospace; font-size:18px; line-height:26px; font-weight:bold; letter-spacing:1px; color:#111827; word-break:break-all;">{{credentials.password}}</td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+
+  <!-- Two actions, sign-in first: the change-password button is the one the
+       copy above asks for, so it carries the brand fill. -->
+  <tr>
+    <td align="center" class="gutter" style="padding:0 40px 14px 40px;">
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td align="center" bgcolor="#FDC332" style="border-radius:8px; background-color:#FDC332;">
+            <a href="{{ctaUrl}}" target="_blank" style="display:inline-block; padding:14px 32px; font-family:Arial, Helvetica, sans-serif; font-size:15px; font-weight:bold; line-height:20px; color:#111827; text-decoration:none; border-radius:8px;">{{ctaLabel}}</a>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" class="gutter" style="padding:0 48px 10px 48px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:22px; color:#6B7280;">
+      That button takes you to your Settings page, where you can set a password of your own.
+    </td>
+  </tr>
+  <tr>
+    <td align="center" class="gutter" style="padding:0 48px 34px 48px; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; color:#6B7280;">
+      Prefer to look around first? <a href="{{loginUrl}}" target="_blank" style="color:#B8860B; text-decoration:underline;">Sign in to your dashboard</a>. Keep this email private &mdash; anyone with these details can access your account.
+    </td>
+  </tr>
+  {{else}}
   {{#if activationPending}}
   <tr>
     <td align="center" class="gutter" style="padding:8px 56px 18px 56px; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:24px; color:#4B5563;">
@@ -145,5 +206,6 @@
       </td>
     </tr>
     {{/if}}
+  {{/if}}
   {{/if}}
 </table>

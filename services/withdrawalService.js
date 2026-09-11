@@ -12,6 +12,7 @@
 // controller orchestrates over HTTP, and the cron reuses it without pulling the
 // controller in.
 const axios = require('axios');
+const crypto = require('crypto');
 const Transaction = require('../models/transactions.js');
 const User = require('../models/user.js');
 const PaymentWebhookEvent = require('../models/paymentWebhookEvents.js');
@@ -214,11 +215,139 @@ async function reconcilePendingWithdrawals({ olderThanMs = WITHDRAWAL_RECONCILE_
   return { checked: stuck.length, settled, refunded };
 }
 
+/**
+ * Debits the wallet and queues the payout. The single place a withdrawal is
+ * started, whether a user pressed "Withdraw" or a scheduled auto payout fired,
+ * so both triggers share one hold-then-transfer contract and one refund path.
+ *
+ * `source` is recorded on the ledger row only — it never changes the money logic.
+ *
+ * Returns one of:
+ *   'successful'   payout confirmed by the gateway in the synchronous response
+ *   'queued'       accepted and in flight; the webhook or sweep finalizes it
+ *   'refunded'     rejected outright, hold released, balance untouched overall
+ *   'insufficient' nothing was debited
+ *   'no_account'   no payout bank saved
+ */
+async function executeWithdrawal({ user, amount, source = 'manual', narration = 'Withdrawal' }) {
+  if (!user?.bankCode || !user?.accountNumber) {
+    return { outcome: 'no_account', message: 'Please add your payout bank account first' };
+  }
+
+  const userId = user._id;
+
+  // Debit first, conditionally on sufficient funds, so two concurrent
+  // withdrawals (or a manual one racing the scheduler) cannot both pass a
+  // balance check and overdraw.
+  const debited = await User.findOneAndUpdate(
+    { _id: userId, balance: { $gte: amount } },
+    { $inc: { balance: -amount } },
+    { new: true },
+  );
+  if (!debited) {
+    return { outcome: 'insufficient', message: 'Insufficient balance' };
+  }
+
+  const reference = `wd-${crypto.randomUUID()}`;
+  const transaction = await Transaction.create({
+    userId,
+    amount,
+    type: 'debit',
+    direction: 'debit',
+    balanceAfter: debited.balance,
+    status: 'pending',
+    txRef: reference,
+    reference,
+    metadata: {
+      purpose: 'withdrawal',
+      source,
+      accountName: user.accountName || null,
+      bankCode: user.bankCode,
+      accountNumber: user.accountNumber,
+    },
+  });
+
+  try {
+    const response = await axios.post(`${flutterwaveBaseURL}transfers`, {
+      account_bank: user.bankCode,
+      account_number: user.accountNumber,
+      amount,
+      narration,
+      currency: 'NGN',
+      reference,
+    }, { headers: flwHeaders, timeout: GATEWAY_TIMEOUT_MS });
+
+    if (response.data?.status !== 'success') {
+      throw new Error(response.data?.message || 'Transfer was not accepted');
+    }
+
+    // `POST /transfers` only QUEUES the payout; Flutterwave confirms the real
+    // outcome asynchronously via the transfer webhook. The wallet is already
+    // debited as a hold, so record the gateway id and keep the withdrawal
+    // pending until the webhook (or the reconciliation sweep) settles it —
+    // marking it successful here would strand the user if the payout later
+    // failed at the bank, with no event to trigger a refund.
+    const transfer = response.data?.data;
+    if (transfer?.id) {
+      await Transaction.updateOne({ _id: transaction._id }, { $set: { gatewayTransactionId: String(transfer.id) } });
+    }
+
+    const transferStatus = String(transfer?.status || '').toUpperCase();
+    if (transferStatus === TRANSFER_SUCCESS) {
+      // Some rails settle instantly and report it right in the response.
+      await Transaction.updateOne(
+        { _id: transaction._id, status: 'pending' },
+        { $set: { status: 'successful', paidAt: new Date() } },
+      );
+      return { outcome: 'successful', message: 'Withdrawal successful', transactionId: transaction._id };
+    }
+    if (TRANSFER_FAILURES.includes(transferStatus)) {
+      const outcome = await reconcileWithdrawalOutcome(transaction, transferStatus, transfer);
+      return {
+        outcome: outcome === 'refunded' ? 'refunded' : 'queued',
+        message: 'Withdrawal could not be completed. Your balance was not affected.',
+        transactionId: transaction._id,
+      };
+    }
+
+    // Queued (NEW/PENDING): the transfer webhook finalizes or refunds it.
+    return {
+      outcome: 'queued',
+      message: 'Your withdrawal is being processed. It will reflect shortly.',
+      transactionId: transaction._id,
+    };
+  } catch (transferError) {
+    // A timeout or 5xx does not prove the transfer failed — the gateway may have
+    // accepted it and lost the response on the way back, in which case refunding
+    // the hold would pay the amount out twice. Resolve by reference first.
+    console.error('Withdrawal transfer failed:', transferError.response?.data || transferError.message);
+    const settled = await settleAmbiguousTransfer(userId, transaction, amount, reference);
+    if (settled === 'successful') {
+      return { outcome: 'successful', message: 'Withdrawal successful', transactionId: transaction._id };
+    }
+    if (settled === 'refunded') {
+      return {
+        outcome: 'refunded',
+        message: 'Withdrawal could not be completed. Your balance was not affected.',
+        transactionId: transaction._id,
+      };
+    }
+    // Still settling at the gateway: keep the hold and let reconciliation finish
+    // it rather than risking a double payout.
+    return {
+      outcome: 'queued',
+      message: 'Your withdrawal is being processed. It will reflect shortly.',
+      transactionId: transaction._id,
+    };
+  }
+}
+
 module.exports = {
   TRANSFER_SUCCESS,
   TRANSFER_FAILURES,
   WITHDRAWAL_RECONCILE_AFTER_MS,
   isWithdrawal,
+  executeWithdrawal,
   reconcileWithdrawalOutcome,
   settleAmbiguousTransfer,
   handleTransferEvent,

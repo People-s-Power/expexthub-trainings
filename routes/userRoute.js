@@ -5,6 +5,7 @@ const auth = require("../middlewares/auth.js");
 const authorize = require("../middlewares/authorize.js");
 const { TUTOR_ROLES, TUTOR_ONLY } = require("../utils/roles.js");
 const { validateObjectId } = require('../middlewares/validateRequest.js');
+const { generalLimiter } = require('../middlewares/rateLimiter.js');
 
 
 userRouter.get("/", (req, res) => {
@@ -20,12 +21,17 @@ userRouter.get("/instructors", auth, authorize(...TUTOR_ONLY), userControllers.g
 // Team members (impersonating a provider) also need the student directory to
 // enrol students on the provider's courses.
 userRouter.get("/students", auth, authorize(...TUTOR_ROLES), userControllers.getStudents);
+// Searchable, capped directory of every account — backs the Users filter in the
+// admissions menu. Tutor-and-above only: it exposes names and email addresses.
+userRouter.get("/directory", auth, authorize(...TUTOR_ROLES), generalLimiter, userControllers.searchUsers);
 userRouter.put("/updateProfile/:id", userControllers.upDateprofile);
 userRouter.put("/updateProfilePicture/:id", userControllers.updateProfilePhote);
 
 // get course student and instructors
 userRouter.put("/myinstructors", userControllers.getMyInstructors);
-userRouter.put("/mystudents", userControllers.getMyStudents);
+// The email-marketing audience. Authenticated: the response is a provider's
+// whole student list with contact details, which is not public data.
+userRouter.put("/mystudents", auth, userControllers.getMyStudents);
 userRouter.get("/tutorstudents/:id", userControllers.getTutorStudents);
 
 userRouter.put("/mymentees", userControllers.getMyMentees);
@@ -61,6 +67,10 @@ userRouter.delete('/team/:tutorId/:ownerId', auth, validateObjectId('tutorId', '
 userRouter.get('/team/:tutorId/:ownerId/:status', validateObjectId('tutorId', 'ownerId'), userControllers.updateTeamMemberStatus)
 
 userRouter.post('/send-mail', userControllers.sendMail);
+
+// Self-service password change from Settings. The controller re-checks the
+// current password, so this only ever changes the caller's own credentials.
+userRouter.put('/change-password', auth, generalLimiter, userControllers.changePassword);
 
 
 module.exports = userRouter;

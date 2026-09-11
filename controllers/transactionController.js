@@ -18,8 +18,10 @@ const {
 const {
   settleAmbiguousTransfer,
   handleTransferEvent,
+  executeWithdrawal,
   TRANSFER_FAILURES,
 } = require('../services/withdrawalService.js');
+const { buildAutoPayoutUpdate, serializeAutoPayout } = require('../services/autoPayoutService.js');
 const { finalizeWalletFunding } = require('../services/walletFundingService.js');
 const { verifyCharge, isChargeConfirmed } = require('../services/flutterwaveGateway.js');
 
@@ -673,7 +675,10 @@ const transactionController = {
           bankCode: user.bankCode,
           accountNumber: user.accountNumber,
           accountName: user.accountName
-        }
+        },
+        // Shipped with the balance so the wallet renders the schedule without a
+        // second round trip; the dedicated endpoint exists for updates and polls.
+        autoPayout: serializeAutoPayout(user)
       });
     } catch (error) {
       console.error('Get balance failed:', error);
@@ -861,96 +866,72 @@ const transactionController = {
       if (!ok || !canWithdrawWallet(user)) {
         return res.status(403).json({ message: 'You do not have permission to withdraw from the wallet' });
       }
-      if (!user.bankCode || !user.accountNumber) {
-        return res.status(400).json({ message: 'Please add your payout bank account first' });
-      }
 
-      const userId = user._id;
+      // Hold-then-transfer lives in withdrawalService so a scheduled auto payout
+      // takes the identical path; this endpoint only maps the outcome to a status.
+      const result = await executeWithdrawal({ user, amount, source: 'manual' });
 
-      // Debit first, conditionally on sufficient funds, so two concurrent
-      // withdrawal requests cannot both pass a balance check and overdraw.
-      const debited = await User.findOneAndUpdate(
-        { _id: userId, balance: { $gte: amount } },
-        { $inc: { balance: -amount } },
-        { new: true },
-      );
-      if (!debited) {
-        return res.status(400).json({ message: 'Insufficient balance' });
-      }
-
-      const reference = `wd-${crypto.randomUUID()}`;
-      const transaction = await Transaction.create({
-        userId: user._id,
-        amount,
-        type: 'debit',
-        direction: 'debit',
-        balanceAfter: debited.balance,
-        status: 'pending',
-        txRef: reference,
-        reference,
-        metadata: { purpose: 'withdrawal', accountName: user.accountName || null, bankCode: user.bankCode, accountNumber: user.accountNumber },
-      });
-
-      try {
-        const response = await axios.post(`${flutterwaveBaseURL}transfers`, {
-          account_bank: user.bankCode,
-          account_number: user.accountNumber,
-          amount,
-          narration: 'Withdrawal',
-          currency: 'NGN',
-          reference,
-        }, { headers: flwHeaders });
-
-        if (response.data?.status !== 'success') {
-          throw new Error(response.data?.message || 'Transfer was not accepted');
-        }
-
-        // `POST /transfers` only QUEUES the payout; Flutterwave confirms the real
-        // outcome asynchronously via the transfer webhook. The wallet is already
-        // debited as a hold, so record the gateway id and keep the withdrawal
-        // pending until the webhook (or the reconciliation sweep) settles it —
-        // marking it successful here would strand the user if the payout later
-        // failed at the bank, with no event to trigger a refund.
-        const transfer = response.data?.data;
-        if (transfer?.id) {
-          await Transaction.updateOne({ _id: transaction._id }, { $set: { gatewayTransactionId: String(transfer.id) } });
-        }
-
-        const transferStatus = String(transfer?.status || '').toUpperCase();
-        if (transferStatus === 'SUCCESSFUL') {
-          // Some rails settle instantly and report it right in the response.
-          await Transaction.updateOne({ _id: transaction._id, status: 'pending' }, { $set: { status: 'successful', paidAt: new Date() } });
-          return res.status(200).json({ message: 'Withdrawal successful' });
-        }
-        if (TRANSFER_FAILURES.includes(transferStatus)) {
-          // Rejected outright: release the hold once, guarded by the transition.
-          const failed = await Transaction.findOneAndUpdate({ _id: transaction._id, status: 'pending' }, { $set: { status: 'failed' } }, { new: true });
-          if (failed) await User.findByIdAndUpdate(userId, { $inc: { balance: amount } });
-          return res.status(502).json({ message: 'Withdrawal could not be completed. Your balance was not affected.' });
-        }
-
-        // Queued (NEW/PENDING): the transfer webhook finalizes or refunds it.
-        return res.status(202).json({ message: 'Your withdrawal is being processed. It will reflect shortly.' });
-      } catch (transferError) {
-        // A timeout or 5xx does not prove the transfer failed — the gateway may
-        // have accepted it and lost the response on the way back, in which case
-        // refunding the hold would pay the amount out twice. Resolve the
-        // transfer by reference before releasing the funds.
-        const outcome = await settleAmbiguousTransfer(userId, transaction, amount, reference);
-        console.error('Withdrawal transfer failed:', transferError.response?.data || transferError.message);
-        if (outcome === 'successful') {
-          return res.status(200).json({ message: 'Withdrawal successful' });
-        }
-        if (outcome === 'refunded') {
-          return res.status(502).json({ message: 'Withdrawal could not be completed. Your balance was not affected.' });
-        }
-        // Still settling at the gateway: keep the hold and let reconciliation
-        // finish it rather than risking a double payout.
-        return res.status(202).json({ message: 'Your withdrawal is being processed. It will reflect shortly.' });
-      }
+      if (result.outcome === 'no_account') return res.status(400).json({ message: result.message });
+      if (result.outcome === 'insufficient') return res.status(400).json({ message: result.message });
+      if (result.outcome === 'successful') return res.status(200).json({ message: result.message });
+      if (result.outcome === 'refunded') return res.status(502).json({ message: result.message });
+      return res.status(202).json({ message: result.message });
     } catch (error) {
       console.error('Error during withdrawal:', error.response?.data || error.message);
       return res.status(500).json({ message: 'Withdrawal failed. Please try again.' });
+    }
+  },
+
+  /**
+   * Read the wallet's payout schedule. Same authorization as viewing the wallet,
+   * since the schedule only describes money that is already visible there.
+   */
+  getAutoPayout: async (req, res) => {
+    try {
+      const { ok, user } = await resolveWalletTarget(req, 'View Wallet', req.query.userId);
+      if (!ok || !canAccessWallet(user)) {
+        return res.status(403).json({ message: 'You do not have permission to view this wallet' });
+      }
+      return res.status(200).json({
+        autoPayout: serializeAutoPayout(user),
+        hasPayoutAccount: Boolean(user.bankCode && user.accountNumber),
+      });
+    } catch (error) {
+      console.error('Get auto payout failed:', error.message);
+      return res.status(500).json({ message: 'Unable to load the payout schedule' });
+    }
+  },
+
+  /**
+   * Create or change the payout schedule.
+   *
+   * Gated on "Withdraw from Wallet", not "View Wallet": scheduling a payout moves
+   * money, so anyone who can set it must already be allowed to withdraw. Enabling
+   * without a saved payout account is refused up front rather than failing later
+   * at transfer time with no one watching.
+   */
+  updateAutoPayout: async (req, res) => {
+    try {
+      const { ok, user } = await resolveWalletTarget(req, 'Withdraw from Wallet', req.body.userId);
+      if (!ok || !canWithdrawWallet(user)) {
+        return res.status(403).json({ message: 'You do not have permission to manage payouts' });
+      }
+
+      const update = buildAutoPayoutUpdate(req.body, user.autoPayout);
+      if (update.enabled && !(user.bankCode && user.accountNumber)) {
+        return res.status(400).json({ message: 'Add your payout bank account before turning on automatic payouts' });
+      }
+
+      user.autoPayout = { ...(user.autoPayout?.toObject?.() || user.autoPayout || {}), ...update };
+      await user.save();
+
+      return res.status(200).json({
+        message: update.enabled ? 'Automatic payouts are on' : 'Automatic payouts are off',
+        autoPayout: serializeAutoPayout(user),
+      });
+    } catch (error) {
+      console.error('Update auto payout failed:', error.message);
+      return res.status(500).json({ message: 'Unable to save the payout schedule' });
     }
   },
 

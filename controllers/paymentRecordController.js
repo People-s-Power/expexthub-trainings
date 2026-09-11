@@ -20,6 +20,9 @@ const {
 
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
+// Cap on the money events joined per enrollment. Far above any real payment
+// history, and it stops one pathological row from dragging the whole page.
+const TIMELINE_LIMIT = 50;
 
 /**
  * Resolves the user whose courses a caller may view payment records for.
@@ -117,6 +120,72 @@ function parsePagination(query) {
  * change an outstanding balance. Scholarship places expect nothing by
  * definition, which is what keeps waived seats out of the owed column.
  */
+/**
+ * Every money event on one enrollment, newest first.
+ *
+ * This is what makes a repeat payment update a row instead of adding one: the
+ * table shows a single (course, student) row whose `paid`/`owed` already include
+ * every payment, and the detail modal expands that row into the individual events
+ * behind it. Part payments and full payments live in different collections, so
+ * they are normalized to a common shape here and merged on time.
+ */
+function buildTimeline(row, plan, fullPayments, scholarship) {
+  const events = [];
+
+  if (row.enrolledOn) {
+    events.push({
+      kind: 'enrollment',
+      label: scholarship ? 'Scholarship place granted' : 'Enrolled on the course',
+      amount: 0,
+      at: row.enrolledOn,
+      status: 'completed',
+    });
+  }
+
+  fullPayments.forEach((entry) => {
+    const offline = String(entry.metadata?.purpose || '').includes('settlement');
+    events.push({
+      kind: offline ? 'settlement' : 'full',
+      label: offline ? 'Balance settled offline' : 'Full payment',
+      amount: Number(entry.amount || 0),
+      at: entry.paidAt || entry.date || null,
+      status: 'completed',
+      reference: entry.reference || entry.txRef || null,
+      note: entry.metadata?.note || null,
+      recordedBy: entry.metadata?.settledByName || null,
+    });
+  });
+
+  // Only instalments that moved money, or are moving it right now. `pending`
+  // entries are intents the student never completed and would read as phantom
+  // payments in a timeline.
+  (plan?.installments || []).forEach((entry) => {
+    if (!['paid', 'processing'].includes(entry.status)) return;
+    // An admin recording an offline settlement writes a normal instalment; the
+    // txRef is the only marker that survives into the plan document.
+    const offline = String(entry.txRef || '').startsWith('admin-settle-');
+    events.push({
+      kind: offline ? 'settlement' : 'part',
+      label: offline
+        ? `Balance settled offline (#${entry.number})`
+        : entry.status === 'paid'
+          ? `Part payment #${entry.number}`
+          : `Part payment #${entry.number} in progress`,
+      amount: Number(entry.amountMinor || 0) / MINOR_UNIT,
+      at: entry.paidAt || entry.lastAttemptAt || null,
+      status: entry.status === 'paid' ? 'completed' : 'processing',
+      reference: entry.txRef || null,
+    });
+  });
+
+  // Undated rows sort last rather than jumping to the top as epoch 0.
+  return events.sort((a, b) => {
+    const left = a.at ? new Date(a.at).getTime() : -Infinity;
+    const right = b.at ? new Date(b.at).getTime() : -Infinity;
+    return right - left;
+  });
+}
+
 function buildRecord(row) {
   const student = row.student || {};
   const plan = row.plan || null;
@@ -125,9 +194,16 @@ function buildRecord(row) {
   // one response then feeds both the payments view and the graduates view.
   const graduate = student.graduate === true;
 
+  const fullPayments = Array.isArray(row.fullPayments) ? row.fullPayments : [];
+  const fullPaid = fullPayments.reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
+  const fullPaidLastAt = fullPayments.reduce((latest, entry) => {
+    const at = entry.paidAt || entry.date;
+    if (!at) return latest;
+    return !latest || new Date(at) > new Date(latest) ? at : latest;
+  }, null);
+
   const planTotalMinor = Number(plan?.totalAmountMinor || 0);
   const planPaidMinor = Number(plan?.amountPaidMinor || 0);
-  const fullPaid = Number(row.fullPaidTotal || 0);
 
   const expected = scholarship
     ? 0
@@ -144,6 +220,13 @@ function buildRecord(row) {
       : planPaidMinor > 0
         ? 'part'
         : 'unpaid';
+
+  const timeline = buildTimeline(row, plan, fullPayments, scholarship);
+  const paidEvents = timeline.filter(event => event.status === 'completed' && event.amount > 0);
+  const lastPaymentAt = paidEvents[0]?.at
+    || plan?.lastPaymentAt
+    || fullPaidLastAt
+    || null;
 
   return {
     courseId: row.courseId,
@@ -165,11 +248,13 @@ function buildRecord(row) {
     paid,
     owed,
     settled: owed <= 0,
-    payments: (plan?.installments || []).filter(entry => entry.status === 'paid').length
-      + (fullPaid > 0 ? 1 : 0),
+    payments: paidEvents.length,
+    timeline,
     planStatus: plan?.status || null,
+    planId: plan?._id || null,
     settlementDueAt: plan?.settlementDueAt || null,
-    lastPaymentAt: plan?.lastPaymentAt || row.fullPaidLastAt || null,
+    firstPaymentAt: plan?.firstPaymentAt || paidEvents[paidEvents.length - 1]?.at || null,
+    lastPaymentAt,
   };
 }
 
@@ -251,15 +336,28 @@ function recordPipeline(scope) {
               },
             },
           },
+          // Rows rather than a total: the row modal renders each payment as its
+          // own timeline entry, and the total is a sum of the same rows in
+          // buildRecord, so the table and the timeline can never disagree.
+          { $sort: { paidAt: -1, date: -1 } },
+          { $limit: TIMELINE_LIMIT },
           {
-            $group: {
-              _id: null,
-              total: { $sum: '$amount' },
-              lastAt: { $max: '$paidAt' },
+            $project: {
+              amount: 1,
+              paidAt: 1,
+              date: 1,
+              type: 1,
+              reference: 1,
+              txRef: 1,
+              currency: 1,
+              'metadata.purpose': 1,
+              'metadata.settledBy': 1,
+              'metadata.settledByName': 1,
+              'metadata.note': 1,
             },
           },
         ],
-        as: 'fullPayment',
+        as: 'fullPayments',
       },
     },
     {
@@ -286,8 +384,7 @@ function recordPipeline(scope) {
         scholarship: '$enrollments.scholarship',
         plan: { $first: '$plan' },
         student: { $first: '$student' },
-        fullPaidTotal: { $ifNull: [{ $first: '$fullPayment.total' }, 0] },
-        fullPaidLastAt: { $first: '$fullPayment.lastAt' },
+        fullPayments: { $ifNull: ['$fullPayments', []] },
       },
     },
   ];
@@ -334,6 +431,19 @@ const paymentRecordController = {
       const status = String(req.query.status || 'all').toLowerCase();
 
       let filtered = records;
+
+      // Exact-user filter behind the admissions Users selector. Kept separate
+      // from the free-text search so picking a name from the dropdown cannot be
+      // widened by a namesake, and so selecting a user with no enrollment on the
+      // caller's courses correctly returns nothing rather than a fuzzy match.
+      const studentId = String(req.query.studentId || '').trim();
+      if (studentId) {
+        if (!mongoose.Types.ObjectId.isValid(studentId)) {
+          return res.status(400).json({ message: 'Invalid student id' });
+        }
+        filtered = filtered.filter(record => String(record.student.id) === studentId);
+      }
+
       if (search) {
         filtered = filtered.filter(record =>
           record.student.fullname.toLowerCase().includes(search)
@@ -348,9 +458,23 @@ const paymentRecordController = {
       // whether a part payment or the full fee.
       else if (status === 'payers') filtered = filtered.filter(record => record.paid > 0);
 
-      // Largest balance first: the rows that need chasing are the point of the view.
-      filtered.sort((a, b) => b.owed - a.owed
-        || new Date(b.enrolledOn || 0) - new Date(a.enrolledOn || 0));
+      // Most recent payment first: a repeat payment updates its existing row and
+      // that row moves to the top, which is what "last payment events should
+      // always be first" means for a table of one row per (course, student).
+      // Rows nobody has paid on have no payment date, so they fall in behind on
+      // enrollment date rather than sorting as epoch 0 at the top.
+      const sortBy = String(req.query.sort || 'recent').toLowerCase();
+      const time = (value) => (value ? new Date(value).getTime() : 0);
+      if (sortBy === 'owed') {
+        filtered.sort((a, b) => b.owed - a.owed || time(b.enrolledOn) - time(a.enrolledOn));
+      } else if (sortBy === 'name') {
+        filtered.sort((a, b) => a.student.fullname.localeCompare(b.student.fullname));
+      } else {
+        filtered.sort((a, b) =>
+          time(b.lastPaymentAt) - time(a.lastPaymentAt)
+          || time(b.enrolledOn) - time(a.enrolledOn)
+          || b.owed - a.owed);
+      }
 
       const { page, limit, skip } = parsePagination(req.query);
       return res.json({
