@@ -4,6 +4,7 @@ const Notification = require("../models/notifications.js");
 const { addCourse } = require("./courseController.js");
 const dayjs = require("dayjs");
 const Course = require("../models/courses.js");
+const CoursePaymentPlan = require("../models/coursePaymentPlans.js");
 const { default: mongoose } = require("mongoose");
 const { create } = require("../models/category.js");
 const { sendEmailReminder } = require("../utils/sendEmailReminder.js");
@@ -408,11 +409,17 @@ const userControllers = {
         return res.status(400).json({ message: 'Invalid user id' });
       }
 
+      // Read the caller from the database rather than trusting the token claims,
+      // so a demotion takes effect immediately.
+      const caller = await User.findById(callerId).select('role teamMembers').lean();
+      if (!caller) {
+        return res.status(401).json({ message: 'Authentication required' });
+      }
+
       // Reading someone else's audience is only for an admin or an accepted team
       // member of that provider — a body-supplied id can never widen the scope.
-      if (requested !== callerId && req.user?.role !== 'admin') {
-        const actor = await User.findById(callerId).select('teamMembers').lean();
-        const isMember = (actor?.teamMembers || []).some(
+      if (requested !== callerId && caller.role !== 'admin') {
+        const isMember = (caller.teamMembers || []).some(
           (entry) => String(entry.ownerId) === requested && entry.status === 'accepted',
         );
         if (!isMember) {
@@ -420,17 +427,24 @@ const userControllers = {
         }
       }
 
-      // Match both id forms: prod stores course ownership as strings on some
-      // documents and ObjectIds on others, and $in against a single form hides
-      // whichever half does not match.
-      const idVariants = [requested, new mongoose.Types.ObjectId(requested)];
+      // An admin's audience is the whole platform, matching how the payments and
+      // admissions views scope (courseScopeFor returns an unfiltered match for
+      // admins). Without this an admin saw only courses they personally own,
+      // which is normally none — the courses belong to the provider accounts —
+      // so the mailing list came back empty for them.
+      const courseFilter = caller.role === 'admin' && requested === callerId
+        ? {}
+        : {
+          $or: [
+            // Match both id forms: prod stores course ownership as strings on
+            // some documents and ObjectIds on others, and $in against a single
+            // form hides whichever half does not match.
+            { instructorId: { $in: [requested, new mongoose.Types.ObjectId(requested)] } },
+            { assignedTutors: { $in: [requested, new mongoose.Types.ObjectId(requested)] } },
+          ],
+        };
 
-      const courses = await Course.find({
-        $or: [
-          { instructorId: { $in: idVariants } },
-          { assignedTutors: { $in: idVariants } },
-        ],
-      })
+      const courses = await Course.find(courseFilter)
         .select('title enrollments enrolledStudents')
         .populate({
           path: 'enrollments.user',
@@ -474,6 +488,28 @@ const userControllers = {
         (course.enrollments || []).forEach((enrollment) => add(enrollment?.user, course.title));
         (course.enrolledStudents || []).forEach((student) => add(student, course.title));
       });
+
+      // Second source: anyone holding a payment plan on these courses. A student
+      // who paid can exist only as a plan when the course's enrollment arrays
+      // lagged behind (the drift scripts/backfillEnrollmentDrift.js repairs), and
+      // someone who paid is squarely inside a provider's audience. Populated in
+      // one query rather than per course, and merged with the map above so a
+      // student found by both counts once.
+      if (courses.length) {
+        const plans = await CoursePaymentPlan.find({
+          courseId: { $in: courses.map((course) => course._id) },
+          status: { $in: ['pending', 'active', 'overdue', 'completed'] },
+        })
+          .select('userId courseId')
+          .populate({
+            path: 'userId',
+            select: "profilePicture fullname email phone gender age skillLevel country state address graduate blocked contact",
+          })
+          .lean();
+
+        const titleByCourse = new Map(courses.map((course) => [String(course._id), course.title]));
+        plans.forEach((plan) => add(plan?.userId, titleByCourse.get(String(plan.courseId))));
+      }
 
       // Blocked accounts are excluded: they cannot sign in, so mailing them is
       // sending a campaign nobody can act on.
