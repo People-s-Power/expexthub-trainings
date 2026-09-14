@@ -31,9 +31,19 @@ transactionRouter.put('/auto-payout', authenticate, walletLimiter, transactionCo
 // Wallet funding: starts a gateway checkout that credits the wallet on success.
 // `/initialize-payment` is the alias the deployed frontend already calls — both
 // paths resolve to the same controller so the existing contract keeps working.
+// No route-level `authorize`: this endpoint serves two audiences. A learner funds
+// their own wallet, while a provider funds a student's by naming a `studentId` —
+// and that second mode is gated inside the controller, where the actor's role and
+// the recipient's are both known. Gating the route would lock students out of
+// their own wallets.
 transactionRouter.post('/fund-wallet', authenticate, walletLimiter, transactionController.fundWallet);
 transactionRouter.post('/initialize-payment', authenticate, walletLimiter, transactionController.fundWallet);
 transactionRouter.get('/verify-wallet-funding/:txRef', transactionController.verifyWalletFunding);
+
+// The fundings this provider has made into student wallets, with their statuses.
+// Scoped to the caller's own rows — a provider cannot read a student's full
+// financial history here (that stays restricted in getBalance).
+transactionRouter.get('/funded-students', authenticate, authorize(...TUTOR_ROLES), generalLimiter, transactionController.listFundedStudents);
 
 // Course payment endpoints (student/client only)
 transactionRouter.post('/initialize-course-payment', authenticate, authorize('student', 'client'), paymentLimiter, validateObjectId('courseId'), transactionController.initializeCoursePayment);

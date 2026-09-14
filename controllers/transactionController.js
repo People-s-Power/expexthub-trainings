@@ -125,6 +125,41 @@ async function resolveWalletTarget(req, privilege, requestedTargetId) {
   return owner ? { ok: true, user: owner } : { ok: false };
 }
 
+/**
+ * Resolves a STUDENT whose wallet a provider may credit.
+ *
+ * Deliberately a separate resolver from `resolveWalletTarget`: that one answers
+ * "may this request act on this wallet as its owner?", which a provider funding a
+ * student's wallet is not. Here the caller is a third party depositing money, so
+ * the checks are about the *recipient* being a legitimate destination rather than
+ * about ownership. Keeping them apart is what stops a body-supplied id from
+ * turning the owner path into an arbitrary-wallet write.
+ *
+ * The role list matches the learner roles everywhere else in the codebase
+ * (`student` and `client` — see getStudents): the signup form posts "client" for
+ * applicants, so admitting only `student` would refuse real learners.
+ *
+ * Returns { ok: true, user } or { ok: false, status, message }.
+ */
+async function resolveFundableStudent(studentId) {
+  if (!isValidObjectId(studentId)) {
+    return { ok: false, status: 400, message: 'Invalid student' };
+  }
+
+  const student = await User.findById(studentId);
+  if (!student) {
+    return { ok: false, status: 404, message: 'Student not found' };
+  }
+  if (!['student', 'client'].includes(student.role)) {
+    return { ok: false, status: 400, message: 'Only a student wallet can be funded' };
+  }
+  if (student.blocked) {
+    return { ok: false, status: 403, message: 'This student account cannot receive funds' };
+  }
+
+  return { ok: true, user: student };
+}
+
 // Withdrawal settlement (settleAmbiguousTransfer, the transfer-webhook handler,
 // and the reconciliation sweep) lives in services/withdrawalService.js so the
 // cron can reuse it without importing this HTTP controller.
@@ -535,14 +570,116 @@ const transactionController = {
         return res.status(400).json({ message: `Amount cannot exceed ${WALLET_MAX_FUNDING}` });
       }
 
-      // The wallet being funded. Self-service by default; a delegated team
-      // member impersonating a provider may fund that provider's wallet when
-      // the membership grants "Fund Wallet".
-      const { ok, user } = await resolveWalletTarget(req, 'Fund Wallet', req.body.userId);
-      if (!ok || !canFundWallet(user)) {
-        return res.status(403).json({ message: 'You do not have permission to fund the wallet' });
+      // Who is being funded. Three modes, in priority order:
+      //
+      //  * a provider funding a STUDENT — `studentId` names somebody other than
+      //    the caller, so it is resolved and authorized separately (below);
+      //  * self-service — no target, or a target matching the caller;
+      //  * a delegated team member impersonating a provider, which
+      //    `resolveWalletTarget` already vets against the membership privileges.
+      const actorId = String(req.user?.id || req.user?._id);
+      const requestedStudentId = req.body.studentId;
+
+      let user;
+      // Non-null only for the provider→student mode. It is both the proof that
+      // the actor is a third party (which selects the wallet-transfer branch) and
+      // the provenance stamped on the ledger row so the provider can read back
+      // the fundings they made.
+      let fundedBy = null;
+
+      if (requestedStudentId && String(requestedStudentId) !== actorId) {
+        // A third party is depositing, so the actor's own privilege is the gate —
+        // not the recipient's. `canFundWallet` passes ordinary tutors/providers
+        // and admins, and requires an accepted membership granting "Fund Wallet"
+        // from a team member.
+        const actor = await User.findById(actorId).select('role teamMembers');
+        if (!actor || !['tutor', 'provider', 'admin', 'team_member'].includes(actor.role)) {
+          return res.status(403).json({ message: 'You do not have permission to fund a student wallet' });
+        }
+        if (!canFundWallet(actor)) {
+          return res.status(403).json({ message: 'You do not have permission to fund a student wallet' });
+        }
+
+        const student = await resolveFundableStudent(requestedStudentId);
+        if (!student.ok) {
+          return res.status(student.status).json({ message: student.message });
+        }
+        user = student.user;
+        fundedBy = actorId;
+      } else {
+        const { ok, user: owner } = await resolveWalletTarget(req, 'Fund Wallet', req.body.userId);
+        if (!ok || !canFundWallet(owner)) {
+          return res.status(403).json({ message: 'You do not have permission to fund the wallet' });
+        }
+        user = owner;
       }
       const userId = user._id;
+
+      // Paying from the provider's own balance is an internal transfer between two
+      // wallets on this platform, so it settles here instead of through a checkout
+      // — there is no gateway leg to wait on. Only reachable in provider→student
+      // mode; funding your own wallet from your own balance would be a no-op.
+      if (fundedBy && req.body.paymentMethod === 'wallet') {
+        // Conditional debit, exactly as `payWith` does it: two concurrent spends
+        // cannot both match on the same balance, so the wallet cannot go negative.
+        const debited = await User.findOneAndUpdate(
+          { _id: fundedBy, balance: { $gte: amount } },
+          { $inc: { balance: -amount } },
+          { new: true },
+        );
+        if (!debited) {
+          return res.status(400).json({ message: 'Insufficient wallet balance' });
+        }
+
+        let credited;
+        try {
+          credited = await User.findByIdAndUpdate(userId, { $inc: { balance: amount } }, { new: true });
+        } catch (creditError) {
+          // The student's credit is the whole point of the transfer, so if it
+          // fails the debit must not stand — put the provider's money back and
+          // report the failure rather than silently keeping it.
+          await User.findByIdAndUpdate(fundedBy, { $inc: { balance: amount } });
+          console.error('Wallet transfer credit failed, debit reversed:', creditError);
+          return res.status(500).json({ message: 'Transfer failed. Your balance has not been charged.' });
+        }
+
+        // One reference links the two legs; `txRef` stays unique per row because
+        // the schema indexes it that way.
+        const transferRef = `wallet-transfer-${fundedBy}-${crypto.randomUUID()}`;
+        await Transaction.create([
+          {
+            userId: fundedBy,
+            amount,
+            type: 'wallet_transfer_out',
+            direction: 'debit',
+            balanceAfter: debited.balance,
+            status: 'successful',
+            currency: 'NGN',
+            txRef: `${transferRef}-out`,
+            reference: transferRef,
+            metadata: { purpose: 'provider_student_funding', fundedTo: String(userId) },
+          },
+          {
+            userId,
+            amount,
+            type: 'wallet_funding',
+            direction: 'credit',
+            balanceAfter: credited?.balance ?? null,
+            status: 'successful',
+            paidAt: new Date(),
+            currency: 'NGN',
+            txRef: `${transferRef}-in`,
+            reference: transferRef,
+            metadata: { purpose: 'provider_student_funding', fundedBy },
+          },
+        ]);
+
+        return res.status(200).json({
+          message: 'Student wallet funded successfully',
+          balance: credited?.balance ?? null,
+          reference: transferRef,
+        });
+      }
 
       // Reuse a still-open checkout so repeated clicks or a tab return do not
       // stack several pending charges for the same amount.
@@ -551,6 +688,11 @@ const transactionController = {
         type: 'wallet_funding',
         status: 'pending',
         amount,
+        // Scoped to the same funder. A student's own abandoned checkout must not
+        // be handed to a provider as "yours" — the money would land correctly,
+        // but the row would lose the fundedBy provenance this feature reads back.
+        // A null matches rows with no funder, which is exactly the self-service case.
+        'metadata.fundedBy': fundedBy,
         'metadata.checkoutLink': { $exists: true },
         date: { $gte: new Date(Date.now() - CHECKOUT_REUSE_WINDOW_MS) },
       }).sort({ date: -1 });
@@ -567,15 +709,19 @@ const transactionController = {
         status: 'pending',
         currency: 'NGN',
         txRef,
-        metadata: { purpose: 'wallet_funding', redirect_url: req.body.redirect_url },
+        metadata: {
+          purpose: fundedBy ? 'provider_student_funding' : 'wallet_funding',
+          ...(fundedBy ? { fundedBy } : {}),
+          redirect_url: req.body.redirect_url,
+        },
       });
 
       const link = await initializeGatewayCheckout({
         txRef,
         amount,
         customer: { email: user.email, name: user.fullname, phone: user.phone },
-        description: 'Wallet funding',
-        meta: { userId: String(userId), purpose: 'wallet_funding' },
+        description: fundedBy ? 'Student wallet funding' : 'Wallet funding',
+        meta: { userId: String(userId), purpose: 'wallet_funding', ...(fundedBy ? { fundedBy } : {}) },
         redirectUrl: req.body.redirect_url,
       });
 
@@ -968,6 +1114,66 @@ const transactionController = {
     } catch (error) {
       console.error('Add funds failed:', error);
       return res.status(500).json({ message: 'Unable to add funds' });
+    }
+  },
+
+  /**
+   * The fundings this provider has made into student wallets, newest first.
+   *
+   * This exists instead of reading the student's wallet through `getBalance`,
+   * which is deliberately restricted to the owner and admins. Widening that would
+   * expose a student's entire financial history to any provider; this returns only
+   * the rows the caller themselves created, keyed on the `metadata.fundedBy`
+   * provenance stamped at funding time.
+   *
+   * Pending rows are included on purpose — a checkout that has not settled yet is
+   * exactly the status the provider needs to see.
+   */
+  listFundedStudents: async (req, res) => {
+    try {
+      const actorId = String(req.user?.id || req.user?._id);
+
+      const fundings = await Transaction.find({
+        'metadata.fundedBy': actorId,
+        type: 'wallet_funding',
+      })
+        .sort({ date: -1 })
+        .limit(100)
+        .lean();
+
+      if (fundings.length === 0) {
+        return res.status(200).json({ fundings: [] });
+      }
+
+      // One lookup for every student on the page rather than a findById per row.
+      const studentIds = [...new Set(fundings.map((entry) => String(entry.userId)))];
+      const students = await User.find({ _id: { $in: studentIds } })
+        .select('name fullname email')
+        .lean();
+      const byId = new Map(students.map((student) => [String(student._id), student]));
+
+      return res.status(200).json({
+        fundings: fundings.map((entry) => {
+          const student = byId.get(String(entry.userId));
+          return {
+            _id: entry._id,
+            studentId: entry.userId,
+            studentName: student?.name || student?.fullname || 'Student',
+            studentEmail: student?.email || null,
+            amount: entry.amount,
+            status: entry.status,
+            txRef: entry.txRef,
+            reference: entry.reference || null,
+            date: entry.date,
+            paidAt: entry.paidAt || null,
+            // Lets the provider reopen a checkout that is still awaiting payment.
+            checkoutLink: entry.metadata?.checkoutLink || null,
+          };
+        }),
+      });
+    } catch (error) {
+      console.error('List funded students failed:', error);
+      return res.status(500).json({ message: 'Unable to retrieve funded students' });
     }
   },
 
