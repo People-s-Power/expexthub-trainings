@@ -202,13 +202,18 @@ const eventsController = {
     const eventId = req.params.eventId;
     const { id } = req.body
     try {
+      if (!id) {
+        return res.status(400).json({ message: 'User ID is required' });
+      }
 
       const event = await LearningEvent.findById(eventId);
       const user = await User.findById(id);
 
-
       if (!event) {
         return res.status(404).json({ message: 'Event not found' });
+      }
+      if (!user) {
+        return res.status(404).json({ message: 'User not found' });
       }
 
       // Check if the student is already enrolled
@@ -264,11 +269,18 @@ const eventsController = {
     console.log(authorId);
 
     try {
-
       const events = await LearningEvent.find({ authorId })
-      console.log(events);
+        .populate({ path: 'enrolledStudents', select: "profilePicture fullname _id" })
+        .lean();
 
-      return res.status(200).json({ events });
+      const cleanedEvents = events.map(ev => ({
+        ...ev,
+        enrolledStudents: Array.isArray(ev.enrolledStudents)
+          ? ev.enrolledStudents.filter(Boolean)
+          : []
+      }));
+
+      return res.status(200).json({ events: cleanedEvents });
     } catch (error) {
       console.error(error);
       return res.status(500).json({ message: 'Unexpected error while fetching author events' });
