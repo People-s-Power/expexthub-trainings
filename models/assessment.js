@@ -18,12 +18,28 @@ const assessmentSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
     },
+    // Free-text guidance shown to the student before they start. Optional — the
+    // assignment email includes it only when the provider wrote one.
+    instructions: {
+      type: String,
+    },
     assesment: [
       {
         question: {
           type: String,
           required: true,
         },
+        // The canonical list of answer options, any length. Providers add and
+        // remove options here; `correctAnswerIndex` is an index into it.
+        options: [
+          {
+            type: String,
+          }
+        ],
+        // Legacy three-option fields. Still declared because assessments created
+        // before `options` existed store their answers here and must keep reading
+        // and writing cleanly. New questions never populate them; the controller's
+        // normalizeAssessment() projects them into `options` on the way out.
         answerA: {
           type: String,
         },
@@ -36,10 +52,17 @@ const assessmentSchema = new mongoose.Schema(
         correctAnswerIndex: {
           type: Number,
           validate: {
+            // Bounded by this question's own option count rather than a fixed
+            // three, so adding or removing an option stays valid. Documents
+            // written before `options` existed fall back to their three
+            // answerA/B/C fields.
             validator: function (value) {
-              return value >= 0 && value <= 2;
+              var count = Array.isArray(this.options) && this.options.length
+                ? this.options.length
+                : 3;
+              return value >= 0 && value < count;
             },
-            message: 'Correct answer index must be a valid index within the answers array.',
+            message: 'Correct answer index must point at one of the options.',
           },
         },
       }
@@ -61,6 +84,14 @@ const assessmentSchema = new mongoose.Schema(
           {
             answer: {
               type: String,
+            },
+            // Which question this answer belongs to. Answers used to be matched
+            // to questions by array position, so deleting a question from the
+            // middle shifted every later answer onto the wrong question in the
+            // scoring view. Older responses predate this field and still fall
+            // back to positional matching.
+            questionId: {
+              type: mongoose.Schema.Types.ObjectId,
             },
           }
         ]

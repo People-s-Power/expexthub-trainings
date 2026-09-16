@@ -1,0 +1,82 @@
+<!-- Assessment assigned body fragment: rendered inside the shared brand layout.
+     Tells the student an assessment is waiting, who assigned it, and links them
+     straight into it. Provider instructions are included only when set. -->
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#FFFFFF;">
+  <tr>
+    <td align="center" class="gutter" style="padding:40px 40px 8px 40px;">
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td width="56" height="56" align="center" valign="middle" style="width:56px; height:56px; background-color:#FDF3DA; border:1px solid #F3E2B4; border-radius:50%; font-family:Arial, Helvetica, sans-serif; font-size:26px; line-height:56px;">&#9998;</td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" class="gutter" style="padding:18px 40px 4px 40px; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:19px; font-weight:bold; letter-spacing:1.5px; color:#B4801A;">NEW ASSESSMENT</td>
+  </tr>
+  <tr>
+    <td align="center" class="gutter" style="padding:8px 40px 6px 40px; font-family:Arial, Helvetica, sans-serif; font-size:27px; line-height:36px; font-weight:bold; color:#111827;">{{assessmentTitle}}</td>
+  </tr>
+  <tr>
+    <td align="center" class="gutter" style="padding:4px 52px 20px 52px; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:23px; color:#4B5563;">
+      Hi {{firstName}}, {{tutorName}} has assigned you an assessment to complete.
+    </td>
+  </tr>
+
+  <!-- Assessment details -->
+  <tr>
+    <td align="center" class="gutter" style="padding:0 40px 8px 40px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #ECE7D8; border-radius:12px;">
+        <tr>
+          <td style="padding:18px 24px; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; color:#6B7280; border-bottom:1px solid #F0EDE4; width:42%;">Assessment</td>
+          <td style="padding:18px 24px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:20px; font-weight:bold; color:#111827; border-bottom:1px solid #F0EDE4;">{{assessmentTitle}}</td>
+        </tr>
+        <tr>
+          <td style="padding:14px 24px; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; color:#6B7280; {{#if questionCount}}border-bottom:1px solid #F0EDE4;{{/if}}">Type</td>
+          <td style="padding:14px 24px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:20px; color:#111827; {{#if questionCount}}border-bottom:1px solid #F0EDE4;{{/if}}">{{assessmentType}}</td>
+        </tr>
+        {{#if questionCount}}
+        <tr>
+          <td style="padding:14px 24px; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; color:#6B7280;">Questions</td>
+          <td style="padding:14px 24px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:20px; color:#111827;">{{questionCount}}</td>
+        </tr>
+        {{/if}}
+      </table>
+    </td>
+  </tr>
+
+  {{#if instructions}}
+  <tr>
+    <td align="center" class="gutter" style="padding:18px 40px 6px 40px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:22px; color:#111827; font-weight:bold;">Instructions</td>
+  </tr>
+  <tr>
+    <td align="center" class="gutter" style="padding:0 40px 6px 40px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#FBF9F2; border:1px solid #ECE7D8; border-radius:12px;">
+        <tr>
+          <td style="padding:16px 20px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:22px; color:#374151;">{{instructions}}</td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+  {{/if}}
+
+  <!-- CTA -->
+  <tr>
+    <td align="center" class="gutter" style="padding:20px 40px 10px 40px;">
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td align="center" bgcolor="#FDC332" style="border-radius:8px; background-color:#FDC332;">
+            <a href="{{ctaUrl}}" target="_blank" style="display:inline-block; padding:14px 32px; font-family:Arial, Helvetica, sans-serif; font-size:15px; font-weight:bold; line-height:20px; color:#111827; text-decoration:none; border-radius:8px;">{{ctaLabel}}</a>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+
+  <tr>
+    <td align="center" class="gutter" style="padding:18px 48px 40px 48px; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; color:#6B7280;">
+      If the button does not work, copy this link into your browser:<br/>
+      <a href="{{ctaUrl}}" style="color:#111827; text-decoration:underline; word-break:break-all;">{{ctaUrl}}</a>
+    </td>
+  </tr>
+</table>
