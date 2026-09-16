@@ -25,20 +25,25 @@ const MAX_LIMIT = 100;
 const TIMELINE_LIMIT = 50;
 
 /**
- * Resolves the user whose courses a caller may view payment records for.
+ * Resolves the user whose courses a caller may act on for payment records.
  *
  * Admins scope the whole platform. A tutor/provider scopes their own courses.
  * A team member acting for a provider keeps their own JWT while the dashboard
  * shows the provider, so the acting owner arrives explicitly as `ownerId`
  * (mirroring /auth/add-team's ownerId). The member is allowed only when the
- * owner added them, the invitation was accepted, and the membership grants the
- * "View Payments" privilege — and the scope is the owner's courses, never the
- * member's own.
+ * owner added them, the invitation was accepted, and the membership grants
+ * `privilege` — and the scope is the owner's courses, never the member's own.
+ *
+ * `privilege` is what separates reading from collecting: "View Payments" opens
+ * the records, and "Collect Payment Balance" additionally permits recording an
+ * offline settlement. They are separate grants on purpose, so a provider can
+ * let a team member reconcile the list without also letting them write money
+ * into the ledger.
  *
  * Returns `{ ok, status, message, caller, scoper }`.
  */
-async function authorizePaymentView(callerId, requestedOwnerId) {
-  const caller = await User.findById(callerId).select('role teamMembers');
+async function authorizeOwnerPrivilege(callerId, requestedOwnerId, privilege, denialMessage) {
+  const caller = await User.findById(callerId).select('role teamMembers fullname');
   if (!caller) {
     return { ok: false, status: 401, message: 'Authentication required' };
   }
@@ -52,19 +57,19 @@ async function authorizePaymentView(callerId, requestedOwnerId) {
     : actorId;
 
   // Admin is handled above. Anyone asking for a different owner must be an
-  // accepted member of that owner holding the "View Payments" privilege.
+  // accepted member of that owner holding this privilege.
   if (ownerId !== actorId) {
     if (caller.role !== 'team_member') {
-      return { ok: false, status: 403, message: 'You do not have permission to view these payments' };
+      return { ok: false, status: 403, message: denialMessage };
     }
     const ownerEntry = (caller.teamMembers || []).find(
       (entry) =>
         String(entry.ownerId) === ownerId && entry.status === 'accepted'
     );
     const granted = ownerEntry && Array.isArray(ownerEntry.privileges)
-      && ownerEntry.privileges.some(p => p.value === 'View Payments' && p.checked);
+      && ownerEntry.privileges.some(p => p.value === privilege && p.checked);
     if (!granted) {
-      return { ok: false, status: 403, message: 'You do not have permission to view payments' };
+      return { ok: false, status: 403, message: denialMessage };
     }
     const owner = await User.findById(ownerId).select('role');
     if (!owner) {
@@ -78,6 +83,15 @@ async function authorizePaymentView(callerId, requestedOwnerId) {
   // so an empty scope) keep the historical behaviour.
   return { ok: true, caller, scoper: caller };
 }
+
+/** Reading the records requires the owner's "View Payments" grant. */
+const authorizePaymentView = (callerId, requestedOwnerId) =>
+  authorizeOwnerPrivilege(
+    callerId,
+    requestedOwnerId,
+    'View Payments',
+    'You do not have permission to view these payments'
+  );
 
 /**
  * Who this caller is allowed to see payment records for.
@@ -534,25 +548,42 @@ const paymentRecordController = {
   },
 
   /**
-   * Admin records an offline settlement of a student's outstanding balance.
+   * Records an offline settlement of a student's outstanding balance.
    *
-   * Money collected outside the gateway (bank transfer handed to the admin,
+   * Money collected outside the gateway (bank transfer handed to the provider,
    * cash reconciliation) still has to land in the same ledger the gateway
    * writes to, or the balance the payment records show drifts from reality.
    * This writes a successful `course_installment` transaction and settles it
    * against the plan through the same code path a webhook uses, so idempotency,
    * instructor credit and enrollment all behave identically.
    *
-   * The amount is clamped to the outstanding balance: an admin action must not
-   * be able to overpay a plan, and the final payment is exempt from the
-   * minimum-payment floor by design.
+   * Who may do it: an admin anywhere, a tutor/provider on their own courses, or
+   * a team member the owner has granted "Collect Payment Balance" — the same
+   * three audiences that can already read the records, narrowed by a separate
+   * grant because this one moves money. The route deliberately admits the whole
+   * tutor family and leaves the privilege check here, where the acting owner and
+   * the caller's role are both known.
+   *
+   * The course is resolved through the caller's own scope rather than by id
+   * alone. Without that, a team member holding the privilege could settle a
+   * balance on any course on the platform by sending its id — the privilege
+   * says who may collect, the scope says on what.
+   *
+   * The amount is clamped to the outstanding balance: this must not be able to
+   * overpay a plan, and the final payment is exempt from the minimum-payment
+   * floor by design.
    */
   settleStudentBalance: async (req, res) => {
     try {
       const callerId = req.user?.id || req.user?._id;
-      const caller = await User.findById(callerId).select('role');
-      if (!caller) return res.status(401).json({ message: 'Authentication required' });
-      if (caller.role !== 'admin') return res.status(403).json({ message: 'Only admins may settle a balance' });
+      const authz = await authorizeOwnerPrivilege(
+        callerId,
+        req.body.ownerId,
+        'Collect Payment Balance',
+        'You do not have permission to record payments'
+      );
+      if (!authz.ok) return res.status(authz.status).json({ message: authz.message });
+      const { caller, scoper } = authz;
 
       const { courseId, studentId } = req.body;
       if (!mongoose.Types.ObjectId.isValid(String(courseId))) {
@@ -563,7 +594,7 @@ const paymentRecordController = {
       }
 
       const [course, student] = await Promise.all([
-        Course.findById(courseId).select('title fee instructorId'),
+        Course.findOne(courseScopeFor(scoper, courseId)).select('title fee instructorId'),
         User.findById(studentId).select('fullname email role'),
       ]);
       if (!course) return res.status(404).json({ message: 'Course not found' });
@@ -603,6 +634,11 @@ const paymentRecordController = {
       const amountMajor = toMajorUnits(amountMinor);
 
       const paymentNumber = nextPaymentNumber(plan);
+      // The `admin-settle-` prefix and the `admin_balance_settlement` purpose
+      // below are read back by buildTimeline (a txRef prefix test and a purpose
+      // substring) and already exist on settled rows, so they stay as they are
+      // even though a team member may now be the one recording the payment.
+      // They identify an offline settlement, not the actor — `settledBy` does.
       const txRef = `admin-settle-${plan._id}-${paymentNumber}-${crypto.randomUUID()}`;
 
       const transaction = await Transaction.create({
@@ -619,7 +655,10 @@ const paymentRecordController = {
         metadata: {
           title: course.title,
           paymentNumber,
+          // The actual actor, which is what an audit needs — for a team member
+          // this is the member, not the provider they are acting for.
           settledBy: String(callerId),
+          settledByName: caller.fullname || null,
           purpose: 'admin_balance_settlement',
           offline: true,
         },
