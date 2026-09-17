@@ -8,9 +8,19 @@ const { sendEmailReminder } = require("../utils/sendEmailReminder.js");
 const appointmentControllers = {
   bookAppointment: async (req, res) => {
     try {
-      const appointment = req.body
-      const user = await User.findById(req.body.from);
-      const tutor = await User.findById(req.body.to);
+      const actorId = String(req.user?.id || '');
+      const { to, mode, category, reason, date, time, location, room, phone } = req.body;
+      if (!actorId || !to || !mode || !category || !reason || !date || !time) {
+        return res.status(400).json({ message: 'Mode, category, reason, date, and time are required' });
+      }
+      const scheduledAt = new Date(`${date}T${time}`);
+      if (Number.isNaN(scheduledAt.getTime()) || scheduledAt <= new Date()) {
+        return res.status(400).json({ message: 'Appointment must be scheduled for a future date and time' });
+      }
+      const user = await User.findById(actorId);
+      const tutor = await User.findById(to);
+      if (!user || !tutor) return res.status(404).json({ message: 'Appointment participant not found' });
+      const appointment = { from: actorId, to, mode, category, reason: String(reason).trim(), date, time, location, room, phone };
 
       const newAppointment = await Appointment.create(appointment)
       if (newAppointment.mode === "online") {
@@ -46,6 +56,9 @@ const appointmentControllers = {
   getAppointments: async (req, res) => {
     try {
       const id = req.params.id
+      if (String(req.user?.id) !== String(id) && req.user?.role !== 'admin') {
+        return res.status(403).json({ message: 'You do not have permission to view these appointments' });
+      }
 
       const appointment = await Appointment.find({
         $or: [{ from: id }, { to: id }]
@@ -64,6 +77,10 @@ const appointmentControllers = {
       const id = req.params.id
 
       const appointment = await Appointment.findById(id).populate({ path: 'from to', select: "profilePicture fullname _id" }).lean();;
+      if (!appointment) return res.status(404).json({ message: 'Appointment not found' });
+      if (req.user?.role !== 'admin' && String(appointment.from?._id) !== String(req.user?.id) && String(appointment.to?._id) !== String(req.user?.id)) {
+        return res.status(403).json({ message: 'You do not have permission to view this appointment' });
+      }
 
       return res.status(200).json({ appointment });
 
@@ -74,14 +91,16 @@ const appointmentControllers = {
   },
 
   editAppointmet: async (req, res) => {
-    const appointment = await Appointment.find({ _id: req.params.id })
+    const appointment = await Appointment.findById(req.params.id)
+
+    if (!appointment) return res.status(404).json({ message: 'Appointment not found' });
+    if (String(appointment.from) !== String(req.user?.id) && req.user?.role !== 'admin') {
+      return res.status(403).json({ message: 'Only the appointment creator can edit it' });
+    }
 
     const user = await User.findById(appointment.from);
     const tutor = await User.findById(appointment.to);
 
-    if (!appointment) {
-      return res.status(404).json({ message: 'Appointment not found' });
-    }
     try {
       const updateAppointment = await Appointment.updateOne({
         _id: req.params.id
@@ -117,7 +136,12 @@ const appointmentControllers = {
       }
 
       // Attempt to delete the appointment
-      const appointment = await Appointment.deleteOne({ _id: req.params.id });
+    const existing = await Appointment.findById(req.params.id);
+    if (!existing) return res.status(404).json({ message: 'Appointment not found' });
+    if (String(existing.from) !== String(req.user?.id) && req.user?.role !== 'admin') {
+      return res.status(403).json({ message: 'Only the appointment creator can delete it' });
+    }
+    const appointment = await Appointment.deleteOne({ _id: req.params.id });
 
       if (appointment.deletedCount === 0) {
         return res.status(404).json({ message: 'Appointment not found' });
@@ -132,7 +156,11 @@ const appointmentControllers = {
 
   updateUserAvailability: async (req, res) => {
     try {
+      if (String(req.params.id) !== String(req.user?.id) && req.user?.role !== 'admin') {
+        return res.status(403).json({ message: 'You do not have permission to update this availability' });
+      }
       const user = await User.findById(req.params.id);
+      if (!user) return res.status(404).json({ message: 'User not found' });
       user.days = req.body.days;
       user.mode = req.body.mode;
       user.room = req.body.room;

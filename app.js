@@ -24,6 +24,7 @@ const appointmentRouter = require("./routes/appointmentRouter.js");
 const certificateRouter = require("./routes/certificateRouter.js");
 const startUpKitRouter = require("./routes/startupkit.js");
 const workspaceRouter = require("./routes/workspaceRoute.js");
+const partnerRouter = require("./routes/partnerRoute.js");
 
 const Chat = require("./models/chat");
 const User = require("./models/user");
@@ -124,6 +125,7 @@ app.use("/appointment", appointmentRouter);
 app.use("/certificate", certificateRouter);
 app.use("/start-up-kit", startUpKitRouter);
 app.use("/workspace", workspaceRouter);
+app.use("/partner", partnerRouter);
 
 app.get("/health", (req, res) => {
   const states = ["disconnected", "connected", "connecting", "disconnecting"];

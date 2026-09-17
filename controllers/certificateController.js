@@ -4,6 +4,12 @@ const Notification = require("../models/notifications.js");
 const certificateController = {
   claimCetificate: async (req, res) => {
     try {
+      const isRecipient = String(req.body.user) === String(req.user?.id);
+      const isIssuingTutor = ['tutor', 'provider'].includes(req.user?.role)
+        && String(req.body.tutor) === String(req.user?.id);
+      if (!isRecipient && !isIssuingTutor && req.user?.role !== 'admin') {
+        return res.status(403).json({ message: 'You do not have permission to issue this certificate' });
+      }
       // Check if the certificate already exists
       const cert = await Ceritificate.findOne({ user: req.body.user, title: req.body.title });
 
@@ -43,6 +49,9 @@ const certificateController = {
   },
   getUserCetificate: async (req, res) => {
     try {
+      if (String(req.params.id) !== String(req.user?.id) && req.user?.role !== 'admin') {
+        return res.status(403).json({ message: 'You do not have permission to view these certificates' });
+      }
       const certificate = await Ceritificate.find({ user: req.params.id }).populate({
         path: 'tutor',
         select: "signature fullname _id"
@@ -57,9 +66,12 @@ const certificateController = {
 
   deleteOne: async (req, res) => {
     try {
-      const course = await Ceritificate.deleteOne({
-        _id: req.params.id
-      })
+      const certificate = await Ceritificate.findById(req.params.id);
+      if (!certificate) return res.status(404).json({ message: 'Certificate not found' });
+      if (String(certificate.user) !== String(req.user?.id) && req.user?.role !== 'admin') {
+        return res.status(403).json({ message: 'You do not have permission to delete this certificate' });
+      }
+      const course = await Ceritificate.deleteOne({ _id: req.params.id })
       res.json(course);
     } catch (error) {
       console.error(error);

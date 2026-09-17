@@ -259,7 +259,7 @@ function issueAccessToken(user) {
 }
 
 // Roles allowed to register somebody else and have their credentials emailed.
-const REGISTRAR_ROLES = ['admin', 'tutor', 'provider', 'team_member'];
+const REGISTRAR_ROLES = ['admin', 'tutor', 'provider', 'team_member', 'partner'];
 
 /**
  * Resolves the signed-in training provider behind an assisted registration.
