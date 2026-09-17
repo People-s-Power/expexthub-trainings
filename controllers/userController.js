@@ -11,6 +11,35 @@ const { sendEmailReminder } = require("../utils/sendEmailReminder.js");
 const { default: axios } = require("axios");
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
 
+/**
+ * Escapes a value for interpolation into the mail HTML. Scoped to the metadata
+ * the template interpolates — subject, sender name, CTA label and link. The
+ * message body is the provider's own markdown, converted by `marked`, and stays
+ * as written.
+ */
+const escapeHtml = (value) => String(value == null ? '' : value).replace(
+  /[&<>"']/g,
+  (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char])
+);
+
+/**
+ * Builds the optional call-to-action button from the provider's pair of fields.
+ *
+ * All-or-nothing: a button with no destination is a dead end for the recipient
+ * and a destination with no label renders an empty button, so a partial pair is
+ * dropped rather than half-rendered. The link is restricted to http(s) because
+ * it is interpolated into markup — that check is what keeps a `javascript:` URL
+ * out of an outgoing mail.
+ *
+ * Returns null when no button should be rendered.
+ */
+const buildCta = (ctaText, ctaUrl) => {
+  const text = typeof ctaText === 'string' ? ctaText.trim() : '';
+  const url = typeof ctaUrl === 'string' ? ctaUrl.trim() : '';
+  if (!text || !url || !/^https?:\/\/\S+$/i.test(url)) return null;
+  return { text, url };
+};
+
 const userControllers = {
 
   // To get user profile
@@ -1244,7 +1273,7 @@ const userControllers = {
 
   sendMail: async (req, res) => {
     try {
-      const { emails, subject, content, senderId } = req.body;
+      const { emails, subject, content, senderId, ctaText, ctaUrl } = req.body;
 
       // Validate required fields
       if (!emails || !Array.isArray(emails) || emails.length === 0) {
@@ -1283,6 +1312,22 @@ const userControllers = {
       // Append sender name to subject
       const fullSubject = `${subject} - From ${sender.fullname}`;
 
+      const cta = buildCta(ctaText, ctaUrl);
+
+      // Email carries two renderings of the same message. The HTML part gets a
+      // real button; the plain-text part — the one a text-only client shows —
+      // gets the label and the link written out, so the call to action survives
+      // wherever the client cannot draw a button.
+      const ctaHtml = cta
+        ? `
+              <div style="text-align: center; margin: 28px 0 24px 0;">
+                <a href="${escapeHtml(cta.url)}" target="_blank" rel="noopener noreferrer" style="background-color: #FDC332; color: #1a1a1a; padding: 14px 32px; border-radius: 6px; font-weight: 700; font-size: 16px; text-decoration: none; display: inline-block;">
+                  ${escapeHtml(cta.text)}
+                </a>
+              </div>`
+        : '';
+      const ctaPlain = cta ? `\n\n${cta.text}: ${cta.url}` : '';
+
       // Send emails to all recipients
       const emailPromises = emails.map(async (email) => {
         const mailOptions = {
@@ -1292,13 +1337,13 @@ const userControllers = {
           subject: fullSubject,
           html: `
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; line-height: 1.6;">
-              <h2 style="color: #333; border-bottom: 2px solid #FDC332; padding-bottom: 10px;">${fullSubject}</h2>
+              <h2 style="color: #333; border-bottom: 2px solid #FDC332; padding-bottom: 10px;">${escapeHtml(fullSubject)}</h2>
               <div style="background-color: #f9f9f9; padding: 10px; border-radius: 8px; margin: 20px 0;">
                 ${htmlContent}
-              </div>
+              </div>${ctaHtml}
               <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
               <p style="color: #666; font-size: 12px; text-align: center;">
-                This email was sent by <strong>${sender.fullname}</strong> via ExperthubLLC Training Platform.
+                This email was sent by <strong>${escapeHtml(sender.fullname)}</strong> via ExperthubLLC Training Platform.
               </p>
             </div>
             <style>
@@ -1332,7 +1377,7 @@ const userControllers = {
               em { color: #555; }
             </style>
           `,
-          text: `${plainTextContent}\n\n---\nThis email was sent by ${sender.fullname} via ExperthubLLC Training Platform.`
+          text: `${plainTextContent}${ctaPlain}\n\n---\nThis email was sent by ${sender.fullname} via ExperthubLLC Training Platform.`
         };
 
         try {
