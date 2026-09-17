@@ -64,10 +64,20 @@ const walletLimiter = createRateLimiter({
   message: 'Too many wallet operations. Please wait a few minutes and try again.',
 });
 
+// Each send drives the shared mail server for every recipient on it, so one
+// account looping this endpoint can burn the sending reputation the whole
+// platform depends on. The composer needs one request per mail, however many
+// recipients it carries, so this budget is far above real use.
+const mailLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: 'Too many send attempts. Please wait a few minutes and try again.',
+});
+
 const generalLimiter = createRateLimiter({
   windowMs: 15 * 60 * 1000,
   max: 300,
   message: 'Too many requests. Please try again later.',
 });
 
-module.exports = { createRateLimiter, paymentLimiter, walletLimiter, generalLimiter };
+module.exports = { createRateLimiter, paymentLimiter, walletLimiter, mailLimiter, generalLimiter };

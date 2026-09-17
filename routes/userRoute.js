@@ -5,7 +5,7 @@ const auth = require("../middlewares/auth.js");
 const authorize = require("../middlewares/authorize.js");
 const { TUTOR_ROLES, TUTOR_ONLY } = require("../utils/roles.js");
 const { validateObjectId } = require('../middlewares/validateRequest.js');
-const { generalLimiter } = require('../middlewares/rateLimiter.js');
+const { generalLimiter, mailLimiter, paymentLimiter } = require('../middlewares/rateLimiter.js');
 
 
 userRouter.get("/", (req, res) => {
@@ -15,7 +15,14 @@ userRouter.get("/", (req, res) => {
 
 //User controllers routes
 userRouter.get("/profile/:id", auth, validateObjectId('id'), userControllers.getProfile);
-userRouter.post("/premium", userControllers.updateTutorLevel);
+// Activation reads the tier from the verified Flutterwave charge, but the
+// account it writes to has to be the caller's — so it needs to know who is
+// calling. Each call also hits Flutterwave's verify API, hence the tighter cap.
+userRouter.post("/premium", auth, paymentLimiter, userControllers.updateTutorLevel);
+
+// The support chat widget asks for its identity hash. Authenticated, because the
+// hash is over the caller's own id — it is never issued for somebody else.
+userRouter.get("/chat-identity", auth, userControllers.getChatIdentity);
 
 userRouter.get("/instructors", auth, authorize(...TUTOR_ONLY), userControllers.getInstructors);
 // Team members (impersonating a provider) also need the student directory to
@@ -66,7 +73,9 @@ userRouter.delete('/team/:tutorId/:ownerId', auth, validateObjectId('tutorId', '
 // the invitation exists before changing any status.
 userRouter.get('/team/:tutorId/:ownerId/:status', validateObjectId('tutorId', 'ownerId'), userControllers.updateTeamMemberStatus)
 
-userRouter.post('/send-mail', userControllers.sendMail);
+// The caller is the sender, and the caller's plan is checked in the controller
+// before a single message goes out.
+userRouter.post('/send-mail', auth, authorize(...TUTOR_ROLES), mailLimiter, userControllers.sendMail);
 
 // Self-service password change from Settings. The controller re-checks the
 // current password, so this only ever changes the caller's own credentials.

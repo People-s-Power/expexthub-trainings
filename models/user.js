@@ -21,7 +21,10 @@ const userSchema = new mongoose.Schema({
   },
   flutterwaveSubscriptionId: {
     type: String,
-    required: false
+    required: false,
+    // Activation checks this to make sure a subscription is not already backing
+    // another account, so it is looked up by value on every upgrade.
+    index: true
   },
   isYearly: {
     type: String,

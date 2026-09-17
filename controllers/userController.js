@@ -9,7 +9,15 @@ const { default: mongoose } = require("mongoose");
 const { create } = require("../models/category.js");
 const { sendEmailReminder } = require("../utils/sendEmailReminder.js");
 const { default: axios } = require("axios");
+const crypto = require("crypto");
+const { hasPaidPlan, planNameForId } = require("../utils/plans.js");
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
+
+// One request can address every recipient in the composer's list, so the cap
+// only ever catches a caller scripting the endpoint directly. It exists because
+// this endpoint drives a shared mail server: an unbounded batch from one account
+// is a deliverability problem for every other account on it.
+const MAX_RECIPIENTS_PER_SEND = 500;
 
 /**
  * Escapes a value for interpolation into the mail HTML. Scoped to the metadata
@@ -829,9 +837,39 @@ const userControllers = {
       return res.status(500).json({ message: 'Unexpected error' });
     }
   },
+
+  /**
+   * Activates a purchased plan.
+   *
+   * Everything that decides the outcome is read from Flutterwave rather than
+   * from the request: the tier comes from the plan id on the *verified*
+   * transaction, and the subscription must be one Flutterwave opened for that
+   * transaction's customer. The caller only says which account to activate, and
+   * that has to be their own.
+   *
+   * The route is authenticated. This still re-checks that the account in the
+   * body is the caller's, because the two checks answer different questions —
+   * `auth` establishes *who* is calling, and this one establishes *whose* plan
+   * they are allowed to change.
+   */
   updateTutorLevel: async (req, res) => {
     try {
-      const { id: userId, txId: transactionId, plan } = req.body;
+      const { id: userId, txId: transactionId } = req.body;
+
+      const callerId = req.user?.id || req.user?._id;
+      if (!callerId) {
+        return res.status(401).json({ message: 'Authentication required' });
+      }
+
+      if (!userId || String(userId) !== String(callerId)) {
+        // Premium is an upgrade to one's own account; activating it on someone
+        // else's account is account takeover by purchase.
+        return res.status(403).json({ message: 'You can only change your own plan' });
+      }
+
+      if (!transactionId) {
+        return res.status(400).json({ message: 'A transaction id is required' });
+      }
 
       const user = await User.findById(userId);
       if (!user) {
@@ -840,7 +878,7 @@ const userControllers = {
 
       // Step 1: Verify transaction
       const verifyResponse = await axios.get(
-        `https://api.flutterwave.com/v3/transactions/${transactionId}/verify`,
+        `https://api.flutterwave.com/v3/transactions/${encodeURIComponent(transactionId)}/verify`,
         {
           headers: {
             Authorization: `Bearer ${flutterwaveSecretKey}`,
@@ -860,9 +898,32 @@ const userControllers = {
         return res.status(400).json({ message: 'Missing customer email or plan ID in transaction' });
       }
 
+      // The tier is the plan on the charge. Reading it from the request body
+      // instead — as this did — let a Standard payment activate Enterprise,
+      // because nothing tied the posted name to the money that was paid.
+      const plan = planNameForId(planId);
+      if (!plan) {
+        console.error(`Premium activation refused: transaction ${transactionId} is on unrecognised plan id ${planId}`);
+        return res.status(400).json({
+          message: 'We could not match this payment to a plan. Please contact support with your transaction reference.',
+        });
+      }
+
+      // The charge has to have been made by this account. The checkout is
+      // pre-filled with the signed-in provider's address, so a mismatch means
+      // the payment belongs to somebody else — and attaching it here would both
+      // hand over a plan that was not bought and block the account it does
+      // belong to from activating it.
+      if (String(customerEmail).toLowerCase() !== String(user.email || '').toLowerCase()) {
+        console.error(`Premium activation refused: transaction ${transactionId} was paid by ${customerEmail} but account ${userId} is ${user.email}`);
+        return res.status(403).json({
+          message: 'This payment was made with a different email address from the one on your account. Please contact support with your transaction reference.',
+        });
+      }
+
       // Step 2: Fetch subscriptions for this customer
       const subscriptionsRes = await axios.get(
-        `https://api.flutterwave.com/v3/subscriptions?email=${customerEmail}`,
+        `https://api.flutterwave.com/v3/subscriptions?email=${encodeURIComponent(customerEmail)}`,
         {
           headers: {
             Authorization: `Bearer ${flutterwaveSecretKey}`,
@@ -870,18 +931,35 @@ const userControllers = {
         }
       );
 
-      const subscriptions = subscriptionsRes.data.data;
+      const subscriptions = subscriptionsRes.data.data || [];
 
       const matchingSubscription = subscriptions.find(
-        (sub) => sub.plan === planId && sub.status === 'active'
+        (sub) => String(sub.plan) === String(planId) && sub.status === 'active'
       );
 
+      // This exact wording is a contract with the checkout, which retries on
+      // this one message: Flutterwave opens the subscription as the charge
+      // settles, so the first read back can land a beat early.
       if (!matchingSubscription) {
         return res.status(400).json({ message: 'No matching subscription found' });
       }
 
+      // A subscription backs exactly one account. Moving one that is already in
+      // use would silently leave the account holding it unable to renew.
+      const claimedBy = await User.findOne({
+        flutterwaveSubscriptionId: matchingSubscription.id,
+        _id: { $ne: userId },
+      }).select('_id');
+
+      if (claimedBy) {
+        console.error(`Premium activation refused: subscription ${matchingSubscription.id} is already attached to account ${claimedBy._id}`);
+        return res.status(409).json({
+          message: 'This subscription is already in use on another account. Please contact support.',
+        });
+      }
+
       // Step 3: Update user data
-      user.premiumPlan = plan?.toLowerCase() || 'basic';
+      user.premiumPlan = plan;
       user.flutterwaveSubscriptionId = matchingSubscription.id;
 
       await user.save();
@@ -896,6 +974,42 @@ const userControllers = {
       return res.status(500).json({ message: 'Unexpected error' });
     }
   },
+  /**
+   * The identity hash the support chat widget verifies.
+   *
+   * Chatcloud (a Chatwoot fork) compares the hash the browser sends against the
+   * HMAC of the user id under the shared key, which is what makes the identity
+   * it displays trustworthy: the widget only gets an id it can verify as ours.
+   * The key has to stay server-side, so the hash is computed here rather than in
+   * the browser — the placeholder the widget used to send was not a hash of
+   * anything and could not have passed.
+   *
+   * With no key configured this answers a null hash, and the widget omits the
+   * field. That leaves the identity unverified, which is what chatcloud already
+   * does for an anonymous visitor; a wrong hash is not equivalent, it is a
+   * rejection.
+   */
+  getChatIdentity: async (req, res) => {
+    try {
+      const secret = process.env.CHATCLOUD_HMAC_KEY;
+
+      if (!secret) {
+        return res.status(200).json({ identifier_hash: null });
+      }
+
+      const userId = req.user?.id || req.user?._id;
+      const identifierHash = crypto
+        .createHmac('sha256', secret)
+        .update(String(userId))
+        .digest('hex');
+
+      return res.status(200).json({ identifier_hash: identifierHash });
+    } catch (error) {
+      console.error('Error building chat identity hash:', error);
+      return res.status(500).json({ message: 'Unexpected error' });
+    }
+  },
+
   makeGraduate: async (req, res) => {
     try {
       const { userId: studentId } = req.params;
@@ -1273,21 +1387,42 @@ const userControllers = {
 
   sendMail: async (req, res) => {
     try {
-      const { emails, subject, content, senderId, ctaText, ctaUrl } = req.body;
+      const { emails, subject, content, ctaText, ctaUrl } = req.body;
 
       // Validate required fields
       if (!emails || !Array.isArray(emails) || emails.length === 0) {
         return res.status(400).json({ message: 'Emails array is required and cannot be empty' });
       }
 
-      if (!subject || !content || !senderId) {
-        return res.status(400).json({ message: 'Subject, content, and senderId are required' });
+      if (emails.length > MAX_RECIPIENTS_PER_SEND) {
+        return res.status(400).json({
+          message: `A single send is limited to ${MAX_RECIPIENTS_PER_SEND} recipients. Please split this into smaller batches.`,
+        });
       }
 
-      // Get sender information
-      const sender = await User.findById(senderId);
+      if (!subject || !content) {
+        return res.status(400).json({ message: 'Subject and content are required' });
+      }
+
+      // The sender is the caller. `senderId` used to arrive in the body and
+      // decide both the From name and the Reply-To address, so any caller could
+      // send a mail that replies went to an inbox of their choosing.
+      const sender = await User.findById(req.user?.id || req.user?._id);
       if (!sender) {
         return res.status(404).json({ message: 'Sender not found' });
+      }
+
+      // Paid plans include the email tools; the pricing table on /tutor/plans is
+      // the contract. This is the server-side half of the gate the composer
+      // applies — without it the endpoint is a free relay for any account with a
+      // token, whatever plan it is on.
+      if (!hasPaidPlan(sender.premiumPlan)) {
+        return res.status(403).json({
+          message: 'Sending email requires a Standard or Enterprise plan',
+          // Named so the composer can tell this refusal from the role-based 403
+          // and open the upgrade path rather than reporting a bare failure.
+          code: 'PLAN_REQUIRED',
+        });
       }
 
       // Configure nodemailer transporter
