@@ -12,6 +12,7 @@ const { default: axios } = require("axios");
 const crypto = require("crypto");
 const { hasPaidPlan, planNameForId } = require("../utils/plans.js");
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
+const flutterwavePublicKey = process.env.FLUTTERWAVE_PUBLIC_KEY;
 
 // One request can address every recipient in the composer's list, so the cap
 // only ever catches a caller scripting the endpoint directly. It exists because
@@ -49,6 +50,18 @@ const buildCta = (ctaText, ctaUrl) => {
 };
 
 const userControllers = {
+
+  // Flutterwave's checkout script runs in the browser, so it needs the public
+  // key. Keep the configured value on the API rather than duplicating a key in
+  // the web bundle; a public key is intended to be shared with the checkout.
+  getFlutterwavePublicKey: (req, res) => {
+    if (!flutterwavePublicKey) {
+      console.error('FLUTTERWAVE_PUBLIC_KEY is not configured.');
+      return res.status(503).json({ message: 'Payment checkout is not configured' });
+    }
+
+    return res.status(200).json({ publicKey: flutterwavePublicKey });
+  },
 
   // To get user profile
   getProfile: async (req, res) => {

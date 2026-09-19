@@ -15,6 +15,7 @@ userRouter.get("/", (req, res) => {
 
 //User controllers routes
 userRouter.get("/profile/:id", auth, validateObjectId('id'), userControllers.getProfile);
+userRouter.get("/payment-config", auth, generalLimiter, userControllers.getFlutterwavePublicKey);
 // Activation reads the tier from the verified Flutterwave charge, but the
 // account it writes to has to be the caller's — so it needs to know who is
 // calling. Each call also hits Flutterwave's verify API, hence the tighter cap.
