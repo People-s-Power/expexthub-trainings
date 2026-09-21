@@ -5,6 +5,7 @@ const Notification = require("../models/notifications.js");
 const mongoose = require("mongoose");
 const { sendAssessmentAssignedEmail } = require("../utils/emails/assessmentAssignedEmail.js");
 const { sendAssessmentScoredEmail } = require("../utils/emails/assessmentScoredEmail.js");
+const { sendAssessmentCompletedEmail } = require("../utils/emails/assessmentCompletedEmail.js");
 
 /**
  * Answers used to be stored as three fixed fields on every question. They now
@@ -313,6 +314,40 @@ const assessmentControllers = {
 
       // Save the updated assessment
       await assessment.save();
+
+      // The provider and the instructor are told a submission is waiting. Both
+      // are resolved from records rather than the request body so a caller
+      // cannot redirect the notification: `tutor` is whoever created the
+      // assessment, and `registeredBy` is the provider who onboarded the student
+      // (set by the admissions flow, absent for self-registered students).
+      // Resolved after the save and sent through the safe wrapper — the
+      // submission is already durable and a mail failure must not undo it.
+      try {
+        const student = await User.findById(studentId).select("fullname email registeredBy");
+
+        const [tutor, provider] = await Promise.all([
+          assessment.tutor
+            ? User.findById(assessment.tutor).select("fullname email role")
+            : null,
+          student?.registeredBy
+            ? User.findById(student.registeredBy).select("fullname email role")
+            : null,
+        ]);
+
+        const recipients = [tutor, provider].filter(Boolean);
+
+        if (recipients.length) {
+          await sendAssessmentEmailSafely('Assessment completed', () =>
+            sendAssessmentCompletedEmail({
+              assessment,
+              student,
+              recipients,
+            })
+          );
+        }
+      } catch (error) {
+        console.error('Assessment completion notification failed:', error?.message || error);
+      }
 
       return res.status(201).json({
         message: "Assessment submitted successfully.",

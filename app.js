@@ -186,6 +186,12 @@ io.on("connection", async (socket) => {
 
   console.log(`User connected ${socket.id}`);
 
+  // Every socket joins a room named for its user, so a change that concerns one
+  // person (a block, an unblock) can be delivered to their open tabs without
+  // being broadcast to the whole platform. A blocking action used to go out as a
+  // global broadcast, which leaked the event to every connected user.
+  if (user_id) socket.join(`user:${user_id}`);
+
   // if (user_id) {
   //   try {
   //     await User.findByIdAndUpdate(user_id, {
@@ -253,7 +259,27 @@ io.on("connection", async (socket) => {
     try {
       const { text, conversation_id, from, to, type, file } = data;
 
-      const to_user = await User.findById(to);
+      // A block only means something if it stops delivery. Without this the
+      // blocked party's messages were still written to the transcript and pushed
+      // to the blocker, so the UI said "blocked" while the messages kept coming.
+      const chat = await Chat.findById(conversation_id);
+      if (!chat) {
+        console.error("send_dm: conversation not found", conversation_id);
+        return;
+      }
+      if (chat.blocked?.isBlocked) {
+        const blockedBy = String(chat.blocked.by);
+        // The blocker may still write into their own thread (nothing is delivered
+        // to them), but the person they blocked may not.
+        if (blockedBy !== String(from)) {
+          socket.emit("message_rejected", {
+            conversation_id,
+            reason: "This conversation is blocked",
+          });
+          return;
+        }
+      }
+
       const from_user = await User.findById(from);
       let cloudFile;
       if (type === "Image" || type === "Document") {
@@ -274,7 +300,6 @@ io.on("connection", async (socket) => {
         file: cloudFile,
       };
 
-      const chat = await Chat.findById(conversation_id);
       chat.messages.push(new_message);
       await chat.save({ new: true, validateModifiedOnly: true });
 
@@ -285,84 +310,115 @@ io.on("connection", async (socket) => {
         userId: to,
       });
 
-      io.to(to_user?.socket_id).broadcast.emit("new_message", {
+      // Delivered to the recipient's own room. `io.to(x).broadcast.emit(...)`
+      // excludes room x, so the old form sent the message to every *other*
+      // connected socket and never to the person it was addressed to.
+      io.to(`user:${to}`).emit("new_message", {
         conversation_id,
         message: new_message,
       });
     } catch (e) {
-      console.error("Error blocking user:", e);
+      console.error("Error sending message:", e);
     }
   });
 
-  socket.on("block_user", async (data) => {
-    const { by, conversation_id } = data;
+  socket.on("block_user", async (data, callback) => {
+    const { by, conversation_id } = data || {};
+    const reply = (payload) => { if (typeof callback === "function") callback(payload); };
 
     try {
-      // Find the user to be blocked
+      if (!conversation_id || !by) {
+        reply({ error: "A conversation and a user are required" });
+        return;
+      }
+
       const chat = await Chat.findById(conversation_id);
+      if (!chat) {
+        reply({ error: "Conversation not found" });
+        return;
+      }
+      // Only a participant can block the thread they are in.
+      if (!chat.participants.some((id) => String(id) === String(by))) {
+        reply({ error: "You are not part of this conversation" });
+        return;
+      }
 
-      // const user = await User.findById(by);
-
-      // if (!user) {
-      //   return socket.emit('error', { message: 'User not found' });
-      // }
-
-      // Update the blocked field
-      chat.blocked = {
-        isBlocked: true,
-        by: by,
-      };
-
+      // Idempotent: blocking an already-blocked thread reports success rather
+      // than erroring, so a retried click is not surfaced as a failure.
+      chat.blocked = { isBlocked: true, by: by };
       await chat.save();
 
-      // Emit success message
-      socket.broadcast.emit("user_blocked", {
-        message: `User has been blocked successfully by ${by}.`,
-      });
+      // The ack is what the caller's UI waits on, and it carries the resulting
+      // state so the client never has to guess.
+      reply({ ok: true, conversation_id, isBlocked: true, by: String(by) });
 
-      console.log(`User blocked by ${by}`);
+      // The other participant's pane has to update live — that is the difference
+      // between "blocked" meaning something and it only taking effect on reload.
+      chat.participants
+        .filter((id) => String(id) !== String(by))
+        .forEach((id) => {
+          io.to(`user:${id}`).emit("conversation_block_changed", {
+            conversation_id,
+            isBlocked: true,
+            by: String(by),
+          });
+        });
+
+      console.log(`User ${by} blocked conversation ${conversation_id}`);
     } catch (error) {
       console.error("Error blocking user:", error);
-      socket.emit("error", { message: "Error blocking user" });
+      reply({ error: "Error blocking user" });
     }
   });
 
-  socket.on("unblock_user", async (data) => {
-    const { by, conversation_id } = data;
+  socket.on("unblock_user", async (data, callback) => {
+    const { by, conversation_id } = data || {};
+    const reply = (payload) => { if (typeof callback === "function") callback(payload); };
 
     try {
-      // Find the chat conversation by ID
+      if (!conversation_id || !by) {
+        reply({ error: "A conversation and a user are required" });
+        return;
+      }
+
       const chat = await Chat.findById(conversation_id);
-
       if (!chat) {
-        return socket.emit("error", { message: "Conversation not found" });
+        reply({ error: "Conversation not found" });
+        return;
       }
 
-      // Check if the conversation is currently blocked and if the 'by' user matches the blocker
-      if (!chat.blocked.isBlocked || String(chat.blocked.by) !== String(by)) {
-        return socket.emit("error", {
-          message:
-            "You are not authorized to unblock this conversation or it is not blocked.",
-        });
+      // Guarded with optional access: a thread that was never blocked has no
+      // `blocked` subdocument, and reading `.isBlocked` off it used to throw
+      // before the authorization check could even run.
+      const blockedBy = chat.blocked?.by;
+      if (!chat.blocked?.isBlocked) {
+        reply({ ok: true, conversation_id, isBlocked: false, by: null });
+        return;
+      }
+      if (String(blockedBy) !== String(by)) {
+        reply({ error: "You are not authorized to unblock this conversation" });
+        return;
       }
 
-      // Update the blocked field: Unblock the conversation
-      chat.blocked = {
-        isBlocked: false,
-        by: null, // Set 'by' to null since there's no current blocker after unblocking
-      };
-
+      chat.blocked = { isBlocked: false, by: null };
       await chat.save();
 
-      // Emit success message after unblocking
-      socket.broadcast.emit("unblock_user", {
-        message: `Conversation ${conversation_id} has been unblocked successfully by user ${by}.`,
-      });
+      reply({ ok: true, conversation_id, isBlocked: false, by: null });
+
+      chat.participants
+        .filter((id) => String(id) !== String(by))
+        .forEach((id) => {
+          io.to(`user:${id}`).emit("conversation_block_changed", {
+            conversation_id,
+            isBlocked: false,
+            by: null,
+          });
+        });
 
       console.log(`Conversation ${conversation_id} unblocked by user ${by}`);
     } catch (error) {
       console.error("Error unblocking user:", error);
-      socket.emit("error", { message: "Error unblocking the conversation" });
+      reply({ error: "Error unblocking the conversation" });
     }
   });
 

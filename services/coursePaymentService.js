@@ -375,8 +375,14 @@ function validatePaymentAmount(plan, requestedAmount) {
  * stored ids were plain strings. Matching `enrollments.user` against both id
  * forms closes both — it still writes at most one row, and it now backfills a
  * missing enrollment row for an already-listed student.
+ *
+ * `renewal` takes the opposite branch: the student is already on the course, so
+ * there is no row to create — the lapsed one is flipped back to active in place.
+ * Reusing the create path here would have been silently wrong, because its
+ * `$nin` guard makes it a no-op for exactly the people a renewal is for, leaving
+ * the student charged with their access still expired.
  */
-async function grantCourseAccess({ userId, courseId, plan, session }) {
+async function grantCourseAccess({ userId, courseId, plan, session, renewal = false }) {
   const options = session ? { session } : {};
   const [course, user] = await Promise.all([
     Course.findById(courseId).setOptions(options),
@@ -385,6 +391,39 @@ async function grantCourseAccess({ userId, courseId, plan, session }) {
   if (!course || !user) throw new Error('Course or student not found');
 
   const enrollmentStatus = plan ? 'payment_plan_active' : 'active';
+
+  if (renewal) {
+    const renewedAt = new Date();
+    // Conditional on the row still being lapsed, so two finalizers racing the
+    // same payment cannot both report a renewal — the loser matches nothing.
+    const renewed = await Course.updateOne(
+      { _id: course._id, enrollments: { $elemMatch: { user: user._id, status: { $ne: 'active' } } } },
+      {
+        $set: {
+          'enrollments.$.status': enrollmentStatus,
+          'enrollments.$.enrolledOn': renewedAt,
+          'enrollments.$.updatedAt': renewedAt,
+        },
+        $addToSet: { enrolledStudents: user._id },
+      },
+      options,
+    );
+    if (renewed.modifiedCount === 0) return false;
+
+    try {
+      await Notification.create({
+        title: 'Course enrollment renewal',
+        content: `${user.fullname} just renewed enrollment for your course ${course.title}`,
+        contentId: course._id,
+        userId: course.instructorId,
+      });
+    } catch (error) {
+      console.error('Renewal notification failed:', error.message);
+    }
+
+    return true;
+  }
+
   const result = await Course.updateOne(
     { _id: course._id, 'enrollments.user': { $nin: [user._id, String(user._id)] } },
     {
@@ -482,7 +521,11 @@ async function finalizeFullCoursePayment(transaction, gatewayPayment) {
   const current = await Transaction.findById(transaction._id);
   if (!current) throw new Error('Transaction disappeared during finalization');
 
-  await grantCourseAccess({ userId: current.userId, courseId: current.courseId });
+  await grantCourseAccess({
+    userId: current.userId,
+    courseId: current.courseId,
+    renewal: current.metadata?.renewal === true,
+  });
   await creditInstructor(current, Number(current.amount));
 
   // Receipt is fire-and-forget and idempotent per transaction; the webhook and

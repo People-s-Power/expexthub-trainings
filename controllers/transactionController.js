@@ -171,8 +171,16 @@ async function resolveFundableStudent(studentId) {
 /**
  * Shared gate for "may this user start paying for this course right now?".
  * Returns an { status, message } problem, or null when the purchase may proceed.
+ *
+ * `renewal` inverts the two enrollment checks rather than skipping them. A
+ * renewal is only meaningful for somebody who is already on the course and whose
+ * access has lapsed, so "already enrolled" and "course is full" are exactly the
+ * conditions that must NOT reject it — while "never enrolled at all" must. Left
+ * unhandled, a renewal would either be refused outright (the old behaviour, which
+ * is why a lapsed student was charged and never renewed) or, worse, admit a
+ * stranger as a fresh enrollment.
  */
-async function checkPurchaseEligibility({ course, user, userId }) {
+async function checkPurchaseEligibility({ course, user, userId, renewal = false }) {
   if (!course) return { status: 404, message: 'Course not found' };
   if (!user) return { status: 404, message: 'User not found' };
   if (user.blocked) return { status: 403, message: 'Your account is not permitted to enroll' };
@@ -185,6 +193,23 @@ async function checkPurchaseEligibility({ course, user, userId }) {
   if (course.enrollmentDeadline && new Date(course.enrollmentDeadline) < new Date()) {
     return { status: 409, message: 'Enrollment for this course has closed' };
   }
+
+  if (renewal) {
+    const enrollment = (course.enrollments || []).find(
+      entry => String(entry.user) === String(userId),
+    );
+    if (!enrollment) {
+      return { status: 400, message: 'You are not enrolled in this course' };
+    }
+    if (enrollment.status === 'active') {
+      return { status: 409, message: 'This enrollment is already active' };
+    }
+    // Capacity is not re-checked: the seat is already this student's, and holding
+    // it against them because the course filled up in the meantime would take away
+    // access they are paying to restore.
+    return null;
+  }
+
   if ((course.enrolledStudents || []).some(id => String(id) === String(userId))) {
     return { status: 409, message: 'Student is already enrolled in the course' };
   }
@@ -224,9 +249,14 @@ const transactionController = {
     try {
       const userId = req.user.id;
       const { courseId } = req.body;
+      // A renewal reuses this whole verified spine — gateway checkout, webhook,
+      // redirect verifier, reconciliation sweep — so a lapsed student is charged
+      // and re-credited through the same code path as a first enrollment instead
+      // of the unverified inline charge that used to leave the provider unpaid.
+      const renewal = req.body.renewal === true;
       const [course, user] = await Promise.all([Course.findById(courseId), User.findById(userId)]);
 
-      const problem = await checkPurchaseEligibility({ course, user, userId });
+      const problem = await checkPurchaseEligibility({ course, user, userId, renewal });
       if (problem) {
         const { status, ...body } = problem;
         return res.status(status).json(body);
@@ -244,6 +274,7 @@ const transactionController = {
         status: 'pending',
         amount,
         'metadata.checkoutLink': { $exists: true },
+        'metadata.renewal': renewal,
         date: { $gte: new Date(Date.now() - 30 * 60 * 1000) },
       }).sort({ date: -1 });
       if (openTransaction?.metadata?.checkoutLink) {
@@ -259,15 +290,15 @@ const transactionController = {
         type: 'course_payment',
         status: 'pending',
         currency: 'NGN',
-        metadata: { title: course.title, courseFeeSnapshot: amount },
+        metadata: { title: course.title, courseFeeSnapshot: amount, renewal },
       });
 
       const link = await initializeGatewayCheckout({
         txRef,
         amount,
         customer: { email: user.email, name: user.fullname, phone: user.phone },
-        description: `Enrollment for ${course.title}`,
-        meta: { userId: String(userId), courseId: String(courseId) },
+        description: `${renewal ? 'Renewal of' : 'Enrollment for'} ${course.title}`,
+        meta: { userId: String(userId), courseId: String(courseId), renewal: String(renewal) },
         redirectUrl: req.body.redirect_url,
       });
 
@@ -500,10 +531,14 @@ const transactionController = {
   payCourseWithWallet: async (req, res) => {
     const userId = req.user?.id || req.user?._id;
     const { courseId } = req.body;
+    // `renewal` is the whole reason this path is reachable for a lapsed student:
+    // it swaps the "already enrolled" rejection for "must be enrolled and
+    // inactive" (see checkPurchaseEligibility).
+    const renewal = req.body.renewal === true;
     try {
       const [course, user] = await Promise.all([Course.findById(courseId), User.findById(userId)]);
 
-      const problem = await checkPurchaseEligibility({ course, user, userId });
+      const problem = await checkPurchaseEligibility({ course, user, userId, renewal });
       if (problem) {
         const { status, ...body } = problem;
         return res.status(status).json(body);
@@ -533,11 +568,23 @@ const transactionController = {
         currency: 'NGN',
         txRef,
         paidAt: new Date(),
-        metadata: { courseFeeSnapshot: amount },
+        metadata: { courseFeeSnapshot: amount, renewal },
       });
 
       try {
-        await grantCourseAccess({ userId, courseId });
+        const granted = await grantCourseAccess({ userId, courseId, renewal });
+        // A renewal that matched no lapsed enrollment means the access was already
+        // restored — by a second tab, a retried request, or a concurrent card
+        // payment. Charging for it and stopping here would take the money and give
+        // nothing back, so the debit is released and the caller told why.
+        if (renewal && !granted) {
+          await User.findByIdAndUpdate(userId, { $inc: { balance: amount } });
+          await Transaction.updateOne(
+            { _id: transaction._id },
+            { $set: { status: 'failed', 'metadata.refunded': true, 'metadata.refundReason': 'enrollment_already_active' } },
+          );
+          return res.status(409).json({ message: 'This enrollment is already active' });
+        }
         await creditInstructor(transaction, amount);
       } catch (error) {
         // Refund the wallet debit if enrollment or credit fails; otherwise the
@@ -552,7 +599,13 @@ const transactionController = {
       // a mail error.
       sendPaymentReceiptOnce({ transaction, settledInFull: true, paymentMethod: 'Wallet' });
 
-      return res.json({ message: 'Payment successful and course enrollment confirmed', courseId });
+      return res.json({
+        message: renewal
+          ? 'Payment successful and course enrollment renewed'
+          : 'Payment successful and course enrollment confirmed',
+        courseId,
+        renewal,
+      });
     } catch (error) {
       console.error('Course wallet payment failed:', error);
       return res.status(500).json({ message: 'Wallet payment failed. Please try again.' });
