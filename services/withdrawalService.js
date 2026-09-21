@@ -21,14 +21,14 @@ const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
 const flwHeaders = { Authorization: `Bearer ${flutterwaveSecretKey}` };
 
-// A withdrawal runs its gateway calls inside the HTTP request, and DigitalOcean
-// App Platform drops the upstream connection at ~30s. Two independent 20s timeouts
-// could therefore stack to ~40s, which surfaced to the user as the platform's own
-// 502 page at the very moment their wallet had already been debited. These bounds
-// keep the whole handler inside the proxy's patience instead.
-const TRANSFER_TIMEOUT_MS = 9000;
-const STATUS_TIMEOUT_MS = 6000;
-const REQUEST_BUDGET_MS = 18000;
+// A withdrawal runs its gateway calls inside the HTTP request. Keep the entire
+// synchronous portion well below an upstream's shortest timeout: a transfer that
+// takes longer is safely left pending and settled by its webhook/reconciler. This
+// prevents a slow bank response from turning a correctly queued withdrawal into a
+// 504 at the browser.
+const TRANSFER_TIMEOUT_MS = 4500;
+const STATUS_TIMEOUT_MS = 2500;
+const REQUEST_BUDGET_MS = 7500;
 
 // The reconciliation sweep has no proxy in front of it and would rather resolve a
 // withdrawal than defer it, so it keeps a more patient timeout than a request can.
