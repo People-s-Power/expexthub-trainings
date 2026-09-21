@@ -128,10 +128,13 @@ async function reconcileWithdrawalOutcome(transaction, status, data) {
  * where the gateway may still have accepted the transfer) without paying out
  * twice, by looking the transfer up by reference.
  *
- * A confirmed terminal state is applied through reconcileWithdrawalOutcome; when
- * no transfer row exists for the reference the request was rejected before a
- * transfer was created, so the hold is released. Anything still in flight keeps
- * the hold so the webhook or a later sweep can finish it.
+ * A confirmed terminal state is applied through reconcileWithdrawalOutcome.
+ * Anything still in flight keeps the hold so the webhook or a later sweep can
+ * finish it.
+ *
+ * A reference with no transfer row only proves the transfer was never created
+ * once the gateway's list has caught up with its own writes — see
+ * `allowRefundOnMissing`.
  *
  * `timeoutMs` defaults to the sweep's patient value; a caller running inside an
  * HTTP request passes a tighter one so the lookup cannot outlive the platform's
@@ -139,7 +142,7 @@ async function reconcileWithdrawalOutcome(transaction, status, data) {
  *
  * Returns 'successful' | 'refunded' | 'pending'.
  */
-async function settleAmbiguousTransfer(userId, transaction, amount, reference, timeoutMs = RECONCILE_TIMEOUT_MS) {
+async function settleAmbiguousTransfer(userId, transaction, amount, reference, timeoutMs = RECONCILE_TIMEOUT_MS, allowRefundOnMissing = true) {
   try {
     const statusResponse = await axios.get(`${flutterwaveBaseURL}transfers`, {
       params: { reference },
@@ -150,7 +153,14 @@ async function settleAmbiguousTransfer(userId, transaction, amount, reference, t
     const transfer = Array.isArray(rows) ? rows.find((row) => row?.reference === reference) : null;
 
     if (!transfer) {
-      // No transfer exists for this reference: releasing the hold cannot double-pay.
+      // No transfer row for this reference. Conclusive only outside the window in
+      // which the gateway's list can lag its own writes: a transfer accepted
+      // moments ago may not be listed yet, and refunding on that reading would pay
+      // the user twice — once by the bank, once by us. A request-time caller passes
+      // allowRefundOnMissing=false and keeps the hold instead; the sweep runs well
+      // past that window and is the one that decides.
+      if (!allowRefundOnMissing) return 'pending';
+
       const failed = await Transaction.findOneAndUpdate(
         { _id: transaction._id, status: 'pending' },
         { $set: { status: 'failed' } },
@@ -390,7 +400,10 @@ async function executeWithdrawal({ user, amount, source = 'manual', narration = 
       };
     }
 
-    const settled = await settleAmbiguousTransfer(userId, transaction, amount, reference, STATUS_TIMEOUT_MS);
+    // allowRefundOnMissing=false: a "not found" taken this soon after the attempt
+    // may just be the gateway's list lagging behind its own writes, so the hold is
+    // kept and the sweep — which runs well past that window — decides the refund.
+    const settled = await settleAmbiguousTransfer(userId, transaction, amount, reference, STATUS_TIMEOUT_MS, false);
     if (settled === 'successful') {
       return { outcome: 'successful', message: 'Withdrawal successful', transactionId: transaction._id };
     }
