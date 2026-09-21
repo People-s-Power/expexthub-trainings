@@ -185,6 +185,9 @@ async function runOneSchedule(user) {
     });
     if (result.outcome === 'successful') return finish('successful', 'Payout completed', amount);
     if (result.outcome === 'queued') return finish('queued', 'Payout queued at the bank', amount);
+    // A manual withdrawal is still holding the money. Skipping is the right answer,
+    // not failing: the schedule did nothing wrong and will run again next cycle.
+    if (result.outcome === 'in_progress') return finish('skipped', result.message);
     return finish('failed', result.message || 'Payout could not be completed');
   } catch (error) {
     console.error('Auto payout failed:', error.message);

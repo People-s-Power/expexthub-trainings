@@ -20,7 +20,19 @@ const PaymentWebhookEvent = require('../models/paymentWebhookEvents.js');
 const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
 const flwHeaders = { Authorization: `Bearer ${flutterwaveSecretKey}` };
-const GATEWAY_TIMEOUT_MS = 20000;
+
+// A withdrawal runs its gateway calls inside the HTTP request, and DigitalOcean
+// App Platform drops the upstream connection at ~30s. Two independent 20s timeouts
+// could therefore stack to ~40s, which surfaced to the user as the platform's own
+// 502 page at the very moment their wallet had already been debited. These bounds
+// keep the whole handler inside the proxy's patience instead.
+const TRANSFER_TIMEOUT_MS = 9000;
+const STATUS_TIMEOUT_MS = 6000;
+const REQUEST_BUDGET_MS = 18000;
+
+// The reconciliation sweep has no proxy in front of it and would rather resolve a
+// withdrawal than defer it, so it keeps a more patient timeout than a request can.
+const RECONCILE_TIMEOUT_MS = 20000;
 
 // How long a withdrawal may sit in `pending` before the reconciliation sweep
 // actively checks it against the gateway. Kept comfortably longer than a normal
@@ -41,6 +53,30 @@ function isWithdrawal(transaction) {
     && transaction.type === 'debit'
     && transaction.metadata?.purpose === 'withdrawal',
   );
+}
+
+// How long after requesting a withdrawal a second one is refused. Deliberately
+// short: the case this guards is the user seeing the request fail and pressing
+// "Withdraw" again seconds later, while the first hold is still on the wallet.
+// Refusing on *any* pending row instead would lock the user out for the whole
+// reconciler grace window — up to ~25 minutes — with only a 409 to explain it.
+const DUPLICATE_WITHDRAWAL_WINDOW_MS = 2 * 60 * 1000;
+
+/**
+ * Finds a withdrawal this user requested within the last `withinMs`, if any.
+ *
+ * The wallet is debited before the gateway is contacted, so a user whose request
+ * errored has already been charged. Without this check a second click would queue
+ * a second real transfer on top of a hold that may already be paying out.
+ */
+async function findPendingWithdrawal(userId, withinMs = DUPLICATE_WITHDRAWAL_WINDOW_MS) {
+  return Transaction.findOne({
+    userId,
+    type: 'debit',
+    status: 'pending',
+    'metadata.purpose': 'withdrawal',
+    date: { $gte: new Date(Date.now() - withinMs) },
+  });
 }
 
 /**
@@ -97,14 +133,18 @@ async function reconcileWithdrawalOutcome(transaction, status, data) {
  * transfer was created, so the hold is released. Anything still in flight keeps
  * the hold so the webhook or a later sweep can finish it.
  *
+ * `timeoutMs` defaults to the sweep's patient value; a caller running inside an
+ * HTTP request passes a tighter one so the lookup cannot outlive the platform's
+ * proxy timeout.
+ *
  * Returns 'successful' | 'refunded' | 'pending'.
  */
-async function settleAmbiguousTransfer(userId, transaction, amount, reference) {
+async function settleAmbiguousTransfer(userId, transaction, amount, reference, timeoutMs = RECONCILE_TIMEOUT_MS) {
   try {
     const statusResponse = await axios.get(`${flutterwaveBaseURL}transfers`, {
       params: { reference },
       headers: flwHeaders,
-      timeout: GATEWAY_TIMEOUT_MS,
+      timeout: timeoutMs,
     });
     const rows = statusResponse.data?.data;
     const transfer = Array.isArray(rows) ? rows.find((row) => row?.reference === reference) : null;
@@ -228,6 +268,7 @@ async function reconcilePendingWithdrawals({ olderThanMs = WITHDRAWAL_RECONCILE_
  *   'refunded'     rejected outright, hold released, balance untouched overall
  *   'insufficient' nothing was debited
  *   'no_account'   no payout bank saved
+ *   'in_progress'  a withdrawal was requested moments ago; nothing was debited
  */
 async function executeWithdrawal({ user, amount, source = 'manual', narration = 'Withdrawal' }) {
   if (!user?.bankCode || !user?.accountNumber) {
@@ -235,6 +276,18 @@ async function executeWithdrawal({ user, amount, source = 'manual', narration = 
   }
 
   const userId = user._id;
+
+  // Refuse a near-immediate retry. The debit below happens before the gateway is
+  // contacted, so a user whose request just errored has already been charged —
+  // without this, the click they make on seeing that error queues a second real
+  // transfer on top of the first.
+  const inFlight = await findPendingWithdrawal(userId);
+  if (inFlight) {
+    return {
+      outcome: 'in_progress',
+      message: 'A withdrawal is already being processed. Please check your transaction history before trying again.',
+    };
+  }
 
   // Debit first, conditionally on sufficient funds, so two concurrent
   // withdrawals (or a manual one racing the scheduler) cannot both pass a
@@ -267,6 +320,9 @@ async function executeWithdrawal({ user, amount, source = 'manual', narration = 
     },
   });
 
+  // Everything past this point has to fit the request's time budget.
+  const startedAt = Date.now();
+
   try {
     const response = await axios.post(`${flutterwaveBaseURL}transfers`, {
       account_bank: user.bankCode,
@@ -275,7 +331,7 @@ async function executeWithdrawal({ user, amount, source = 'manual', narration = 
       narration,
       currency: 'NGN',
       reference,
-    }, { headers: flwHeaders, timeout: GATEWAY_TIMEOUT_MS });
+    }, { headers: flwHeaders, timeout: TRANSFER_TIMEOUT_MS });
 
     if (response.data?.status !== 'success') {
       throw new Error(response.data?.message || 'Transfer was not accepted');
@@ -321,7 +377,20 @@ async function executeWithdrawal({ user, amount, source = 'manual', narration = 
     // accepted it and lost the response on the way back, in which case refunding
     // the hold would pay the amount out twice. Resolve by reference first.
     console.error('Withdrawal transfer failed:', transferError.response?.data || transferError.message);
-    const settled = await settleAmbiguousTransfer(userId, transaction, amount, reference);
+
+    // ...but only while the request can still afford it. If the transfer attempt
+    // already ate the budget, defer to the webhook and the sweep rather than push
+    // the handler past the platform's proxy timeout — that timeout is what showed
+    // users a gateway error page over a hold that had already been taken.
+    if (Date.now() - startedAt + STATUS_TIMEOUT_MS > REQUEST_BUDGET_MS) {
+      return {
+        outcome: 'queued',
+        message: 'Your withdrawal is being processed. It will reflect shortly.',
+        transactionId: transaction._id,
+      };
+    }
+
+    const settled = await settleAmbiguousTransfer(userId, transaction, amount, reference, STATUS_TIMEOUT_MS);
     if (settled === 'successful') {
       return { outcome: 'successful', message: 'Withdrawal successful', transactionId: transaction._id };
     }
@@ -346,7 +415,9 @@ module.exports = {
   TRANSFER_SUCCESS,
   TRANSFER_FAILURES,
   WITHDRAWAL_RECONCILE_AFTER_MS,
+  DUPLICATE_WITHDRAWAL_WINDOW_MS,
   isWithdrawal,
+  findPendingWithdrawal,
   executeWithdrawal,
   reconcileWithdrawalOutcome,
   settleAmbiguousTransfer,

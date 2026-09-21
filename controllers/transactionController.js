@@ -1019,6 +1019,9 @@ const transactionController = {
 
       if (result.outcome === 'no_account') return res.status(400).json({ message: result.message });
       if (result.outcome === 'insufficient') return res.status(400).json({ message: result.message });
+      // A withdrawal requested moments ago is still holding the money, so a second
+      // one is refused rather than queued as a duplicate payout.
+      if (result.outcome === 'in_progress') return res.status(409).json({ message: result.message });
       if (result.outcome === 'successful') return res.status(200).json({ message: result.message });
       if (result.outcome === 'refunded') return res.status(502).json({ message: result.message });
       return res.status(202).json({ message: result.message });
