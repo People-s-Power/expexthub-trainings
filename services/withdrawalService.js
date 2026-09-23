@@ -80,18 +80,67 @@ async function findPendingWithdrawal(userId, withinMs = DUPLICATE_WITHDRAWAL_WIN
 }
 
 /**
+ * The gateway's own rejection, when it gave us one.
+ *
+ * A refusal we can act on is returned as a body: an HTTP 4xx, or Flutterwave's
+ * habit of answering 200 with `{ status: 'error', message }`. Both prove no
+ * transfer was created, so refunding the hold on the spot cannot double-pay.
+ *
+ * Anything ambiguous returns null and keeps the hold: a timeout or dropped
+ * connection says nothing about whether the transfer exists, and a 5xx means the
+ * gateway broke *after* possibly accepting it.
+ */
+function definitiveRejection(error) {
+  if (error?.gatewayResponse) return error.gatewayResponse;
+  const status = Number(error?.response?.status);
+  if (status >= 400 && status < 500) return error.response?.data || {};
+  return null;
+}
+
+/**
+ * Fails a pending withdrawal and releases its hold, exactly once.
+ *
+ * The pending->failed transition is the lock: only the caller that wins it credits
+ * the wallet, so a replayed webhook, the redirect settle path, and the
+ * reconciliation sweep can never double-refund.
+ *
+ * The reason is written onto the row rather than only logged. A failed payout used
+ * to be indistinguishable from any other — the gateway's explanation (a bank's
+ * `complete_message`, or the body of a refusal) lived in one console line, which
+ * is exactly why "every withdrawal fails" was undiagnosable from the wallet.
+ */
+async function failAndRefundWithdrawal(transaction, { reason, gatewayStatus } = {}) {
+  const failed = await Transaction.findOneAndUpdate(
+    { _id: transaction._id, status: 'pending' },
+    {
+      $set: {
+        status: 'failed',
+        'metadata.failureReason': reason || 'Payout could not be completed',
+        ...(gatewayStatus ? { 'metadata.gatewayStatus': gatewayStatus } : {}),
+        'metadata.failedAt': new Date(),
+      },
+    },
+    { new: true },
+  );
+  if (failed) {
+    await User.findByIdAndUpdate(transaction.userId, { $inc: { balance: Number(transaction.amount) } });
+  }
+  return Boolean(failed);
+}
+
+/**
  * Applies a transfer's terminal outcome to its withdrawal exactly once.
  *
  * The wallet was already debited when the withdrawal was requested, so SUCCESSFUL
  * only flips the ledger row to successful, while a failure releases the hold by
- * crediting the amount back. The refund is gated by the same pending->failed
- * transition that authorizes it: only the caller that wins that conditional update
- * credits the wallet, so a replayed webhook, the redirect settle path, and the
- * reconciliation sweep can never double-refund.
+ * crediting the amount back (see failAndRefundWithdrawal).
+ *
+ * `reason` overrides what the gateway payload would supply, for a caller that has
+ * a better explanation than the raw body.
  *
  * Returns 'successful' | 'refunded' | 'pending'.
  */
-async function reconcileWithdrawalOutcome(transaction, status, data) {
+async function reconcileWithdrawalOutcome(transaction, status, data, reason) {
   const normalized = String(status || '').toUpperCase();
 
   if (normalized === TRANSFER_SUCCESS) {
@@ -109,14 +158,10 @@ async function reconcileWithdrawalOutcome(transaction, status, data) {
   }
 
   if (TRANSFER_FAILURES.includes(normalized)) {
-    const failed = await Transaction.findOneAndUpdate(
-      { _id: transaction._id, status: 'pending' },
-      { $set: { status: 'failed' } },
-      { new: true },
-    );
-    if (failed) {
-      await User.findByIdAndUpdate(transaction.userId, { $inc: { balance: Number(transaction.amount) } });
-    }
+    await failAndRefundWithdrawal(transaction, {
+      reason: reason || data?.complete_message || data?.message || `Gateway reported ${normalized}`,
+      gatewayStatus: normalized,
+    });
     return 'refunded';
   }
 
@@ -142,7 +187,7 @@ async function reconcileWithdrawalOutcome(transaction, status, data) {
  *
  * Returns 'successful' | 'refunded' | 'pending'.
  */
-async function settleAmbiguousTransfer(userId, transaction, amount, reference, timeoutMs = RECONCILE_TIMEOUT_MS, allowRefundOnMissing = true) {
+async function settleAmbiguousTransfer(transaction, reference, timeoutMs = RECONCILE_TIMEOUT_MS, allowRefundOnMissing = true) {
   try {
     const statusResponse = await axios.get(`${flutterwaveBaseURL}transfers`, {
       params: { reference },
@@ -161,12 +206,9 @@ async function settleAmbiguousTransfer(userId, transaction, amount, reference, t
       // past that window and is the one that decides.
       if (!allowRefundOnMissing) return 'pending';
 
-      const failed = await Transaction.findOneAndUpdate(
-        { _id: transaction._id, status: 'pending' },
-        { $set: { status: 'failed' } },
-        { new: true },
-      );
-      if (failed) await User.findByIdAndUpdate(userId, { $inc: { balance: amount } });
+      await failAndRefundWithdrawal(transaction, {
+        reason: 'No transfer exists at the gateway for this reference',
+      });
       return 'refunded';
     }
 
@@ -250,12 +292,7 @@ async function reconcilePendingWithdrawals({ olderThanMs = WITHDRAWAL_RECONCILE_
   for (const withdrawal of stuck) {
     const reference = withdrawal.reference || withdrawal.txRef;
     if (!reference) continue;
-    const outcome = await settleAmbiguousTransfer(
-      withdrawal.userId,
-      withdrawal,
-      Number(withdrawal.amount),
-      reference,
-    );
+    const outcome = await settleAmbiguousTransfer(withdrawal, reference);
     if (outcome === 'successful') settled += 1;
     if (outcome === 'refunded') refunded += 1;
   }
@@ -279,6 +316,11 @@ async function reconcilePendingWithdrawals({ olderThanMs = WITHDRAWAL_RECONCILE_
  *   'insufficient' nothing was debited
  *   'no_account'   no payout bank saved
  *   'in_progress'  a withdrawal was requested moments ago; nothing was debited
+ *
+ * A 'refunded' result also carries `reason` — the gateway's own explanation, when
+ * it gave one. It is the same text written to the ledger row, offered to callers
+ * that report the failure to somebody (the scheduled payout's last-run line)
+ * rather than only to the user who pressed the button.
  */
 async function executeWithdrawal({ user, amount, source = 'manual', narration = 'Withdrawal' }) {
   if (!user?.bankCode || !user?.accountNumber) {
@@ -344,7 +386,13 @@ async function executeWithdrawal({ user, amount, source = 'manual', narration = 
     }, { headers: flwHeaders, timeout: TRANSFER_TIMEOUT_MS });
 
     if (response.data?.status !== 'success') {
-      throw new Error(response.data?.message || 'Transfer was not accepted');
+      // Flutterwave refuses with a 200 carrying `status: 'error'` rather than an
+      // HTTP error code, so there is no status for the catch below to read. Carry
+      // the body on the error itself so it is still recognised as a refusal — left
+      // as a bare Error it would look like a dropped connection and be deferred.
+      const refusal = new Error(response.data?.message || 'Transfer was not accepted');
+      refusal.gatewayResponse = response.data || {};
+      throw refusal;
     }
 
     // `POST /transfers` only QUEUES the payout; Flutterwave confirms the real
@@ -372,6 +420,7 @@ async function executeWithdrawal({ user, amount, source = 'manual', narration = 
       return {
         outcome: outcome === 'refunded' ? 'refunded' : 'queued',
         message: 'Withdrawal could not be completed. Your balance was not affected.',
+        reason: outcome === 'refunded' ? (transfer?.complete_message || transfer?.message || null) : null,
         transactionId: transaction._id,
       };
     }
@@ -383,10 +432,32 @@ async function executeWithdrawal({ user, amount, source = 'manual', narration = 
       transactionId: transaction._id,
     };
   } catch (transferError) {
+    // A refusal the gateway stated outright proves no transfer was created, so
+    // there is nothing to be paid out later and holding the money buys nothing.
+    // Release the hold now and report the failure, rather than answering "queued"
+    // and leaving the sweep to fail the row fifteen minutes later — that gap is
+    // what made every rejected payout look like it had been accepted.
+    const rejection = definitiveRejection(transferError);
+    console.error('Withdrawal transfer failed:', rejection || transferError.response?.data || transferError.message);
+
+    if (rejection) {
+      await reconcileWithdrawalOutcome(
+        transaction,
+        'FAILED',
+        rejection,
+        rejection.message || 'The payout was rejected by the gateway',
+      );
+      return {
+        outcome: 'refunded',
+        message: 'Withdrawal could not be completed. Your balance was not affected.',
+        reason: rejection.message || null,
+        transactionId: transaction._id,
+      };
+    }
+
     // A timeout or 5xx does not prove the transfer failed — the gateway may have
     // accepted it and lost the response on the way back, in which case refunding
     // the hold would pay the amount out twice. Resolve by reference first.
-    console.error('Withdrawal transfer failed:', transferError.response?.data || transferError.message);
 
     // ...but only while the request can still afford it. If the transfer attempt
     // already ate the budget, defer to the webhook and the sweep rather than push
@@ -403,11 +474,15 @@ async function executeWithdrawal({ user, amount, source = 'manual', narration = 
     // allowRefundOnMissing=false: a "not found" taken this soon after the attempt
     // may just be the gateway's list lagging behind its own writes, so the hold is
     // kept and the sweep — which runs well past that window — decides the refund.
-    const settled = await settleAmbiguousTransfer(userId, transaction, amount, reference, STATUS_TIMEOUT_MS, false);
+    const settled = await settleAmbiguousTransfer(transaction, reference, STATUS_TIMEOUT_MS, false);
     if (settled === 'successful') {
       return { outcome: 'successful', message: 'Withdrawal successful', transactionId: transaction._id };
     }
     if (settled === 'refunded') {
+      // The lookup found the transfer and it had already failed, so
+      // reconcileWithdrawalOutcome has written the gateway's own reason to the
+      // row. Nothing accurate can be added here without re-reading it, and the
+      // caller falls back to the generic message.
       return {
         outcome: 'refunded',
         message: 'Withdrawal could not be completed. Your balance was not affected.',

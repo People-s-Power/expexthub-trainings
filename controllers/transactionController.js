@@ -16,10 +16,8 @@ const {
   CHECKOUT_REUSE_WINDOW_MS,
 } = require('../services/coursePaymentService.js');
 const {
-  settleAmbiguousTransfer,
   handleTransferEvent,
   executeWithdrawal,
-  TRANSFER_FAILURES,
 } = require('../services/withdrawalService.js');
 const { buildAutoPayoutUpdate, serializeAutoPayout } = require('../services/autoPayoutService.js');
 const { finalizeWalletFunding } = require('../services/walletFundingService.js');
@@ -1057,6 +1055,12 @@ const transactionController = {
       if (amount > WALLET_MAX_WITHDRAWAL) {
         return res.status(400).json({ message: `Maximum withdrawal is ${WALLET_MAX_WITHDRAWAL}` });
       }
+      // Flutterwave's transfer endpoint takes an integer amount and rejects kobo,
+      // so a fractional request would come back as a gateway refusal. Catch it here
+      // while the user can still see which field is wrong.
+      if (!Number.isInteger(amount)) {
+        return res.status(400).json({ message: 'Enter a whole naira amount' });
+      }
 
       // The wallet the money leaves. Self-service by default; a delegated team
       // member impersonating a provider may withdraw from that provider's
@@ -1076,7 +1080,10 @@ const transactionController = {
       // one is refused rather than queued as a duplicate payout.
       if (result.outcome === 'in_progress') return res.status(409).json({ message: result.message });
       if (result.outcome === 'successful') return res.status(200).json({ message: result.message });
-      if (result.outcome === 'refunded') return res.status(502).json({ message: result.message });
+      // 400, not 502: a refused payout is settled and the balance is already back,
+      // so the wallet must not read this as the "the bank is still working on it"
+      // case (the client maps 502/503/504 to that copy) and invite a blind retry.
+      if (result.outcome === 'refunded') return res.status(400).json({ message: result.message });
       return res.status(202).json({ message: result.message });
     } catch (error) {
       console.error('Error during withdrawal:', error.response?.data || error.message);

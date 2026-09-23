@@ -188,7 +188,9 @@ async function runOneSchedule(user) {
     // A manual withdrawal is still holding the money. Skipping is the right answer,
     // not failing: the schedule did nothing wrong and will run again next cycle.
     if (result.outcome === 'in_progress') return finish('skipped', result.message);
-    return finish('failed', result.message || 'Payout could not be completed');
+    // The gateway's own reason when we have it: a schedule that fails every run is
+    // the thing this card exists to reveal, and "could not be completed" hides it.
+    return finish('failed', result.reason || result.message || 'Payout could not be completed');
   } catch (error) {
     console.error('Auto payout failed:', error.message);
     return finish('failed', 'Payout could not be completed');
