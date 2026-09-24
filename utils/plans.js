@@ -1,51 +1,181 @@
 /**
  * The plan catalogue, server-side.
  *
- * `User.premiumPlan` stores the plan name lowercased. Until now that name came
- * from the request body of POST /user/premium, so a caller could pay for
- * Standard and post `plan: "enterprise"` to be activated on the top tier. The
- * name is now derived from the Flutterwave plan id carried on the *verified*
- * transaction — the one field the caller cannot choose — and this map is the
- * translation from that id to the tier.
+ * This is the only list of premium plans. Each tier's Flutterwave plan id and
+ * amount live here and reach the pricing table through GET /user/plans, rather
+ * than being typed into the page as well. They used to be two hand-kept copies
+ * of the same four ids; when those copies drifted, the checkout offered a plan
+ * Flutterwave refused with "Payment plan does not exist" — an error the page
+ * could not explain and nothing in the logs recorded.
  *
- * The ids are the ones the pricing table on /tutor/plans sends as
- * `payment_plan`. This list and that table have to stay in step: an id the
- * table offers but this map does not know is refused at activation rather than
- * activated on a guessed tier.
+ * `User.premiumPlan` holds the tier name lowercased, taken at activation from
+ * the plan id on the *verified* transaction — the one field the caller cannot
+ * choose. An id therefore has to mean exactly one tier: two tiers claiming the
+ * same id would make the tier depend on iteration order, so that is refused
+ * rather than resolved.
+ *
+ * The ids must exist on the Flutterwave account behind FLUTTERWAVE_PUBLIC_KEY
+ * and FLUTTERWAVE_SECRET, in the same mode. An id that does not is refused by
+ * the checkout itself, before any of this code runs.
  */
 
-const DEFAULT_PLAN_IDS = {
-  133951: 'standard',   // monthly
-  133952: 'standard',   // yearly
-  133953: 'enterprise', // monthly
-  133954: 'enterprise', // yearly
+const CURRENCY = 'NGN';
+
+// The intervals a plan can be sold on. Also the order the catalogue is served
+// in, so the pricing page needs no ordering of its own.
+const INTERVALS = ['monthly', 'yearly'];
+
+// tier -> interval -> { id, amount }
+//
+// The ids are the live plans on the Flutterwave account behind
+// FLUTTERWAVE_PUBLIC_KEY and FLUTTERWAVE_SECRET. They are also the plans created
+// in Test Mode on the same account, which have different ids — that is what
+// FLUTTERWAVE_PLANS is for, and it is the only way to point an environment at
+// the test ones.
+//
+// The amount is written here as well as on the plan because it is what the
+// pricing page displays, while the plan's own amount is what Flutterwave renews
+// at. Changing one on the dashboard without changing it here advertises a price
+// the renewals will not honour.
+const DEFAULT_CATALOGUE = {
+  standard: {
+    monthly: { id: 170261, amount: 8000 },
+    yearly: { id: 170262, amount: 80000 },
+  },
+  enterprise: {
+    monthly: { id: 170264, amount: 15000 },
+    yearly: { id: 170265, amount: 150000 },
+  },
 };
 
+function isPositiveNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
 /**
- * The plan ids in force, with any configured additions merged over the
- * built-in ones. `FLUTTERWAVE_PLAN_IDS` is a JSON object of id to tier, for
- * adding a tier without a deploy:
+ * Checks a catalogue-shaped object before it is allowed to replace a tier.
  *
- *   FLUTTERWAVE_PLAN_IDS={"133955":"enterprise"}
+ * Throws with a message naming the tier and interval at fault, because this runs
+ * on a hand-written env var and "the catalogue is invalid" is not a useful thing
+ * to find in a log at 2am.
  *
- * A malformed value is logged and ignored — refusing to activate every
- * subscription because of a typo in an unrelated env var would be worse than
- * running on the built-in list.
+ * Two things are refused outright rather than repaired:
+ *
+ * - a tier with no intervals. Emptying a tier is far more likely to be a typo
+ *   than an intention, and the damage is asymmetric: tiers are also what
+ *   `hasPaidPlan` reads, so a tier that vanishes from the catalogue takes the
+ *   paid features away from the accounts already on it.
+ * - one plan id under two tiers. See the note at the top of the file.
  */
-function planIdMap() {
+function validateCatalogue(candidate, label) {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    throw new Error('expected a JSON object of tier -> interval -> { id, amount }');
+  }
+
+  const owners = new Map();
+
+  for (const [tier, byInterval] of Object.entries(candidate)) {
+    if (!byInterval || typeof byInterval !== 'object' || Array.isArray(byInterval)) {
+      throw new Error(`tier "${tier}" must be an object of interval -> { id, amount }`);
+    }
+
+    const intervals = Object.keys(byInterval);
+    if (!intervals.length) {
+      throw new Error(`tier "${tier}" lists no intervals; drop the tier from the override to leave it as it is`);
+    }
+
+    for (const interval of intervals) {
+      const entry = byInterval[interval];
+      const where = `tier "${tier}" ${interval}`;
+
+      if (!INTERVALS.includes(interval)) {
+        throw new Error(`${where}: unknown interval, expected one of ${INTERVALS.join(', ')}`);
+      }
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new Error(`${where} must be an object of { id, amount }`);
+      }
+      if (!Number.isInteger(entry.id) || entry.id <= 0) {
+        throw new Error(`${where} needs a positive integer plan id`);
+      }
+      if (!isPositiveNumber(entry.amount)) {
+        throw new Error(`${where} needs a positive amount`);
+      }
+
+      const owner = owners.get(entry.id);
+      if (owner && owner !== tier) {
+        throw new Error(`plan id ${entry.id} is claimed by both "${owner}" and "${tier}"`);
+      }
+      owners.set(entry.id, tier);
+    }
+  }
+
+  return candidate;
+}
+
+/**
+ * The ids the older FLUTTERWAVE_PLAN_IDS knob adds to activation.
+ *
+ * Kept working for anyone already setting it, but it is deliberately not part of
+ * the catalogue: it carries no amount or interval, so an id in it can be
+ * recognised at activation and cannot be offered on the pricing page.
+ */
+function legacyIdOverrides() {
   const configured = process.env.FLUTTERWAVE_PLAN_IDS;
-  if (!configured) return DEFAULT_PLAN_IDS;
+  if (!configured) return {};
 
   try {
     const parsed = JSON.parse(configured);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       throw new Error('expected a JSON object of planId to tier');
     }
-    return { ...DEFAULT_PLAN_IDS, ...parsed };
+    return parsed;
   } catch (error) {
-    console.error('FLUTTERWAVE_PLAN_IDS is not usable; falling back to the built-in plan ids:', error.message);
-    return DEFAULT_PLAN_IDS;
+    console.error('FLUTTERWAVE_PLAN_IDS is not usable; ignoring it:', error.message);
+    return {};
   }
+}
+
+/**
+ * The catalogue in force: FLUTTERWAVE_PLANS merged over the built-in tiers, whole
+ * tier by whole tier.
+ *
+ *   FLUTTERWAVE_PLANS={"standard":{"monthly":{"id":999001,"amount":8000}}}
+ *
+ * A tier named there replaces the built-in one entirely, including dropping the
+ * intervals it does not list — which is what takes a plan off sale without a
+ * deploy. The merged result is validated as a whole rather than the override on
+ * its own, so an id that collides with a built-in one is caught too; a fault
+ * anywhere in it is logged and the built-in list is used instead of a
+ * half-applied one.
+ */
+function catalogue() {
+  const configured = process.env.FLUTTERWAVE_PLANS;
+  if (!configured) return DEFAULT_CATALOGUE;
+
+  try {
+    const parsed = JSON.parse(configured);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('expected a JSON object of tier -> interval -> { id, amount }');
+    }
+    return validateCatalogue({ ...DEFAULT_CATALOGUE, ...parsed }, 'FLUTTERWAVE_PLANS');
+  } catch (error) {
+    console.error('FLUTTERWAVE_PLANS is not usable; falling back to the built-in plan catalogue:', error.message);
+    return DEFAULT_CATALOGUE;
+  }
+}
+
+/** Plan id -> tier, for reading a tier back off a verified charge. */
+function planIdMap() {
+  const map = {};
+
+  for (const [tier, byInterval] of Object.entries(catalogue())) {
+    for (const interval of INTERVALS) {
+      const entry = byInterval[interval];
+      if (entry) map[String(entry.id)] = tier;
+    }
+  }
+
+  return { ...map, ...legacyIdOverrides() };
 }
 
 /**
@@ -63,14 +193,67 @@ function planNameForId(planId) {
 /**
  * Which tiers carry the paid features.
  *
- * This mirrors the pricing table on /tutor/plans and the frontend's
- * `src/utils/premium.ts` — Basic has no email tools, Standard and Enterprise
- * both do. Change one and the other has to change with it.
+ * Derived from the catalogue rather than listed again, so a tier cannot be added
+ * to the pricing page and left out of the gate — gating email on Enterprise
+ * alone is what once locked out paying Standard customers. The legacy override
+ * is included for the same reason: an account activated on an id only it knows
+ * is on a paid tier too.
+ *
+ * The derivation is why a tier with no intervals is refused in validation: a
+ * tier that leaves the catalogue is also, by this reading, no longer paid.
  */
-const PAID_PLANS = ['standard', 'enterprise'];
+function paidPlans() {
+  const tiers = new Set(Object.keys(catalogue()));
 
-function hasPaidPlan(plan) {
-  return typeof plan === 'string' && PAID_PLANS.includes(plan.toLowerCase());
+  for (const tier of Object.values(legacyIdOverrides())) {
+    if (typeof tier === 'string' && tier) tiers.add(tier.toLowerCase());
+  }
+
+  return [...tiers];
 }
 
-module.exports = { DEFAULT_PLAN_IDS, PAID_PLANS, hasPaidPlan, planNameForId };
+function hasPaidPlan(plan) {
+  return typeof plan === 'string' && paidPlans().includes(plan.toLowerCase());
+}
+
+/**
+ * The catalogue as the pricing page needs it: one row per plan on sale, in
+ * catalogue order then interval order, carrying the commercial facts only.
+ *
+ * The page keeps its own marketing copy — descriptions, feature lists, which
+ * tier is "most popular" — and merges it onto these rows by tier, so an
+ * unoffered tier renders with its features and no way to pay for it rather than
+ * a button that opens a checkout the gateway will refuse.
+ */
+function planCatalogue() {
+  const offerings = [];
+
+  for (const [tier, byInterval] of Object.entries(catalogue())) {
+    for (const interval of INTERVALS) {
+      const entry = byInterval[interval];
+      if (!entry) continue;
+
+      offerings.push({
+        tier,
+        interval,
+        planId: entry.id,
+        amount: entry.amount,
+        currency: CURRENCY,
+      });
+    }
+  }
+
+  return offerings;
+}
+
+module.exports = {
+  CURRENCY,
+  INTERVALS,
+  DEFAULT_CATALOGUE,
+  catalogue,
+  planCatalogue,
+  planIdMap,
+  planNameForId,
+  paidPlans,
+  hasPaidPlan,
+};

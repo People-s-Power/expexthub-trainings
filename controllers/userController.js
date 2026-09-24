@@ -10,7 +10,7 @@ const { create } = require("../models/category.js");
 const { sendEmailReminder } = require("../utils/sendEmailReminder.js");
 const { default: axios } = require("axios");
 const crypto = require("crypto");
-const { hasPaidPlan, planNameForId } = require("../utils/plans.js");
+const { hasPaidPlan, planCatalogue, planNameForId } = require("../utils/plans.js");
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
 const flutterwavePublicKey = process.env.FLUTTERWAVE_PUBLIC_KEY;
 
@@ -61,6 +61,19 @@ const userControllers = {
     }
 
     return res.status(200).json({ publicKey: flutterwavePublicKey });
+  },
+
+  // The premium plans on sale, as the pricing page offers them.
+  //
+  // The ids come from the API rather than from the page so that the table and
+  // the activation map cannot disagree: an id the page offers but
+  // `planNameForId` does not know is refused by Flutterwave with "Payment plan
+  // does not exist", and one it knows but the page never offers is a plan nobody
+  // can buy. There is no 503 branch here as there is above — a catalogue with
+  // nothing in it is a truthful answer, and the page says so, whereas a missing
+  // public key means no checkout can run at all.
+  getPremiumPlans: (req, res) => {
+    return res.status(200).json({ plans: planCatalogue() });
   },
 
   // To get user profile
