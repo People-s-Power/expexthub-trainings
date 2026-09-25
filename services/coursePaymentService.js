@@ -6,6 +6,7 @@ const Transaction = require('../models/transactions.js');
 const Notification = require('../models/notifications.js');
 const CoursePaymentPlan = require('../models/coursePaymentPlans.js');
 const { sendPaymentReceiptOnce } = require('../utils/emails/receiptDispatcher.js');
+const { generateCommissionForPayment } = require('./affiliateCommissionService.js');
 
 const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
@@ -528,6 +529,17 @@ async function finalizeFullCoursePayment(transaction, gatewayPayment) {
   });
   await creditInstructor(current, Number(current.amount));
 
+  // Affiliate commission, if the student was referred. Deliberately after the
+  // instructor is credited and deliberately non-fatal: access is already granted
+  // and the student's money has already been taken, so a commission failure must
+  // not turn a successful payment into an error response. Its own write is
+  // idempotent, so the webhook/redirect replay cannot double-pay the affiliate.
+  try {
+    await generateCommissionForPayment(current);
+  } catch (error) {
+    console.error('Affiliate commission generation failed:', current.txRef, error.message);
+  }
+
   // Receipt is fire-and-forget and idempotent per transaction; the webhook and
   // the redirect both land here, so this is the one safe choke point for full
   // payments. Never block finalization on the mailer.
@@ -599,6 +611,16 @@ async function finalizeInstallmentPayment(transaction, gatewayPayment) {
   // otherwise a replay would pay the instructor twice for one payment.
   if (updatedPlan) {
     await creditInstructor(transaction, Number(transaction.amount));
+
+    // Commission accrues per settled instalment, capped so the running total can
+    // never exceed the commission on the full fee. The `updatedPlan` guard is
+    // what keeps a replayed webhook from accruing twice for one instalment, and
+    // the commission row's own unique key is the second line of defence.
+    try {
+      await generateCommissionForPayment(transaction, { plan: currentPlan });
+    } catch (error) {
+      console.error('Affiliate commission generation failed:', transaction.txRef, error.message);
+    }
   }
 
   // Receipt is fire-and-forget and idempotent per transaction. The dispatcher

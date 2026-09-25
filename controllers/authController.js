@@ -11,6 +11,8 @@ const { sendTeamInvitation } = require("../utils/TeamInviteEmail.js");
 const { sendWelcomeEmailOnce } = require("../utils/emails/welcomeEmail.js");
 
 const determineRole = require("../utils/determinUserType.js");
+const { resolveReferralAttribution, markClickConverted } = require("../utils/referralAttribution.js");
+const { parseAffiliateApplication } = require("../utils/affiliateApplication.js");
 const { default: axios } = require("axios");
 const jwt = require('jsonwebtoken');
 const { logger } = require("handlebars");
@@ -259,7 +261,10 @@ function issueAccessToken(user) {
 }
 
 // Roles allowed to register somebody else and have their credentials emailed.
-const REGISTRAR_ROLES = ['admin', 'tutor', 'provider', 'team_member', 'partner'];
+// Affiliates are included: their admissions flow ("Add New Student") creates the
+// prospective student's account and hands them credentials, and the affiliate's
+// student list is keyed off `registeredBy`.
+const REGISTRAR_ROLES = ['admin', 'tutor', 'provider', 'team_member', 'affiliate'];
 
 /**
  * Resolves the signed-in training provider behind an assisted registration.
@@ -364,6 +369,32 @@ const authControllers = {
       const registrar = req.body?.sendCredentials === true ? await resolveRegistrar(req) : null;
       const createdByProvider = Boolean(registrar) && role !== 'admin';
 
+      // The affiliate application (spec §3.1). Validated before the account is
+      // written, so a malformed application is a 400 rather than a half-created
+      // affiliate whose profile is missing the answers they typed.
+      const affiliateApplication =
+        role === 'affiliate'
+          ? parseAffiliateApplication(req.body)
+          : { ok: true, value: {} };
+      if (!affiliateApplication.ok) {
+        return res.status(400).json({ message: affiliateApplication.message });
+      }
+
+      // Who referred this student. Resolved before the account is written so an
+      // invalid or missing answer is rejected as a 400 rather than creating an
+      // unattributed account the student cannot then correct. Precedence and the
+      // self-referral guard both live in the resolver.
+      const attribution = await resolveReferralAttribution({
+        body: req.body,
+        role,
+        email: normalizedEmail,
+        registrar: createdByProvider ? registrar : null,
+      });
+
+      if (!attribution.ok) {
+        return res.status(attribution.status || 400).json({ message: attribution.message });
+      }
+
       const hashPassword = bcrypt.hashSync(password, 10);
       const newUser = new User({
         username: normalizedEmail,
@@ -387,9 +418,28 @@ const authControllers = {
         ...(createdByProvider ? { isVerified: true, registeredBy: registrar._id } : {}),
         // Applicant signup step 3 — primary course category.
         ...(normalizedCategory ? { assignedCourse: normalizedCategory } : {}),
+        // Referral attribution and the verbatim declaration behind it.
+        ...(attribution.referredByAffiliate ? { referredByAffiliate: attribution.referredByAffiliate } : {}),
+        ...(attribution.referral ? { referral: attribution.referral } : {}),
+        // An affiliate who signs up starts with a pending application; the status
+        // is what gates their referral link and their ability to earn. The
+        // application's own answers (spec §3.1) ride along with it, validated and
+        // URL-normalised by the same parser the profile editor uses.
+        ...(role === 'affiliate'
+          ? {
+              affiliateProfile: {
+                ...affiliateApplication.value,
+                status: 'pending',
+                submittedAt: new Date(),
+              },
+            }
+          : {}),
       });
 
       await newUser.save();
+
+      // Only now, with the account safely written, is the click marked converted.
+      await markClickConverted(attribution.referralClickId, newUser._id);
 
       if (createdByProvider) {
         // Onboarding mail carries the sign-in details and a link straight to the
@@ -619,6 +669,16 @@ const authControllers = {
           profilePicture: user.image,
           otherCourse: user.otherCourse,
           isGoogleLinked: user.isGoogleLinked,
+          // Affiliate standing, so the portal can show the right screen on first
+          // load — an applicant awaiting approval sees their status rather than an
+          // empty dashboard, and the shell never has to guess.
+          ...(user.role === 'affiliate'
+            ? {
+                affiliateId: user.affiliateId || null,
+                affiliateCode: user.affiliateCode || null,
+                affiliateStatus: user.affiliateProfile?.status || 'pending',
+              }
+            : {}),
         },
       });
     } catch (error) {

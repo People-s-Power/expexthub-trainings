@@ -59,6 +59,16 @@ const courseSchema = new mongoose.Schema({
         type: Boolean,
         default: false
     },
+    // Per-course affiliate commission override. Sits above the provider's default
+    // in the resolution order, so a provider can run a generous rate on one
+    // flagship course without lifting their baseline everywhere. `enabled: false`
+    // is a deliberate opt-out for this course even when the provider's programme
+    // is on — useful for a course that is already discounted to the floor.
+    affiliateCommission: {
+        enabled: { type: Boolean, default: null },
+        type: { type: String, enum: ['percentage', 'fixed', null], default: null },
+        value: { type: Number, min: 0, default: null },
+    },
     target: Number,
     assignedTutors: [{
         type: mongoose.Schema.Types.ObjectId,

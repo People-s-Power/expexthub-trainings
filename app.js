@@ -24,7 +24,8 @@ const appointmentRouter = require("./routes/appointmentRouter.js");
 const certificateRouter = require("./routes/certificateRouter.js");
 const startUpKitRouter = require("./routes/startupkit.js");
 const workspaceRouter = require("./routes/workspaceRoute.js");
-const partnerRouter = require("./routes/partnerRoute.js");
+const affiliateRouter = require("./routes/affiliateRoute.js");
+const settingsRouter = require("./routes/settingsRoute.js");
 
 const Chat = require("./models/chat");
 const User = require("./models/user");
@@ -34,6 +35,7 @@ const { startCronJobs } = require("./utils/ReminderSetupEmail");
 const { startWithdrawalReconciliation } = require("./utils/withdrawalReconciler");
 const { startPaymentReconciliation } = require("./utils/paymentReconciler");
 const { startAutoPayouts } = require("./services/autoPayoutService");
+const { startAffiliateCommissionRelease } = require("./utils/affiliateCommissionReleaser");
 
 const bodyParser = require("body-parser");
 const { connect } = require("./config/connectionState");
@@ -82,6 +84,7 @@ startCronJobs();
 startWithdrawalReconciliation();
 startPaymentReconciliation();
 startAutoPayouts();
+startAffiliateCommissionRelease();
 // Middleware
 app.use(cors(corsOptions));
 
@@ -125,7 +128,16 @@ app.use("/appointment", appointmentRouter);
 app.use("/certificate", certificateRouter);
 app.use("/start-up-kit", startUpKitRouter);
 app.use("/workspace", workspaceRouter);
-app.use("/partner", partnerRouter);
+app.use("/affiliate", affiliateRouter);
+// The persona was formerly named "partner". The old prefix is kept as an alias so
+// a client build that still calls /partner keeps working; it can be dropped once
+// the renamed frontend is the only deployed client.
+app.use("/partner", affiliateRouter);
+
+// Platform configuration. Mounted at the root, not under /affiliate: it is the
+// platform's settings, and /affiliate/settings already belongs to the training
+// provider's commission configuration.
+app.use("/settings", settingsRouter);
 
 app.get("/health", (req, res) => {
   const states = ["disconnected", "connected", "connecting", "disconnecting"];
