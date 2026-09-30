@@ -111,11 +111,59 @@ function joinedAt(doc) {
   }
 }
 
+/**
+ * The account's affiliate serial, allocating one if it has none.
+ *
+ * Serials arrived with the affiliate portal. An account that predates them — or
+ * one whose role was changed to `affiliate` afterwards, or that was created by
+ * hand — therefore has a live affiliate account with no identity to show for it.
+ * `scripts/migrateAffiliateStatus.js` backfills those in bulk, but a script has
+ * to be remembered and run, and this was reported as "the affiliate id is still
+ * not issued" precisely because that had not happened: the roster kept rendering
+ * a blank beside real accounts.
+ *
+ * So the serial is now issued on first read as well. The account heals the
+ * moment anything looks at it, whatever its history, and there is no window in
+ * which a live affiliate is displayed without an identifier — which matters
+ * beyond cosmetics, because `affiliateId` is what the roster searches on and
+ * what an admin quotes when looking an affiliate up.
+ *
+ * Safe to call from a read path: it writes only while the field is empty, and
+ * the write is conditional so two requests racing cannot overwrite each other.
+ */
+async function ensureAffiliateIdentity(doc) {
+  if (!doc) return null;
+  if (doc.affiliateId) return doc.affiliateId;
+
+  const affiliateId = await nextAffiliateId();
+  const result = await User.updateOne(
+    {
+      _id: doc._id,
+      // Still empty — the same test the caller used, re-applied at write time so
+      // this only ever fills a blank and never rewrites an issued serial.
+      $or: [{ affiliateId: { $exists: false } }, { affiliateId: null }, { affiliateId: '' }],
+    },
+    { $set: { affiliateId } }
+  );
+
+  // Nothing modified means another request allocated one first. Its serial is
+  // the stored one, and returning this call's freshly-minted serial would show
+  // the reader a number the database does not hold — and burn a serial that
+  // nothing will ever be issued.
+  if (!result.modifiedCount) {
+    const current = await User.findById(doc._id).select('affiliateId').lean();
+    return current?.affiliateId || affiliateId;
+  }
+
+  return affiliateId;
+}
+
 module.exports = {
   nextAffiliateId,
   generateAffiliateCode,
   generateUniqueAffiliateCode,
   generateReferralToken,
   joinedAt,
+  ensureAffiliateIdentity,
   AFFILIATE_ID_PREFIX,
 };

@@ -1,0 +1,64 @@
+<!--
+  Body fragment for a message an administrator writes to one affiliate from the
+  admin console. Rendered inside the shared brand layout.
+
+  `messageHtml` arrives as pre-escaped HTML (paragraphs and line breaks) built by
+  textToHtml, so it is placed with a triple-stash. Every other value here uses the
+  template engine's default escaping. Note for anyone editing this file: a
+  handlebars expression written inside an HTML comment is still parsed, so
+  describe the syntax rather than quoting it.
+-->
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#FFFFFF;">
+  <tr>
+    <td align="center" class="gutter" style="padding:40px 40px 8px 40px;">
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td width="56" height="56" align="center" valign="middle" style="width:56px; height:56px; background-color:#FFF7E0; border:1px solid #FDEAB0; border-radius:50%; font-family:Arial, Helvetica, sans-serif; font-size:26px; line-height:56px;">&#9993;</td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" class="gutter" style="padding:20px 40px 4px 40px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:20px; color:#6B7280;">AFFILIATE PROGRAMME</td>
+  </tr>
+  <tr>
+    <td align="center" class="gutter" style="padding:8px 40px 4px 40px; font-family:Arial, Helvetica, sans-serif; font-size:24px; line-height:32px; font-weight:bold; color:#111827;">{{emailHeading}}</td>
+  </tr>
+  <tr>
+    <td align="center" class="gutter" style="padding:8px 40px 24px 40px; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:23px; color:#4B5563;">
+      Hello <span style="font-weight:bold; color:#111827;">{{affiliateName}}</span>,
+    </td>
+  </tr>
+
+  <!-- The message itself. Left-aligned, unlike the header block: this is prose
+       written for one person to read, not a notification. -->
+  <tr>
+    <td class="gutter" style="padding:0 40px 8px 40px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#FBF9F2; border:1px solid #ECE7D8; border-radius:12px;">
+        <tr>
+          <td style="padding:22px 26px; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:23px; color:#374151;">
+            {{{messageHtml}}}
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+
+  <tr>
+    <td class="gutter" style="padding:16px 40px 4px 40px; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:23px; color:#4B5563;">
+      Kind regards,<br/>
+      <span style="font-weight:bold; color:#111827;">{{senderName}}</span><br/>
+      <span style="color:#6B7280;">ExpertHub Affiliate Programme</span>
+    </td>
+  </tr>
+
+  {{#if affiliateId}}
+  <tr>
+    <td class="gutter" style="padding:24px 40px 40px 40px; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:20px; color:#6B7280;">
+      This message was sent to the affiliate account
+      <span style="font-family:Consolas, Menlo, 'Courier New', monospace; color:#111827;">{{affiliateId}}</span>.
+      Replying to it reaches the ExpertHub team member who wrote it.
+    </td>
+  </tr>
+  {{/if}}
+</table>

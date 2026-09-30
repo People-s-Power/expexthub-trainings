@@ -162,6 +162,39 @@ function formatDate(date) {
   });
 }
 
+/**
+ * Escapes a value for interpolation into an HTML email.
+ *
+ * Templates compiled here escape `{{value}}` for themselves. This exists for the
+ * other direction: text that arrives from a person — an administrator's message,
+ * a provider's name — and has to be converted to HTML *before* it reaches a
+ * triple-stash, where nothing is escaped. Doing it by hand at each call site is
+ * how one of them ends up interpolating a user-supplied name raw.
+ */
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * Renders plain, person-written text as HTML paragraphs.
+ *
+ * Blank lines separate paragraphs and single newlines become breaks, so a
+ * message typed into a textarea arrives looking the way it was written. Every
+ * value is escaped first — see escapeHtml — so this is safe to place behind a
+ * triple-stash in a template.
+ */
+function textToHtml(value) {
+  return String(value == null ? '' : value)
+    .split(/\n{2,}/)
+    .map((paragraph) => `<p style="margin:0 0 14px 0;">${escapeHtml(paragraph).replace(/\n/g, '<br/>')}</p>`)
+    .join('');
+}
+
 module.exports = {
   transporter,
   sendMail,
@@ -169,6 +202,8 @@ module.exports = {
   renderLayout,
   templatePath,
   plainTextFallback,
+  escapeHtml,
+  textToHtml,
   formatNaira,
   formatDate,
   EMAIL_DIR,

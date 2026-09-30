@@ -8,7 +8,7 @@ const AuditLog = require('../models/auditLog');
 const ReferralClick = require('../models/referralClick');
 const AffiliateCommission = require('../models/affiliateCommission');
 const { executeWithdrawal } = require('../services/withdrawalService.js');
-const { generateUniqueAffiliateCode, generateReferralToken, joinedAt } = require('../utils/affiliateIdentity');
+const { ensureAffiliateIdentity, generateUniqueAffiliateCode, generateReferralToken, joinedAt } = require('../utils/affiliateIdentity');
 const { MAX_COMMISSION_RATE } = require('../services/affiliateCommissionService.js');
 const { TUTOR_ONLY } = require('../utils/roles.js');
 const { SOCIAL_KEYS } = require('../utils/affiliateApplication.js');
@@ -1156,6 +1156,15 @@ exports.getProfile = async (req, res) => {
     const affiliate = await requireAffiliate(req, res);
     if (!affiliate) return;
 
+    // Issued here as well as in the admin console, because the affiliate's own
+    // sidebar shows this serial: an account that predates the portal would
+    // otherwise read "ExpertHub affiliate programme" in place of its identifier
+    // until somebody happened to open the roster in the admin dashboard.
+    const affiliateId = await ensureAffiliateIdentity(affiliate).catch((error) => {
+      console.error('Affiliate serial backfill failed:', error.message);
+      return affiliate.affiliateId || null;
+    });
+
     return res.json({
       profile: {
         id: affiliate._id,
@@ -1166,7 +1175,7 @@ exports.getProfile = async (req, res) => {
         state: affiliate.state,
         address: affiliate.address,
         profilePicture: affiliate.image || affiliate.profilePicture || null,
-        affiliateId: affiliate.affiliateId || null,
+        affiliateId: affiliateId || null,
         affiliateCode: affiliate.affiliateCode || null,
         status: affiliateStatus(affiliate),
         application: {

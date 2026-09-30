@@ -6,7 +6,7 @@ const authorize = require('../middlewares/authorize');
 const affiliate = require('../controllers/affiliateController');
 const adminAffiliate = require('../controllers/adminAffiliateController');
 const { TUTOR_ROLES, TUTOR_ONLY } = require('../utils/roles.js');
-const { generalLimiter, walletLimiter } = require('../middlewares/rateLimiter.js');
+const { generalLimiter, walletLimiter, mailLimiter } = require('../middlewares/rateLimiter.js');
 
 // -----------------------------------------------------------------------------
 // Public routes
@@ -70,6 +70,18 @@ affiliateRouter.patch(
   authenticate,
   authorize('admin'),
   adminAffiliate.updateAffiliateStatus
+);
+// Emailing an affiliate from the console. Its own route rather than reusing
+// POST /user/send-mail, which is the tutor marketing composer: that one refuses
+// any account without a paid plan, so an administrator — who has none — would
+// have been turned away from every send. `mailLimiter` rather than
+// `generalLimiter`, because this route does send mail.
+affiliateRouter.post(
+  '/admin/affiliates/:id/email',
+  authenticate,
+  authorize('admin'),
+  mailLimiter,
+  adminAffiliate.sendAffiliateEmail
 );
 affiliateRouter.get('/admin/commissions', authenticate, authorize('admin'), adminAffiliate.listCommissions);
 affiliateRouter.patch(

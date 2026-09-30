@@ -57,7 +57,7 @@ const sendTeamInvitation = async (to, senderName, tutorId, ownerId, tutorName, m
 
         </div>
         <p>Either button opens ExpertHub, where you confirm your answer. If you are not signed in you will be asked to first, and brought straight back.</p>
-        <p>The invitation is also waiting inside your ExpertHub dashboard, under Team, if you would rather answer it there.</p>
+        <p>The invitation is also in your ExpertHub notifications, if you would rather answer it there.</p>
         <p>Best regards,</p>
         <p><strong>The ExpertHub Team</strong></p>
       </div>
