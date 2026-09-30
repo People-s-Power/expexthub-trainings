@@ -2,6 +2,7 @@ const passport = require("passport");
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const User = require("../models/user.js");
+const Notification = require("../models/notifications.js");
 const GoogleStrategy = require("passport-google-oauth20").Strategy
 const {
   generateVerificationCode,
@@ -1077,6 +1078,33 @@ const authControllers = {
 
       await owner.save();
       await member.save();
+
+      // Tell the invitee inside the app, not only by email.
+      //
+      // The email was the *only* notice an invitation produced. That is fine
+      // until it is not: the message is filtered to spam, the address is one the
+      // member rarely opens, or — as reported — the invitee is an affiliate who
+      // has no team page in their portal at all, so even opening the email led
+      // them to a tutor-branded page with nowhere to respond. The in-app record
+      // is the notice of record; the email is a courtesy on top of it.
+      //
+      // `contentId` carries the inviter so the notification can deep-link to the
+      // invitation without the member having to search for which provider it was.
+      // Written before the email is attempted, so a mail failure cannot also cost
+      // the member their notification.
+      try {
+        await Notification.create({
+          title: "Team Invitation",
+          userId: member._id,
+          content: `${owner.fullname} invited you to join their team. Open your dashboard to accept or decline.`,
+          contentId: String(owner._id),
+        });
+      } catch (notifyError) {
+        // The invitation itself is already persisted, so this is recoverable: the
+        // member can still see it on their team page. Logged rather than thrown,
+        // so a notification failure does not report the invitation as failed.
+        console.error("Team invitation notification failed:", notifyError);
+      }
 
       // Email delivery must not turn a successfully persisted invitation into a
       // false 500. The invite remains visible in the app and can be accepted there.

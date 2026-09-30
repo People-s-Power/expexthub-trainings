@@ -12,8 +12,19 @@ const transporter = nodemailer.createTransport({
 
 const sendTeamInvitation = async (to, senderName, tutorId, ownerId, tutorName, memberRole = "team member") => {
 
-  const acceptLink = `https://trainings.experthubllc.com/tutor/team/user?tutorId=${tutorId}&ownerId=${ownerId}&status=accepted`;
-  const rejectLink = `https://trainings.experthubllc.com/tutor/team/user?tutorId=${tutorId}&ownerId=${ownerId}&status=rejected`;
+  // Both buttons open the invitation screen; neither acts on its own.
+  //
+  // They used to point straight at the API route that accepts or rejects, which
+  // changes state on a GET — so a mail client or antivirus that prefetches links
+  // to scan them answered the invitation before the member ever read the email.
+  // Worse for an affiliate specifically: that route lived under the tutor portal,
+  // which they cannot open at all. The screen asks them to confirm, and works for
+  // every category of user.
+  const invitationUrl = (answer) =>
+    `https://trainings.experthubllc.com/team/invitation?tutorId=${tutorId}&ownerId=${ownerId}&status=${answer}`;
+
+  const acceptLink = invitationUrl("accepted");
+  const rejectLink = invitationUrl("rejected");
 
   // Present the member's category (tutor, client, student, provider, admin)
   // in a human friendly form: "Team member" -> "Team Member".
@@ -37,14 +48,16 @@ const sendTeamInvitation = async (to, senderName, tutorId, ownerId, tutorName, m
               ✅ Accept Invitation
             </button>
           </a>
-          
+
           <a href="${rejectLink}">
               <button style="border: none; background-color: #dc3545; color: white; padding: 10px; border-radius: 10px; margin-bottom: 10px; width: 100%;">
               ❌ Reject Invitation
             </button>
           </a>
-         
+
         </div>
+        <p>Either button opens ExpertHub, where you confirm your answer. If you are not signed in you will be asked to first, and brought straight back.</p>
+        <p>The invitation is also waiting inside your ExpertHub dashboard, under Team, if you would rather answer it there.</p>
         <p>Best regards,</p>
         <p><strong>The ExpertHub Team</strong></p>
       </div>

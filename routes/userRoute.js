@@ -72,9 +72,32 @@ userRouter.get('/team/:tutorId', auth, validateObjectId('tutorId'), userControll
 // Authorization is enforced inside the controller: the owner, an admin, or an
 // accepted member with the "Delete team member" privilege may remove a member.
 userRouter.delete('/team/:tutorId/:ownerId', auth, validateObjectId('tutorId', 'ownerId'), userControllers.deleteTeamMembers)
+// Accept or decline a team invitation.
+//
+// POST, and this is the path every new surface uses. The GET below was the only
+// route for years, and it *changes state on a GET* — which means any mail client
+// that prefetches links to scan them (Outlook SafeLinks, most corporate
+// antivirus) silently accepted invitations on the member's behalf before they
+// ever read the message. A POST cannot be triggered by a link preview.
+//
+// Authorization is enforced inside the controller.
+userRouter.post(
+  '/team/:tutorId/:ownerId/:status',
+  auth,
+  generalLimiter,
+  validateObjectId('tutorId', 'ownerId'),
+  userControllers.updateTeamMemberStatus
+)
+
 // Public on purpose: the accept/reject links in the invitation email carry the
 // authorization. The controller accepts anonymous requests but still verifies
 // the invitation exists before changing any status.
+//
+// Kept only so invitations already sitting in inboxes keep working — they point
+// straight at this endpoint and have no in-app notification to fall back on.
+// New emails link to the frontend page at /team/invitation, which confirms the
+// decision before calling the POST route above. Do not build anything new on
+// this one.
 userRouter.get('/team/:tutorId/:ownerId/:status', validateObjectId('tutorId', 'ownerId'), userControllers.updateTeamMemberStatus)
 
 // The caller is the sender, and the caller's plan is checked in the controller

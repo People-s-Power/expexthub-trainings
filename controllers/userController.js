@@ -1321,11 +1321,29 @@ const userControllers = {
       }
 
       // Create a notification
+      //
+      // Who is told what depends on who ended it. A member leaving under their
+      // own steam previously produced a notice telling them that *they* had
+      // removed themselves, and left the provider with no record that a member
+      // had gone — which is how a provider ends up surprised that someone they
+      // thought was on their team cannot see their courses any more.
+      const leftVoluntarily = isSelfRemoval && !isOwner && !isAdmin;
+
       await Notification.create({
         title: "Team Member Removal",
-        content: `${owner?.organizationName || owner.fullname} has removed you from their team.`,
+        content: leftVoluntarily
+          ? `You have left ${owner?.organizationName || owner.fullname}'s team.`
+          : `${owner?.organizationName || owner.fullname} has removed you from their team.`,
         userId: tutorId,
       });
+
+      if (leftVoluntarily) {
+        await Notification.create({
+          title: "Team Member Left",
+          content: `${member.fullname} has left your team.`,
+          userId: ownerId,
+        });
+      }
 
       return res.status(200).json({
         success: true,
@@ -1358,11 +1376,25 @@ const userControllers = {
         return res.status(404).json({ message: "Owner not found" });
       }
 
-      // The accept/reject links inside the invitation email are themselves the
-      // bearer of authorization, so anonymous requests (no JWT) are allowed.
-      // When authenticated, only the invited member (or an admin) may respond;
-      // owners cannot self-accept on the member's behalf.
-      if (req.user && req.user.role !== 'admin' && String(actorId) !== String(tutorId)) {
+      // Who may respond:
+      //
+      //   signed in  → only the invited member, or an admin. An owner can never
+      //                self-accept on the member's behalf.
+      //   signed out → only on the legacy GET, whose URL is the capability. That
+      //                route exists solely for invitations already sitting in
+      //                inboxes and pointing straight at this endpoint; there is no
+      //                in-app notification to fall back on for those.
+      //
+      // Every new surface responds through POST, which the route already guards
+      // with `auth`. That matters: without the split, a leaked or prefetched URL
+      // would be enough to join someone to a team, and team membership carries
+      // real privileges over the provider's account.
+      const isLegacyLink = req.method === 'GET';
+      const mayRespond = req.user
+        ? String(actorId) === String(tutorId) || req.user.role === 'admin'
+        : isLegacyLink;
+
+      if (!mayRespond) {
         return res.status(403).json({ message: "You can only respond to your own team invitation" });
       }
 
@@ -1401,6 +1433,15 @@ const userControllers = {
         return res.status(400).json({ message: "No invitation found" });
       }
 
+      // Already accepted. Repeating the request is not an error — the member may
+      // have clicked the email link and then the button in their dashboard, and
+      // the two now race — but the provider must not be told twice, and the
+      // member must not be handed a second "you have joined" for one invitation.
+      const alreadyAccepted = ownerTeamEntry.status === "accepted";
+      if (alreadyAccepted) {
+        return res.json({ success: true, message: "Invitation already accepted" });
+      }
+
       memberTeamEntry.status = "accepted";
       ownerTeamEntry.status = "accepted";
 
@@ -1413,7 +1454,7 @@ const userControllers = {
         content: `${member.fullname} has accepted your team invitation`,
       });
 
-      res.json({ success: true, message: "Invitation accepted successfully" });
+      return res.json({ success: true, message: "Invitation accepted successfully" });
     } catch (error) {
       console.error("Error updating invitation status:", error);
       res.status(500).json({ message: "Unexpected error occurred" });
