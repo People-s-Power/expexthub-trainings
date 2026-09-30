@@ -885,6 +885,11 @@ exports.listCommissions = async (req, res) => {
       baseAmount: toMajor(row.baseAmount),
       student: row.studentId ? { fullname: row.studentId.fullname, email: row.studentId.email } : null,
       course: row.courseId?.title || null,
+      // The course id, alongside its title. A commission notification carries the
+      // courseId as its `contentId`, so this is what lets the wallet open on the
+      // row a notification was about — the title alone is not a stable key, and
+      // two students paying for the same course share it.
+      courseId: row.courseId?._id ? String(row.courseId._id) : null,
       holdUntil: row.holdUntil,
       releasedAt: row.releasedAt,
       reversalReason: row.reversalReason || null,

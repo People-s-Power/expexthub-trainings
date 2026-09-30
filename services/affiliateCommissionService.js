@@ -146,7 +146,7 @@ async function generateCommissionForPayment(transaction, options = {}) {
 
   // Attribution is per-student. A student with no referring affiliate generates
   // no commission at all, which is the common case and exits immediately.
-  const student = await User.findById(transaction.userId).select('referredByAffiliate role');
+  const student = await User.findById(transaction.userId).select('referredByAffiliate role fullname');
   const affiliateId = student?.referredByAffiliate;
   if (!affiliateId) return { created: false, reason: 'no_referral' };
 
@@ -155,7 +155,7 @@ async function generateCommissionForPayment(transaction, options = {}) {
   if (String(affiliateId) === String(transaction.userId)) return { created: false, reason: 'self_referral' };
 
   const [course, affiliate] = await Promise.all([
-    Course.findById(transaction.courseId).select('instructorId affiliateCommission'),
+    Course.findById(transaction.courseId).select('instructorId affiliateCommission title'),
     User.findById(affiliateId).select('role affiliateProfile.status fullname'),
   ]);
 
@@ -258,9 +258,14 @@ async function generateCommissionForPayment(transaction, options = {}) {
   }
 
   // Fire-and-forget: a notification is not worth failing a settled payment over.
+  //
+  // The student and course are named because this notification is a link into the
+  // wallet, where the same affiliate may be looking at several commissions. "You
+  // earned ₦X from a referred student's payment" gave them nothing to match the
+  // row against once they arrived.
   Notification.create({
     title: 'Commission earned',
-    content: `You earned ${formatMoney(toMajor(amountMinor))} from a referred student's payment. It becomes available on ${holdUntil.toDateString()}.`,
+    content: `You earned ${formatMoney(toMajor(amountMinor))} when ${student.fullname || 'a referred student'} paid for ${course.title || 'a course'}. It becomes available on ${holdUntil.toDateString()}.`,
     contentId: String(course._id),
     read: false,
     userId: affiliate._id,

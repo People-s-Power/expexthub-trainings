@@ -260,6 +260,29 @@ function issueAccessToken(user) {
   }, process.env.JWT_SECRET, { expiresIn: '24h' });
 }
 
+/**
+ * Whether the learner intake survey has been completed, for the dashboards that
+ * offer it.
+ *
+ * Signup no longer routes anybody through `/auth/survey`: a new account lands on
+ * its dashboard, and the applicant dashboard offers the survey from there. For
+ * that offer to stop once the survey is done, the dashboard needs to know — and
+ * the session payload is the only place it can read it from, because the client
+ * never fetches its own user document.
+ *
+ * `submit()` in the survey requires `joiningAccomplishment`, so its presence is
+ * exactly the condition the survey endpoint enforces; anything looser would hide
+ * the prompt from someone whose submission had actually been rejected.
+ *
+ * Sent only to learners. No other role takes the survey, and an always-present
+ * `surveyCompleted: false` would be a field every other dashboard has to ignore.
+ */
+function surveyStanding(user) {
+  const isLearner = user.role === 'student' || user.role === 'client';
+  if (!isLearner) return {};
+  return { surveyCompleted: Boolean(user.survey && user.survey.joiningAccomplishment) };
+}
+
 // Roles allowed to register somebody else and have their credentials emailed.
 // Affiliates are included: their admissions flow ("Add New Student") creates the
 // prospective student's account and hands them credentials, and the affiliate's
@@ -592,6 +615,7 @@ const authControllers = {
             profilePicture: user.profilePicture,
             otherCourse: user.otherCourse,
             isGoogleLinked: user.isGoogleLinked || false,
+            ...surveyStanding(user),
           },
           accessToken: user.googleAccessToken,
           success: true,
@@ -679,6 +703,10 @@ const authControllers = {
                 affiliateStatus: user.affiliateProfile?.status || 'pending',
               }
             : {}),
+          // Learners land on /applicant after signing in, where the intake survey
+          // is offered rather than demanded. This is how that offer knows when to
+          // stop.
+          ...surveyStanding(user),
         },
       });
     } catch (error) {
@@ -749,6 +777,7 @@ const authControllers = {
           username: user.username,
           email: user.email,
           role: user.role,
+          ...surveyStanding(user),
         },
       });
     } catch (error) {
@@ -847,6 +876,7 @@ const authControllers = {
           email: user.email,
           role: user.role,
           isVerified: true,
+          ...surveyStanding(user),
         },
       });
     } catch (error) {
