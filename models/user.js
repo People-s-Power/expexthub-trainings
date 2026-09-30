@@ -44,6 +44,14 @@ const userSchema = new mongoose.Schema({
   skillLevel: String,
   country: String,
   state: String,
+  // The town or city. Collected from affiliates, whose residence is reviewed and
+  // who are paid by bank transfer, and deliberately optional everywhere else —
+  // an account created before this field existed has none, and neither does a
+  // student, who is never asked.
+  city: {
+    type: String,
+    default: ""
+  },
   address: {
     type: String,
     default: ""

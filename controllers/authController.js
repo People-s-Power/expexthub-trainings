@@ -331,6 +331,7 @@ const authControllers = {
         phone,
         country,
         state,
+        city,
         address,
         contact,
         password,
@@ -450,6 +451,9 @@ const authControllers = {
         phone,
         country,
         state,
+        // Only the affiliate form collects a city, so the value arrives absent
+        // from every other signup and the schema default fills it in.
+        city,
         address,
         role,
         organizationName,

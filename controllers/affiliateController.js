@@ -1173,6 +1173,7 @@ exports.getProfile = async (req, res) => {
         phone: affiliate.phone,
         country: affiliate.country,
         state: affiliate.state,
+        city: affiliate.city,
         address: affiliate.address,
         profilePicture: affiliate.image || affiliate.profilePicture || null,
         affiliateId: affiliateId || null,
@@ -1227,7 +1228,7 @@ exports.updateProfile = async (req, res) => {
     const affiliate = await requireAffiliate(req, res);
     if (!affiliate) return;
 
-    const { fullname, phone, country, state, address, businessName, website, socialLinks, payoutPreference } =
+    const { fullname, phone, country, state, city, address, businessName, website, socialLinks, payoutPreference } =
       req.body || {};
 
     const update = {};
@@ -1236,6 +1237,7 @@ exports.updateProfile = async (req, res) => {
     if (typeof phone === 'string') update.phone = phone.slice(0, 40);
     if (typeof country === 'string') update.country = country.slice(0, 80);
     if (typeof state === 'string') update.state = state.slice(0, 80);
+    if (typeof city === 'string') update.city = city.slice(0, 80);
     if (typeof address === 'string') update.address = address.slice(0, 300);
 
     if (typeof businessName === 'string') update['affiliateProfile.businessName'] = businessName.slice(0, 160);
