@@ -4,6 +4,7 @@ const Transaction = require('../models/transactions');
 const Notification = require('../models/notifications');
 const AffiliateCommission = require('../models/affiliateCommission');
 const CoursePaymentPlan = require('../models/coursePaymentPlans');
+const { isAffiliateActive } = require('../utils/affiliateStatus.js');
 
 const MINOR_UNIT = 100;
 
@@ -162,11 +163,12 @@ async function generateCommissionForPayment(transaction, options = {}) {
   if (!course?.instructorId) return { created: false, reason: 'no_course' };
   if (!affiliate || affiliate.role !== 'affiliate') return { created: false, reason: 'affiliate_missing' };
 
-  // A suspended affiliate keeps what they already earned but accrues nothing new.
-  // `approved` is required because a referral can only ever be attributed to an
-  // approved affiliate in the first place; this covers a later suspension.
-  if (affiliate.affiliateProfile?.status !== 'approved') {
-    return { created: false, reason: 'affiliate_not_approved' };
+  // A deactivated affiliate keeps what they already earned but accrues nothing
+  // new. Attribution can only ever land on an affiliate who was active at the
+  // time, so this covers someone switched off between the referral and the
+  // payment finally settling.
+  if (!isAffiliateActive(affiliate)) {
+    return { created: false, reason: 'affiliate_not_active' };
   }
 
   const provider = await User.findById(course.instructorId).select('affiliateSettings');

@@ -13,6 +13,8 @@ const { sendWelcomeEmailOnce } = require("../utils/emails/welcomeEmail.js");
 const determineRole = require("../utils/determinUserType.js");
 const { resolveReferralAttribution, markClickConverted } = require("../utils/referralAttribution.js");
 const { parseAffiliateApplication } = require("../utils/affiliateApplication.js");
+const { nextAffiliateId, generateUniqueAffiliateCode } = require("../utils/affiliateIdentity.js");
+const { affiliateStatus } = require("../utils/affiliateStatus.js");
 const { default: axios } = require("axios");
 const jwt = require('jsonwebtoken');
 const { logger } = require("handlebars");
@@ -418,6 +420,27 @@ const authControllers = {
         return res.status(attribution.status || 400).json({ message: attribution.message });
       }
 
+      // An affiliate's serial and referral code are allocated here, at signup,
+      // because the account is live from this moment: there is no approval step
+      // left to issue them at. Allocated before the account is constructed so an
+      // exhausted counter is a 500 with nothing written, rather than an affiliate
+      // holding an account that has no identity and no way to earn.
+      //
+      // The code is issued once and kept for life — regenerating it later would
+      // break every link the affiliate has already shared.
+      let affiliateIdentity = {};
+      if (role === 'affiliate') {
+        try {
+          affiliateIdentity = {
+            affiliateId: await nextAffiliateId(),
+            affiliateCode: await generateUniqueAffiliateCode(),
+          };
+        } catch (error) {
+          console.error('Affiliate identity allocation failed:', error.message);
+          return res.status(500).json({ message: 'Could not set up your affiliate account. Please try again.' });
+        }
+      }
+
       const hashPassword = bcrypt.hashSync(password, 10);
       const newUser = new User({
         username: normalizedEmail,
@@ -444,22 +467,38 @@ const authControllers = {
         // Referral attribution and the verbatim declaration behind it.
         ...(attribution.referredByAffiliate ? { referredByAffiliate: attribution.referredByAffiliate } : {}),
         ...(attribution.referral ? { referral: attribution.referral } : {}),
-        // An affiliate who signs up starts with a pending application; the status
-        // is what gates their referral link and their ability to earn. The
-        // application's own answers (spec §3.1) ride along with it, validated and
-        // URL-normalised by the same parser the profile editor uses.
+        // An affiliate's account is live the moment it exists — there is no
+        // approval queue to sit in. The application's own answers (spec §3.1)
+        // ride along with it, validated and URL-normalised by the same parser the
+        // profile editor uses, and `submittedAt` is kept as the record of when
+        // they signed up.
         ...(role === 'affiliate'
           ? {
+              ...affiliateIdentity,
               affiliateProfile: {
                 ...affiliateApplication.value,
-                status: 'pending',
+                status: 'active',
                 submittedAt: new Date(),
               },
             }
           : {}),
       });
 
-      await newUser.save();
+      // The referral code is checked for uniqueness before it is used, but only
+      // the unique index is authoritative — a concurrent signup can land between
+      // that check and this write. A duplicate-key error on the code is therefore
+      // expected rather than exceptional, and is retried with a fresh one instead
+      // of surfacing as a failed registration for someone who did nothing wrong.
+      try {
+        await newUser.save();
+      } catch (saveError) {
+        const isDuplicateCode =
+          saveError?.code === 11000 && Object.keys(saveError.keyPattern || {}).includes('affiliateCode');
+        if (!isDuplicateCode) throw saveError;
+
+        newUser.affiliateCode = await generateUniqueAffiliateCode();
+        await newUser.save();
+      }
 
       // Only now, with the account safely written, is the click marked converted.
       await markClickConverted(attribution.referralClickId, newUser._id);
@@ -693,14 +732,16 @@ const authControllers = {
           profilePicture: user.image,
           otherCourse: user.otherCourse,
           isGoogleLinked: user.isGoogleLinked,
-          // Affiliate standing, so the portal can show the right screen on first
-          // load — an applicant awaiting approval sees their status rather than an
-          // empty dashboard, and the shell never has to guess.
+          // Affiliate identity and standing, so the portal can label the sidebar
+          // and show the right screen on first load without a second round trip.
+          // The standing is normalised rather than read raw, so an account whose
+          // stored status word predates the two-state model still resolves to the
+          // one it means.
           ...(user.role === 'affiliate'
             ? {
                 affiliateId: user.affiliateId || null,
                 affiliateCode: user.affiliateCode || null,
-                affiliateStatus: user.affiliateProfile?.status || 'pending',
+                affiliateStatus: affiliateStatus(user),
               }
             : {}),
           // Learners land on /applicant after signing in, where the intake survey

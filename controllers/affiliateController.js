@@ -8,10 +8,11 @@ const AuditLog = require('../models/auditLog');
 const ReferralClick = require('../models/referralClick');
 const AffiliateCommission = require('../models/affiliateCommission');
 const { executeWithdrawal } = require('../services/withdrawalService.js');
-const { generateUniqueAffiliateCode, generateReferralToken } = require('../utils/affiliateIdentity');
+const { generateUniqueAffiliateCode, generateReferralToken, joinedAt } = require('../utils/affiliateIdentity');
 const { MAX_COMMISSION_RATE } = require('../services/affiliateCommissionService.js');
 const { TUTOR_ONLY } = require('../utils/roles.js');
 const { SOCIAL_KEYS } = require('../utils/affiliateApplication.js');
+const { ACTIVE_AFFILIATE_FILTER, affiliateStatus, isAffiliateActive } = require('../utils/affiliateStatus.js');
 const { normalizeUrl } = require('../utils/normalizeUrl.js');
 
 const LEARNER_ROLES = ['student', 'client'];
@@ -179,7 +180,7 @@ exports.directory = async (req, res) => {
     const { page, limit, skip } = pagination(req.query, { defaultLimit: 20, maxLimit: 50 });
     const search = String(req.query.search || '').trim();
 
-    const filter = { role: 'affiliate', 'affiliateProfile.status': 'approved', blocked: { $ne: true } };
+    const filter = { role: 'affiliate', ...ACTIVE_AFFILIATE_FILTER, blocked: { $ne: true } };
     if (search) {
       const pattern = new RegExp(escapeRegex(search), 'i');
       filter.$or = [
@@ -233,7 +234,7 @@ exports.attribute = async (req, res) => {
     const affiliate = await User.findOne({
       affiliateCode: code,
       role: 'affiliate',
-      'affiliateProfile.status': 'approved',
+      ...ACTIVE_AFFILIATE_FILTER,
     }).select('_id affiliateCode');
 
     // An unknown or inactive code is answered with 204 rather than 404: the public
@@ -315,7 +316,7 @@ exports.summary = async (req, res) => {
       balance: Number(affiliate.balance) || 0,
       affiliateId: affiliate.affiliateId || null,
       affiliateCode: affiliate.affiliateCode || null,
-      status: affiliate.affiliateProfile?.status || 'pending',
+      status: affiliateStatus(affiliate),
     });
   } catch (error) {
     console.error('Affiliate summary failed:', error);
@@ -478,8 +479,8 @@ exports.createStudent = async (req, res) => {
     const affiliate = await requireAffiliate(req, res);
     if (!affiliate) return;
 
-    if (affiliate.affiliateProfile?.status !== 'approved') {
-      return res.status(403).json({ message: 'Your affiliate account is not approved yet' });
+    if (!isAffiliateActive(affiliate)) {
+      return res.status(403).json({ message: 'Your affiliate account is not active' });
     }
 
     const { fullname, email, phone, interestedCourse, intendedStartDate, notes } = req.body || {};
@@ -704,7 +705,7 @@ exports.referral = async (req, res) => {
     const affiliate = await requireAffiliate(req, res);
     if (!affiliate) return;
 
-    const status = affiliate.affiliateProfile?.status || 'pending';
+    const status = affiliateStatus(affiliate);
     const baseUrl = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
 
     const [clicks, conversions, referredCount] = await Promise.all([
@@ -1167,16 +1168,27 @@ exports.getProfile = async (req, res) => {
         profilePicture: affiliate.image || affiliate.profilePicture || null,
         affiliateId: affiliate.affiliateId || null,
         affiliateCode: affiliate.affiliateCode || null,
-        status: affiliate.affiliateProfile?.status || 'pending',
+        status: affiliateStatus(affiliate),
         application: {
           type: affiliate.affiliateProfile?.type || 'individual',
           businessName: affiliate.affiliateProfile?.businessName || null,
           website: affiliate.affiliateProfile?.website || null,
           socialLinks: affiliate.affiliateProfile?.socialLinks || {},
           submittedAt: affiliate.affiliateProfile?.submittedAt || null,
-          approvedAt: affiliate.affiliateProfile?.approvedAt || null,
-          rejectionReason: affiliate.affiliateProfile?.rejectionReason || null,
-          suspensionReason: affiliate.affiliateProfile?.suspensionReason || null,
+          // When the account joined, resolved through the shared helper so a
+          // record that predates `createdAt` still shows a real date rather than
+          // a blank beside a label the affiliate reasonably expects to be filled.
+          joinedAt: joinedAt(affiliate),
+          // Why an administrator last switched the account off, so the affiliate
+          // can be told something more useful than "your account is inactive".
+          // The legacy reasons are still surfaced for accounts switched off under
+          // the old model and not yet folded over by the status migration.
+          deactivationReason:
+            affiliate.affiliateProfile?.deactivationReason ||
+            affiliate.affiliateProfile?.suspensionReason ||
+            affiliate.affiliateProfile?.rejectionReason ||
+            null,
+          deactivatedAt: affiliate.affiliateProfile?.deactivatedAt || null,
           reviewNote: affiliate.affiliateProfile?.reviewNote || null,
         },
         bank: {

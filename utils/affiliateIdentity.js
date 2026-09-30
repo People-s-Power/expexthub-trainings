@@ -88,10 +88,34 @@ function generateReferralToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 
+/**
+ * When an account joined, as a date that is always present.
+ *
+ * Some early affiliate records were seeded without a `createdAt`, and with strict
+ * schemas it is not written back on read — so `createdAt` is genuinely absent on
+ * those documents rather than merely unselected. An ObjectId carries its creation
+ * timestamp in its leading four bytes, which recovers the real join date instead
+ * of leaving a blank beside every one of them.
+ *
+ * Returns a Date, or null only when neither source exists, so callers can format
+ * without a second null check.
+ */
+function joinedAt(doc) {
+  if (doc?.createdAt) return doc.createdAt;
+  try {
+    return doc?._id?.getTimestamp?.() || null;
+  } catch {
+    // A non-ObjectId id (or a plain string) has no timestamp to read. Returning
+    // null lets the caller render a dash rather than throwing over a date.
+    return null;
+  }
+}
+
 module.exports = {
   nextAffiliateId,
   generateAffiliateCode,
   generateUniqueAffiliateCode,
   generateReferralToken,
+  joinedAt,
   AFFILIATE_ID_PREFIX,
 };

@@ -1,5 +1,6 @@
 const User = require('../models/user');
 const ReferralClick = require('../models/referralClick');
+const { isAffiliateActive } = require('./affiliateStatus.js');
 
 // Roles that are asked the referral question at signup. A provider or tutor
 // signing themselves up is never asked, and neither is an affiliate — the
@@ -46,9 +47,9 @@ async function resolveAffiliate({ affiliateId, affiliateCode }) {
   if (!affiliate || affiliate.role !== 'affiliate') {
     return { ok: false, message: 'We could not find that affiliate' };
   }
-  if (affiliate.affiliateProfile?.status !== 'approved') {
-    // One message for every non-approved state: which stage an affiliate's
-    // application is at is not the student's business.
+  if (!isAffiliateActive(affiliate)) {
+    // One message for every way an affiliate can be switched off: which internal
+    // state the account is in is not the student's business.
     return { ok: false, message: 'That affiliate is not currently active. Please choose another.' };
   }
 
@@ -73,11 +74,11 @@ async function resolveLinkAttribution(referralToken) {
   if (!click) return null;
 
   // Re-check standing at conversion time, not just at click time: the affiliate
-  // may have been suspended in the days between the click and the signup.
+  // may have been switched off in the days between the click and the signup.
   const affiliate = await User.findOne({ _id: click.affiliateId, role: 'affiliate' }).select(
     'affiliateProfile.status affiliateCode email fullname'
   );
-  if (!affiliate || affiliate.affiliateProfile?.status !== 'approved') return null;
+  if (!affiliate || !isAffiliateActive(affiliate)) return null;
 
   return { click, affiliate };
 }

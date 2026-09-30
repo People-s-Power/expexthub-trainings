@@ -132,22 +132,40 @@ const userSchema = new mongoose.Schema({
       whatsapp: String,
     },
     payoutPreference: String,
-    // `pending` → awaiting review; `approved` → may refer and earn; `suspended`
-    // → existing attribution and earnings survive but no new referrals count.
+    // Whether the affiliate may currently refer and earn. `active` is the state
+    // every signup lands in — there is no application to wait on, so a new
+    // affiliate can share their link from the moment they register — and
+    // `deactivated` is the single lever an administrator has to stop one.
+    //
+    // The legacy values are still accepted so a document written before the
+    // approval step was removed keeps loading. `pending`, `under_review` and
+    // `approved` all now mean exactly what `active` means, and `rejected` and
+    // `suspended` mean what `deactivated` means; `scripts/migrateAffiliateStatus.js`
+    // folds them over. They are deliberately kept in the enum rather than deleted:
+    // a rollback would otherwise make every affiliate document fail validation.
     status: {
       type: String,
-      enum: ['pending', 'under_review', 'approved', 'rejected', 'suspended'],
-      default: 'pending',
+      enum: ['active', 'deactivated', 'pending', 'under_review', 'approved', 'rejected', 'suspended'],
+      default: 'active',
       index: true,
     },
     submittedAt: { type: Date, default: Date.now },
     reviewedAt: Date,
     reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     reviewNote: String,
+    // Kept for the legacy values above and for the audit trail on accounts that
+    // were rejected or suspended before the approval step was removed.
     rejectionReason: String,
     approvedAt: Date,
     suspendedAt: Date,
     suspensionReason: String,
+    // Why an administrator switched the account off. Optional — deactivating is
+    // meant to be a single deliberate click, not a form — but recorded whenever
+    // one is given, because "why was this affiliate switched off" is the first
+    // question asked when they write in about it.
+    deactivatedAt: Date,
+    deactivationReason: String,
+    deactivatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   },
 
   // Commission terms for this user's *own* courses — i.e. the training provider's

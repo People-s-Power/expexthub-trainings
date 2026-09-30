@@ -6,11 +6,19 @@ const Appointment = require('../models/appointment');
 const AuditLog = require('../models/auditLog');
 const Notification = require('../models/notifications');
 const AffiliateCommission = require('../models/affiliateCommission');
-const { generateUniqueAffiliateCode } = require('../utils/affiliateIdentity');
+const { generateUniqueAffiliateCode, joinedAt } = require('../utils/affiliateIdentity');
 const { reverseCommission } = require('../services/affiliateCommissionService.js');
+const {
+  ACTIVE_STATUSES,
+  DEACTIVATED_STATUSES,
+  affiliateStatus,
+} = require('../utils/affiliateStatus.js');
 const { studentScope, escapeRegex, maskAccountNumber, toMajor } = require('./affiliateController.js');
 
-const APPROVAL_STATUSES = ['pending', 'under_review', 'approved', 'rejected', 'suspended'];
+// The two states an administrator can move an affiliate between. There is no
+// approval step: an affiliate is live from signup, so the only question the
+// console asks is whether this account should currently be able to refer and earn.
+const AFFILIATE_STATUSES = ['active', 'deactivated'];
 
 const isObjectId = (value) => mongoose.Types.ObjectId.isValid(String(value || ''));
 
@@ -54,9 +62,15 @@ exports.listAffiliates = async (req, res) => {
 
     const filter = { role: 'affiliate' };
 
+    // Matching the whole legacy family, not just the one word: until the status
+    // migration has run, an affiliate switched off under the old model is stored
+    // as `suspended` or `rejected`, and a filter for "deactivated" that only
+    // looked for the new word would show an empty list rather than those accounts.
     const status = String(req.query.status || '').trim();
-    if (status && APPROVAL_STATUSES.includes(status)) {
-      filter['affiliateProfile.status'] = status;
+    if (status === 'active') {
+      filter['affiliateProfile.status'] = { $in: ACTIVE_STATUSES };
+    } else if (status === 'deactivated') {
+      filter['affiliateProfile.status'] = { $in: DEACTIVATED_STATUSES };
     }
 
     const search = String(req.query.search || '').trim();
@@ -101,12 +115,15 @@ exports.listAffiliates = async (req, res) => {
       return acc;
     }, {});
 
+    // Counted through the same normaliser the rest of the code uses, so the
+    // figures are right during the window where code has shipped but the status
+    // migration has not yet run and the stored words are still the old ones.
     const summary = statusCounts.reduce(
       (acc, row) => {
-        acc[row._id || 'pending'] = row.count;
+        acc[affiliateStatus({ affiliateProfile: { status: row._id } })] += row.count;
         return acc;
       },
-      { pending: 0, under_review: 0, approved: 0, rejected: 0, suspended: 0 }
+      { active: 0, deactivated: 0 }
     );
 
     const records = rows.map((row) => ({
@@ -117,11 +134,11 @@ exports.listAffiliates = async (req, res) => {
       organizationName: row.affiliateProfile?.businessName || row.organizationName || null,
       affiliateId: row.affiliateId || null,
       affiliateCode: row.affiliateCode || null,
-      status: row.affiliateProfile?.status || 'pending',
+      status: affiliateStatus(row),
       balance: Number(row.balance) || 0,
       totalEarnings: earningsById[String(row._id)] || 0,
       blocked: row.blocked === true,
-      createdAt: row.createdAt,
+      createdAt: joinedAt(row),
     }));
 
     return res.json({ ...paged(records, total, { page, limit }), summary });
@@ -190,10 +207,10 @@ exports.getAffiliate = async (req, res) => {
         address: affiliate.address,
         affiliateId: affiliate.affiliateId || null,
         affiliateCode: affiliate.affiliateCode || null,
-        status: affiliate.affiliateProfile?.status || 'pending',
+        status: affiliateStatus(affiliate),
         blocked: affiliate.blocked === true,
         profilePicture: affiliate.image || affiliate.profilePicture || null,
-        createdAt: affiliate.createdAt,
+        createdAt: joinedAt(affiliate),
         balance: Number(affiliate.balance) || 0,
         application: affiliate.affiliateProfile || {},
         commissionSettings: affiliate.affiliateSettings || {},
@@ -256,11 +273,19 @@ exports.getAffiliate = async (req, res) => {
 };
 
 /**
- * Approves, rejects, suspends or reinstates an affiliate.
+ * Switches an affiliate account on or off.
  *
- * Approval is where the referral code is issued, so an affiliate has no working
- * link before a human has looked at the application. Every transition requires a
- * reason when it is a negative one, and all of them land in the audit log.
+ * There is no approval to give: an affiliate signs up active and can share their
+ * link immediately, so the console's only lever is whether they should currently
+ * be able to refer and earn. Switching off stops new commission accruing and
+ * takes them out of the directory and the referral picker; it deliberately does
+ * not touch attribution already recorded or earnings already banked, because
+ * reversing those is a separate financial act with its own audit trail.
+ *
+ * A reason is welcome but optional. Deactivating is meant to be one deliberate
+ * click — requiring prose would make administrators skip it in the cases that
+ * matter — but whatever they write is kept, because "why was this affiliate
+ * switched off" is the first question asked when the affiliate writes in.
  */
 exports.updateAffiliateStatus = async (req, res) => {
   try {
@@ -268,19 +293,15 @@ exports.updateAffiliateStatus = async (req, res) => {
 
     const { status, reason, note } = req.body || {};
 
-    if (!APPROVAL_STATUSES.includes(status)) {
+    if (!AFFILIATE_STATUSES.includes(status)) {
       return res.status(400).json({ message: 'Unknown affiliate status' });
-    }
-    // A refusal without a reason is a support ticket waiting to happen.
-    if (['rejected', 'suspended'].includes(status) && !String(reason || '').trim()) {
-      return res.status(400).json({ message: 'A reason is required' });
     }
 
     const affiliate = await User.findOne({ _id: req.params.id, role: 'affiliate' });
     if (!affiliate) return res.status(404).json({ message: 'Affiliate not found' });
 
     const before = {
-      status: affiliate.affiliateProfile?.status || 'pending',
+      status: affiliateStatus(affiliate),
       affiliateCode: affiliate.affiliateCode || null,
     };
 
@@ -293,15 +314,20 @@ exports.updateAffiliateStatus = async (req, res) => {
 
     if (note !== undefined) update['affiliateProfile.reviewNote'] = String(note).slice(0, 1000);
 
-    if (status === 'approved') {
-      update['affiliateProfile.approvedAt'] = now;
-      // Clearing rather than leaving a stale rejection behind, so a reinstated
+    if (status === 'active') {
+      // Clearing rather than leaving a stale shutdown behind, so a reactivated
       // affiliate is not shown a reason that no longer applies.
-      update['affiliateProfile.rejectionReason'] = null;
+      update['affiliateProfile.deactivationReason'] = null;
+      update['affiliateProfile.deactivatedAt'] = null;
+      update['affiliateProfile.deactivatedBy'] = null;
       update['affiliateProfile.suspensionReason'] = null;
+      update['affiliateProfile.rejectionReason'] = null;
 
-      // The code is issued once and kept for life: regenerating it on
-      // reinstatement would break every link the affiliate has already shared.
+      // An affiliate who signed up before the referral code was issued at
+      // registration — or who was switched off while it still was not — has none.
+      // Reactivating them without one would leave them active and unable to refer,
+      // which is the worst of both. The code is issued once and kept for life:
+      // regenerating it on reactivation would break every link already shared.
       if (!affiliate.affiliateCode) {
         try {
           update.affiliateCode = await generateUniqueAffiliateCode();
@@ -312,13 +338,12 @@ exports.updateAffiliateStatus = async (req, res) => {
       }
     }
 
-    if (status === 'rejected') {
-      update['affiliateProfile.rejectionReason'] = String(reason).trim().slice(0, 500);
-    }
-
-    if (status === 'suspended') {
-      update['affiliateProfile.suspendedAt'] = now;
-      update['affiliateProfile.suspensionReason'] = String(reason).trim().slice(0, 500);
+    if (status === 'deactivated') {
+      update['affiliateProfile.deactivatedAt'] = now;
+      update['affiliateProfile.deactivatedBy'] = req.user.id;
+      if (String(reason || '').trim()) {
+        update['affiliateProfile.deactivationReason'] = String(reason).trim().slice(0, 500);
+      }
     }
 
     // `findOneAndUpdate` with the role in the filter, so this can never touch a
@@ -342,18 +367,18 @@ exports.updateAffiliateStatus = async (req, res) => {
     });
 
     Notification.create({
-      title: 'Affiliate application update',
+      title: 'Affiliate account update',
       content:
-        status === 'approved'
-          ? 'Your affiliate application has been approved. Your referral link is now active.'
-          : `Your affiliate application status is now: ${status}.${reason ? ` Reason: ${String(reason).slice(0, 300)}` : ''}`,
+        status === 'active'
+          ? 'Your affiliate account is active. Your referral link is working.'
+          : `Your affiliate account has been deactivated, so your referral link is no longer earning.${reason ? ` Reason: ${String(reason).slice(0, 300)}` : ''}`,
       contentId: String(affiliate._id),
       read: false,
       userId: affiliate._id,
     }).catch((error) => console.error('Affiliate status notification failed:', error.message));
 
     return res.json({
-      message: `Affiliate ${status}`,
+      message: status === 'active' ? 'Affiliate activated' : 'Affiliate deactivated',
       affiliate: {
         id: updated._id,
         status: updated.affiliateProfile?.status,
@@ -542,12 +567,15 @@ exports.stats = async (req, res) => {
     ]);
 
     return res.json({
+      // Normalised the same way as the roster, so the programme-wide figures and
+      // the roster's own summary counts can never disagree about how many
+      // affiliates are active.
       affiliates: byStatus.reduce(
         (acc, row) => {
-          acc[row._id || 'pending'] = row.count;
+          acc[affiliateStatus({ affiliateProfile: { status: row._id } })] += row.count;
           return acc;
         },
-        { pending: 0, under_review: 0, approved: 0, rejected: 0, suspended: 0 }
+        { active: 0, deactivated: 0 }
       ),
       commissions: commissionTotals.reduce((acc, row) => {
         acc[row._id] = { total: toMajor(row.total), count: row.count };
@@ -670,4 +698,4 @@ exports.updateCourseCommission = async (req, res) => {
   }
 };
 
-module.exports.APPROVAL_STATUSES = APPROVAL_STATUSES;
+module.exports.AFFILIATE_STATUSES = AFFILIATE_STATUSES;

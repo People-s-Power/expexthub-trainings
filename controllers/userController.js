@@ -11,6 +11,7 @@ const { sendEmailReminder } = require("../utils/sendEmailReminder.js");
 const { default: axios } = require("axios");
 const crypto = require("crypto");
 const { hasPaidPlan, planCatalogue, planNameForId } = require("../utils/plans.js");
+const { DEACTIVATED_STATUSES } = require("../utils/affiliateStatus.js");
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
 const flutterwavePublicKey = process.env.FLUTTERWAVE_PUBLIC_KEY;
 
@@ -1139,9 +1140,17 @@ const userControllers = {
     try {
       const actorId = req.user?.id || req.user?._id;
 
-      const users = await User.find(
-        actorId ? { _id: { $ne: actorId } } : {}
-      )
+      // A deactivated affiliate is excluded outright rather than returned with a
+      // flag: this list is what a provider picks a team member from, and offering
+      // an account that cannot sign in or earn would only produce an invitation
+      // that fails at the other end. The rule lives here, in the query, so no
+      // caller can forget it.
+      const users = await User.find({
+        ...(actorId ? { _id: { $ne: actorId } } : {}),
+        $nor: [
+          { role: 'affiliate', 'affiliateProfile.status': { $in: DEACTIVATED_STATUSES } },
+        ],
+      })
         .select('fullname email profilePicture role organizationName blocked')
         .lean();
 
