@@ -12,6 +12,7 @@ const { default: axios } = require("axios");
 const crypto = require("crypto");
 const { hasPaidPlan, planCatalogue, planNameForId } = require("../utils/plans.js");
 const { DEACTIVATED_STATUSES } = require("../utils/affiliateStatus.js");
+const { LEARNER_ROLES, isLearnerRole } = require("../utils/roles.js");
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
 const flutterwavePublicKey = process.env.FLUTTERWAVE_PUBLIC_KEY;
 
@@ -661,7 +662,7 @@ const userControllers = {
       const studentIds = enrolledStudents.map(s => s._id);
 
       // Get student details
-      const students = await User.find({ _id: { $in: studentIds }, role: 'student' });
+      const students = await User.find({ _id: { $in: studentIds }, role: { $in: LEARNER_ROLES } });
 
       if (!students || students.length === 0) {
         return res.status(404).json({ message: 'No enrolled students found for this tutor' });
@@ -695,8 +696,9 @@ const userControllers = {
 
   getMyGraduates: async (req, res) => {
     try {
-      // Find all users with the role 'student'
-      const students = await User.find({ role: 'student', assignedCourse: req.body.course, graduate: true });
+      // Both learner spellings — see LEARNER_ROLES. Filtering on `student` alone
+      // hid every self-registered graduate from this list.
+      const students = await User.find({ role: { $in: LEARNER_ROLES }, assignedCourse: req.body.course, graduate: true });
 
       if (!students || students.length === 0) {
         return res.status(404).json({ message: 'No students found' });
@@ -803,8 +805,9 @@ const userControllers = {
 
   getGraduates: async (req, res) => {
     try {
-      // Find all users with the role 'student'
-      const students = await User.find({ role: 'student', graduate: true });
+      // Both learner spellings — see LEARNER_ROLES. This backs the admin
+      // "Graduates/Experts" counter, which was undercounting for the same reason.
+      const students = await User.find({ role: { $in: LEARNER_ROLES }, graduate: true });
 
       if (!students || students.length === 0) {
         return res.status(404).json({ message: 'No students found' });
@@ -1046,7 +1049,10 @@ const userControllers = {
       if (!student) {
         return res.status(404).json({ message: 'Student not found' });
       }
-      if (student.role !== 'student') {
+      // Both learner spellings, not `student` alone. A self-registered student
+      // is stored as `client`, and this check was rejecting exactly those — the
+      // students a tutor is most likely to be looking at.
+      if (!isLearnerRole(student.role)) {
         return res.status(400).json({ message: 'Only students can be marked as graduates' });
       }
 
