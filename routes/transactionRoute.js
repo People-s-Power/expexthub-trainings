@@ -3,6 +3,7 @@ const transactionRouter = express.Router();
 const transactionController = require('../controllers/transactionController.js');
 const authenticate = require('../middlewares/auth.js');
 const authorize = require('../middlewares/authorize.js');
+const tutorSurface = require('../middlewares/tutorSurface.js');
 const { TUTOR_ROLES } = require('../utils/roles.js');
 const { validateObjectId } = require('../middlewares/validateRequest.js');
 const { paymentLimiter, walletLimiter, generalLimiter } = require('../middlewares/rateLimiter.js');
@@ -43,7 +44,7 @@ transactionRouter.get('/verify-wallet-funding/:txRef', transactionController.ver
 // The fundings this provider has made into student wallets, with their statuses.
 // Scoped to the caller's own rows — a provider cannot read a student's full
 // financial history here (that stays restricted in getBalance).
-transactionRouter.get('/funded-students', authenticate, authorize(...TUTOR_ROLES), generalLimiter, transactionController.listFundedStudents);
+transactionRouter.get('/funded-students', authenticate, tutorSurface(TUTOR_ROLES, 'Fund Wallet'), generalLimiter, transactionController.listFundedStudents);
 
 // Course payment endpoints (student/client only)
 transactionRouter.post('/initialize-course-payment', authenticate, authorize('student', 'client'), paymentLimiter, validateObjectId('courseId'), transactionController.initializeCoursePayment);
@@ -60,19 +61,19 @@ transactionRouter.post('/course-payment-plans/:planId/payments/wallet', authenti
 
 // Payment records for the payments menu. Tutors and admins both reach this;
 // the controller scopes rows by course ownership, so a tutor only ever sees the
-// money owed on their own courses. Team members pass the role gate but the
-// controller still requires the owner's "View Payments" privilege before any
-// row is returned.
+// money owed on their own courses. A team member passes the role gate only when
+// the acting owner's membership grants the privilege named here, and the
+// controller then scopes the rows to that owner — the grant decides who may
+// look, the scope decides at what.
 const paymentRecordController = require('../controllers/paymentRecordController.js');
-transactionRouter.get('/payment-records', authenticate, authorize(...TUTOR_ROLES), generalLimiter, paymentRecordController.listPaymentRecords);
-transactionRouter.get('/payment-records/courses', authenticate, authorize(...TUTOR_ROLES), generalLimiter, paymentRecordController.listPaymentRecordCourses);
-// Recording an offline settlement of a student's outstanding balance. Admits
-// the whole tutor family for the same reason the read routes above do: a team
-// member passes the role gate and the controller then requires the owner's
-// "Collect Payment Balance" privilege, resolves the acting owner, and scopes
-// the course to that owner — so the privilege decides who may collect and the
-// scope decides on what.
-transactionRouter.post('/payment-records/settle-balance', authenticate, authorize(...TUTOR_ROLES), paymentLimiter, paymentRecordController.settleStudentBalance);
+transactionRouter.get('/payment-records', authenticate, tutorSurface(TUTOR_ROLES, 'View Payments'), generalLimiter, paymentRecordController.listPaymentRecords);
+transactionRouter.get('/payment-records/courses', authenticate, tutorSurface(TUTOR_ROLES, 'View Payments'), generalLimiter, paymentRecordController.listPaymentRecordCourses);
+// Recording an offline settlement of a student's outstanding balance, under its
+// own grant so a provider can let a member reconcile the list without also
+// letting them write money into the ledger. The controller re-resolves the
+// acting owner and scopes the course to it, so the privilege decides who may
+// collect and the scope decides on what.
+transactionRouter.post('/payment-records/settle-balance', authenticate, tutorSurface(TUTOR_ROLES, 'Collect Payment Balance'), paymentLimiter, paymentRecordController.settleStudentBalance);
 
 // Admin-only operations
 transactionRouter.post('/cancel-premium/:userId', authenticate, authorize('admin'), validateObjectId('userId'), transactionController.cancelPremiumPlan);

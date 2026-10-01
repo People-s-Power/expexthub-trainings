@@ -17,6 +17,7 @@ const {
   grantCourseAccess,
   creditInstructor,
 } = require('../services/coursePaymentService.js');
+const { resolveForOwner, actingOwnerHeader } = require('../utils/actingOwner.js');
 
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
@@ -28,11 +29,16 @@ const TIMELINE_LIMIT = 50;
  * Resolves the user whose courses a caller may act on for payment records.
  *
  * Admins scope the whole platform. A tutor/provider scopes their own courses.
- * A team member acting for a provider keeps their own JWT while the dashboard
- * shows the provider, so the acting owner arrives explicitly as `ownerId`
- * (mirroring /auth/add-team's ownerId). The member is allowed only when the
- * owner added them, the invitation was accepted, and the membership grants
- * `privilege` — and the scope is the owner's courses, never the member's own.
+ * A team member acting for a provider keeps their own session while the
+ * dashboard shows the provider, so the acting owner arrives separately — in the
+ * `X-Acting-Owner` header, or in the `ownerId` these payment screens have sent
+ * in the query or body since they were written. Both are read here, and the
+ * header wins: it is set once for the whole workspace, while a query value is
+ * one screen's own idea of whose records it wants.
+ *
+ * The rule itself lives in utils/actingOwner.js, shared with the route gate, so
+ * there is one implementation of "may this person act for that account" rather
+ * than two that can drift apart.
  *
  * `privilege` is what separates reading from collecting: "View Payments" opens
  * the records, and "Collect Payment Balance" additionally permits recording an
@@ -42,53 +48,19 @@ const TIMELINE_LIMIT = 50;
  *
  * Returns `{ ok, status, message, caller, scoper }`.
  */
-async function authorizeOwnerPrivilege(callerId, requestedOwnerId, privilege, denialMessage) {
-  const caller = await User.findById(callerId).select('role teamMembers fullname');
-  if (!caller) {
-    return { ok: false, status: 401, message: 'Authentication required' };
-  }
-  if (caller.role === 'admin') return { ok: true, caller, scoper: caller };
-
-  // The acting owner id normally equals the caller, except when a team member
-  // is impersonating the provider that added them.
-  const actorId = String(caller._id);
-  const ownerId = requestedOwnerId && String(requestedOwnerId) !== actorId
-    ? String(requestedOwnerId)
-    : actorId;
-
-  // Admin is handled above. Anyone asking for a different owner must be an
-  // accepted member of that owner holding this privilege.
-  if (ownerId !== actorId) {
-    if (caller.role !== 'team_member') {
-      return { ok: false, status: 403, message: denialMessage };
-    }
-    const ownerEntry = (caller.teamMembers || []).find(
-      (entry) =>
-        String(entry.ownerId) === ownerId && entry.status === 'accepted'
-    );
-    const granted = ownerEntry && Array.isArray(ownerEntry.privileges)
-      && ownerEntry.privileges.some(p => p.value === privilege && p.checked);
-    if (!granted) {
-      return { ok: false, status: 403, message: denialMessage };
-    }
-    const owner = await User.findById(ownerId).select('role');
-    if (!owner) {
-      return { ok: false, status: 404, message: 'Owner not found' };
-    }
-    // The scope is built from the owner's own role/id.
-    return { ok: true, caller, scoper: owner };
-  }
-
-  // tutor/provider (and team_member acting on their own record — no courses,
-  // so an empty scope) keep the historical behaviour.
-  return { ok: true, caller, scoper: caller };
+async function authorizeOwnerPrivilege(req, privilege, denialMessage) {
+  return resolveForOwner(
+    req.user?.id || req.user?._id,
+    actingOwnerHeader(req) || req.query?.ownerId || req.body?.ownerId || null,
+    privilege,
+    denialMessage
+  );
 }
 
 /** Reading the records requires the owner's "View Payments" grant. */
-const authorizePaymentView = (callerId, requestedOwnerId) =>
+const authorizePaymentView = (req) =>
   authorizeOwnerPrivilege(
-    callerId,
-    requestedOwnerId,
+    req,
     'View Payments',
     'You do not have permission to view these payments'
   );
@@ -417,8 +389,7 @@ const paymentRecordController = {
    */
   listPaymentRecords: async (req, res) => {
     try {
-      const callerId = req.user?.id || req.user?._id;
-      const authz = await authorizePaymentView(callerId, req.query.ownerId);
+      const authz = await authorizePaymentView(req);
       if (!authz.ok) return res.status(authz.status).json({ message: authz.message });
       const scoper = authz.scoper;
 
@@ -518,8 +489,7 @@ const paymentRecordController = {
    */
   listPaymentRecordCourses: async (req, res) => {
     try {
-      const callerId = req.user?.id || req.user?._id;
-      const authz = await authorizePaymentView(callerId, req.query.ownerId);
+      const authz = await authorizePaymentView(req);
       if (!authz.ok) return res.status(authz.status).json({ message: authz.message });
       const scoper = authz.scoper;
 
@@ -577,8 +547,7 @@ const paymentRecordController = {
     try {
       const callerId = req.user?.id || req.user?._id;
       const authz = await authorizeOwnerPrivilege(
-        callerId,
-        req.body.ownerId,
+        req,
         'Collect Payment Balance',
         'You do not have permission to record payments'
       );

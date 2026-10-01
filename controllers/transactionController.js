@@ -7,6 +7,12 @@ const CoursePaymentPlan = require('../models/coursePaymentPlans.js');
 const PaymentWebhookEvent = require('../models/paymentWebhookEvents.js');
 const { sendPaymentReceiptOnce } = require('../utils/emails/receiptDispatcher.js');
 const { isValidObjectId, parseAmount } = require('../middlewares/validateRequest.js');
+const { TUTOR_ROLES } = require('../utils/roles.js');
+const {
+  actingOwnerHeader,
+  resolveForOwner,
+  scopeIdOf,
+} = require('../utils/actingOwner.js');
 const {
   finalizeFullCoursePayment,
   finalizeInstallmentPayment,
@@ -87,21 +93,26 @@ function canFundWallet(user) {
  * Resolves the user whose wallet this request may act on, and loads that user.
  *
  * Self-service is the default: no target supplied (or a target matching the
- * actor) acts on the caller's own wallet, and their own stored privileges are
- * the gate. A delegated team member impersonating a provider (the sidebar flow
- * swaps the dashboard's user id to the provider's while the member keeps their
- * own JWT) may act on that provider's wallet, and only that provider's: the
- * request must name the owner, the actor must hold an accepted membership with
- * that owner, and the membership must grant `privilege`. Every other role
- * acting on somebody else's id is rejected, so a body-supplied userId can
- * never redirect a wallet operation onto a stranger.
+ * actor) acts on the caller's own wallet. A delegated team member acting for the
+ * provider that added them (the sidebar flow swaps the dashboard's user id to
+ * the provider's while the member keeps their own session) may act on that
+ * provider's wallet, and only that provider's. The membership rule itself lives
+ * in utils/actingOwner.js, shared with the route gate and the payment records,
+ * so there is one implementation of "may this person act for that account".
+ *
+ * The acting owner is read from the `X-Acting-Owner` header as well as from a
+ * body-supplied id: the header is set once for the whole workspace, while
+ * `userId` is one screen's own idea of whose wallet it wants. Every other role
+ * naming somebody else's id is rejected, so a body-supplied id can never
+ * redirect a wallet operation onto a stranger.
  *
  * Returns { ok: true, user } with the target owner document, or { ok: false }.
  */
 async function resolveWalletTarget(req, privilege, requestedTargetId) {
   const actorId = String(req.user?.id || req.user?._id);
-  const targetId = requestedTargetId && String(requestedTargetId) !== actorId
-    ? String(requestedTargetId)
+  const requested = requestedTargetId || actingOwnerHeader(req) || null;
+  const targetId = requested && String(requested) !== actorId
+    ? String(requested)
     : actorId;
 
   if (targetId === actorId) {
@@ -109,15 +120,8 @@ async function resolveWalletTarget(req, privilege, requestedTargetId) {
     return user ? { ok: true, user } : { ok: false };
   }
 
-  const actor = await User.findById(actorId).select('role teamMembers');
-  if (!actor || actor.role !== 'team_member') return { ok: false };
-
-  const membership = (actor.teamMembers || []).find(
-    (entry) => String(entry.ownerId) === targetId && entry.status === 'accepted',
-  );
-  const granted = membership && Array.isArray(membership.privileges)
-    && membership.privileges.some((p) => p?.value === privilege && p?.checked === true);
-  if (!granted) return { ok: false };
+  const authz = await resolveForOwner(actorId, targetId, privilege);
+  if (!authz.ok || !authz.acting) return { ok: false };
 
   const owner = await User.findById(targetId);
   return owner ? { ok: true, user: owner } : { ok: false };
@@ -639,15 +643,26 @@ const transactionController = {
       let fundedBy = null;
 
       if (requestedStudentId && String(requestedStudentId) !== actorId) {
-        // A third party is depositing, so the actor's own privilege is the gate —
-        // not the recipient's. `canFundWallet` passes ordinary tutors/providers
-        // and admins, and requires an accepted membership granting "Fund Wallet"
-        // from a team member.
-        const actor = await User.findById(actorId).select('role teamMembers');
-        if (!actor || !['tutor', 'provider', 'admin', 'team_member'].includes(actor.role)) {
-          return res.status(403).json({ message: 'You do not have permission to fund a student wallet' });
-        }
-        if (!canFundWallet(actor)) {
+        // A third party is depositing, so the account being deposited FROM is
+        // what has to be authorised — not the recipient's.
+        //
+        // Normally that account is the caller's own and a provider/tutor/admin
+        // role is what admits them. A delegated member instead deposits from the
+        // provider they are working for, and their membership granting "Fund
+        // Wallet" is what admits them: testing their own role here would refuse
+        // every member, because the membership is written for whatever category
+        // of account they signed up as and their role is never rewritten. The
+        // membership rule is resolved by the same code the route gate uses.
+        const authz = await resolveForOwner(
+          actorId,
+          actingOwnerHeader(req) || req.body.ownerId || null,
+          'Fund Wallet',
+        );
+        const funderId = authz.ok && authz.acting ? String(authz.scoper._id) : actorId;
+
+        const funder = await User.findById(funderId).select('role teamMembers');
+        const isTutorFamily = funder && TUTOR_ROLES.includes(funder.role);
+        if (!funder || (!isTutorFamily && !authz.acting)) {
           return res.status(403).json({ message: 'You do not have permission to fund a student wallet' });
         }
 
@@ -656,7 +671,9 @@ const transactionController = {
           return res.status(student.status).json({ message: student.message });
         }
         user = student.user;
-        fundedBy = actorId;
+        // Stamped with the account the money left, so the provider reads the
+        // funding back on their own list whichever member made it.
+        fundedBy = funderId;
       } else {
         const { ok, user: owner } = await resolveWalletTarget(req, 'Fund Wallet', req.body.userId);
         if (!ok || !canFundWallet(owner)) {
@@ -1194,7 +1211,11 @@ const transactionController = {
    */
   listFundedStudents: async (req, res) => {
     try {
-      const actorId = String(req.user?.id || req.user?._id);
+      // The account being worked in, not the person clicking. A member acting
+      // for a provider reads the provider's fundings back, including the ones
+      // they made themselves — the ledger stamps `fundedBy` with the account the
+      // money left, which is the provider's in both cases.
+      const actorId = String(scopeIdOf(req));
 
       const fundings = await Transaction.find({
         'metadata.fundedBy': actorId,

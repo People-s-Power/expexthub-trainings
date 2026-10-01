@@ -13,6 +13,7 @@ const crypto = require("crypto");
 const { hasPaidPlan, planCatalogue, planNameForId } = require("../utils/plans.js");
 const { DEACTIVATED_STATUSES } = require("../utils/affiliateStatus.js");
 const { LEARNER_ROLES, isLearnerRole } = require("../utils/roles.js");
+const { scopeIdOf } = require("../utils/actingOwner.js");
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
 const flutterwavePublicKey = process.env.FLUTTERWAVE_PUBLIC_KEY;
 
@@ -1043,7 +1044,11 @@ const userControllers = {
   makeGraduate: async (req, res) => {
     try {
       const { userId: studentId } = req.params;
-      const actorId = req.user?.id || req.user?._id;
+      // The account being worked in, not the person clicking: a team member
+      // acting for a provider graduates the provider's students, so the
+      // enrollment below has to be looked for on the provider's courses. When
+      // nobody is being acted for this is the caller's own id, unchanged.
+      const actorId = scopeIdOf(req);
 
       const student = await User.findById(studentId);
       if (!student) {
@@ -1108,6 +1113,26 @@ const userControllers = {
         return res.status(404).json({ message: 'User not found' });
       }
 
+      // A student belongs to a course, and the privilege is "Block and unblock
+      // Students". Without this the endpoint toggles `blocked` on whichever
+      // account the path names — another provider, an administrator, a student
+      // of somebody else — so one grant is a platform-wide denial of access.
+      // The enrollment test is the one makeGraduate already uses, for the same
+      // reason, and it is what the route's own audience was always assumed to
+      // imply.
+      if (req.user?.role !== 'admin') {
+        const scoperId = scopeIdOf(req);
+        const managesStudent = await Course.exists({
+          $and: [
+            { $or: [{ instructorId: scoperId }, { assignedTutors: scoperId }] },
+            { $or: [{ enrolledStudents: userId }, { 'enrollments.user': userId }] },
+          ],
+        });
+        if (!managesStudent) {
+          return res.status(403).json({ message: 'You can only block students enrolled on your courses' });
+        }
+      }
+
       user.blocked = !user.blocked;
       await user.save();
       return res.status(200).json({ message: 'User Blocked successfully' });
@@ -1120,7 +1145,15 @@ const userControllers = {
 
   addSignature: async (req, res) => {
     try {
-      const userId = req.params.id
+      const userId = req.params.id;
+
+      // Your own signature, or — while working inside a provider's account —
+      // that provider's. The id arrives in the path, so without this any caller
+      // the route admits could overwrite the signature on any account.
+      if (req.user?.role !== 'admin' && String(userId) !== String(scopeIdOf(req))) {
+        return res.status(403).json({ message: 'You can only change your own signature' });
+      }
+
       const isUser = await User.findById(userId);
 
       if (!isUser) {
@@ -1132,7 +1165,11 @@ const userControllers = {
       isUser.signature = cloudFile.url || isUser.signature;
       await isUser.save();
 
-      return res.status(200).json({ message: 'Signature updated successfully', user: isUser });
+      // The URL, not the account. Returning the saved document sent the caller
+      // the whole user record — including the password hash and any stored
+      // Google tokens — in reply to an image upload. Neither caller reads it;
+      // both re-fetch the profile afterwards.
+      return res.status(200).json({ message: 'Signature updated successfully', signature: isUser.signature });
 
     } catch (error) {
       console.error(error);
@@ -1498,7 +1535,15 @@ const userControllers = {
       // the contract. This is the server-side half of the gate the composer
       // applies — without it the endpoint is a free relay for any account with a
       // token, whatever plan it is on.
-      if (!hasPaidPlan(sender.premiumPlan)) {
+      //
+      // The plan checked is the one belonging to the account the work is done
+      // for. A provider delegates this tool with the "Send Email" privilege, and
+      // it is the provider's plan paying for it, so testing the member's own
+      // plan would refuse precisely the delegation the grant exists to allow.
+      // The From address above still belongs to the caller, so nothing about
+      // who the mail appears to come from changes.
+      const planHolder = req.actingOwner || sender;
+      if (!hasPaidPlan(planHolder.premiumPlan)) {
         return res.status(403).json({
           message: 'Sending email requires a Standard or Enterprise plan',
           // Named so the composer can tell this refusal from the role-based 403

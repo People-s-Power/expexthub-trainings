@@ -11,6 +11,7 @@ const { executeWithdrawal } = require('../services/withdrawalService.js');
 const { ensureAffiliateIdentity, generateUniqueAffiliateCode, generateReferralToken, joinedAt } = require('../utils/affiliateIdentity');
 const { MAX_COMMISSION_RATE } = require('../services/affiliateCommissionService.js');
 const { TUTOR_ONLY } = require('../utils/roles.js');
+const { scopeIdOf } = require('../utils/actingOwner.js');
 const { SOCIAL_KEYS } = require('../utils/affiliateApplication.js');
 const { ACTIVE_AFFILIATE_FILTER, affiliateStatus, isAffiliateActive } = require('../utils/affiliateStatus.js');
 const { normalizeUrl } = require('../utils/normalizeUrl.js');
@@ -1408,7 +1409,7 @@ exports.markNotificationsRead = async (req, res) => {
  */
 exports.getSettings = async (req, res) => {
   try {
-    const provider = await User.findById(req.user.id).select('affiliateSettings organizationName fullname');
+    const provider = await User.findById(scopeIdOf(req)).select('affiliateSettings organizationName fullname');
     if (!provider) return res.status(404).json({ message: 'Account not found' });
 
     const settings = provider.affiliateSettings || {};
@@ -1446,7 +1447,7 @@ exports.getSettings = async (req, res) => {
  */
 exports.updateSettings = async (req, res) => {
   try {
-    const provider = await User.findById(req.user.id).select('affiliateSettings role');
+    const provider = await User.findById(scopeIdOf(req)).select('affiliateSettings role');
     if (!provider) return res.status(404).json({ message: 'Account not found' });
 
     const { enabled, defaultCommissionType, defaultCommissionRate, maxCommissionCap, holdDays, affiliateOverrides } =
@@ -1556,7 +1557,7 @@ exports.listCourseCommissions = async (req, res) => {
   try {
     const { page, limit, skip } = pagination(req.query);
 
-    const ownedCourseIds = await Course.find({ instructorId: req.user.id }).distinct('_id');
+    const ownedCourseIds = await Course.find({ instructorId: scopeIdOf(req) }).distinct('_id');
     if (!ownedCourseIds.length) {
       return res.json(paged([], 0, { page, limit }));
     }

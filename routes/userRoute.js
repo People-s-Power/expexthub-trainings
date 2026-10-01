@@ -2,7 +2,7 @@ const express = require('express');
 const userControllers = require('../controllers/userController.js');
 const userRouter = express.Router();
 const auth = require("../middlewares/auth.js");
-const authorize = require("../middlewares/authorize.js");
+const tutorSurface = require("../middlewares/tutorSurface.js");
 const { TUTOR_ROLES, TUTOR_ONLY } = require("../utils/roles.js");
 const { validateObjectId } = require('../middlewares/validateRequest.js');
 const { generalLimiter, mailLimiter, paymentLimiter } = require('../middlewares/rateLimiter.js');
@@ -28,13 +28,13 @@ userRouter.post("/premium", auth, paymentLimiter, userControllers.updateTutorLev
 // hash is over the caller's own id — it is never issued for somebody else.
 userRouter.get("/chat-identity", auth, userControllers.getChatIdentity);
 
-userRouter.get("/instructors", auth, authorize(...TUTOR_ONLY), userControllers.getInstructors);
+userRouter.get("/instructors", auth, tutorSurface(TUTOR_ONLY, 'Assign course to a Tutor'), userControllers.getInstructors);
 // Team members (impersonating a provider) also need the student directory to
 // enrol students on the provider's courses.
-userRouter.get("/students", auth, authorize(...TUTOR_ROLES), userControllers.getStudents);
+userRouter.get("/students", auth, tutorSurface(TUTOR_ROLES, 'Enroll students'), userControllers.getStudents);
 // Searchable, capped directory of every account — backs the Users filter in the
 // admissions menu. Tutor-and-above only: it exposes names and email addresses.
-userRouter.get("/directory", auth, authorize(...TUTOR_ROLES), generalLimiter, userControllers.searchUsers);
+userRouter.get("/directory", auth, tutorSurface(TUTOR_ROLES, 'View Course Participant and send email reminder'), generalLimiter, userControllers.searchUsers);
 userRouter.put("/updateProfile/:id", userControllers.upDateprofile);
 userRouter.put("/updateProfilePicture/:id", userControllers.updateProfilePhote);
 
@@ -50,15 +50,15 @@ userRouter.put("/mymentees", userControllers.getMyMentees);
 userRouter.put("/graduate", userControllers.getGraduates);
 userRouter.put("/mygraduate", userControllers.getMyGraduates);
 
-userRouter.put("/block/:userId", auth, authorize(...TUTOR_ONLY), validateObjectId('userId'), userControllers.block)
-userRouter.put("/graduate/:userId", auth, authorize(...TUTOR_ONLY), validateObjectId('userId'), userControllers.makeGraduate)
+userRouter.put("/block/:userId", auth, tutorSurface(TUTOR_ONLY, 'Block and unblock Students'), validateObjectId('userId'), userControllers.block)
+userRouter.put("/graduate/:userId", auth, tutorSurface(TUTOR_ONLY, 'Make Graduate'), validateObjectId('userId'), userControllers.makeGraduate)
 // Assigning a course category is self-service: any authenticated user may set
 // their own category (e.g. the signup step-3 picker, or the dashboard
 // interests modal). The controller verifies the caller may only modify their
 // own record, so a tutor cannot silently change another user's interests.
 userRouter.put("/assign/:userId", auth, validateObjectId('userId'), userControllers.addCourse)
 userRouter.put("/unassign/:userId", auth, validateObjectId('userId'), userControllers.unassignCourse)
-userRouter.put("/signature/:id", auth, authorize(...TUTOR_ONLY), validateObjectId('id'), userControllers.addSignature)
+userRouter.put("/signature/:id", auth, tutorSurface(TUTOR_ONLY, 'Edit Signature'), validateObjectId('id'), userControllers.addSignature)
 
 // Directory of every user category so a provider can add any category of user
 // as a team member.
@@ -102,7 +102,7 @@ userRouter.get('/team/:tutorId/:ownerId/:status', validateObjectId('tutorId', 'o
 
 // The caller is the sender, and the caller's plan is checked in the controller
 // before a single message goes out.
-userRouter.post('/send-mail', auth, authorize(...TUTOR_ROLES), mailLimiter, userControllers.sendMail);
+userRouter.post('/send-mail', auth, tutorSurface(TUTOR_ROLES, 'Send Email'), mailLimiter, userControllers.sendMail);
 
 // Self-service password change from Settings. The controller re-checks the
 // current password, so this only ever changes the caller's own credentials.

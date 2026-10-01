@@ -7,6 +7,7 @@ const AuditLog = require('../models/auditLog');
 const Notification = require('../models/notifications');
 const AffiliateCommission = require('../models/affiliateCommission');
 const { ensureAffiliateIdentity, generateUniqueAffiliateCode, joinedAt } = require('../utils/affiliateIdentity');
+const { scopeIdOf } = require('../utils/actingOwner.js');
 const { reverseCommission } = require('../services/affiliateCommissionService.js');
 const {
   ACTIVE_STATUSES,
@@ -745,7 +746,7 @@ exports.listAudit = async (req, res) => {
 /** Courses owned by this provider, for the per-course commission override UI. */
 exports.listProviderCourses = async (req, res) => {
   try {
-    const courses = await Course.find({ instructorId: req.user.id })
+    const courses = await Course.find({ instructorId: scopeIdOf(req) })
       .select('title fee affiliateCommission')
       .sort({ title: 1 })
       .limit(200)
@@ -799,7 +800,7 @@ exports.updateCourseCommission = async (req, res) => {
     // Scoped by instructorId, so a provider can only change their own course. A
     // course they do not own resolves to null and its existence is not disclosed.
     const course = await Course.findOneAndUpdate(
-      { _id: req.params.courseId, instructorId: req.user.id },
+      { _id: req.params.courseId, instructorId: scopeIdOf(req) },
       { $set: update },
       { new: true }
     ).select('title affiliateCommission');

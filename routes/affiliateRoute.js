@@ -3,6 +3,7 @@ const affiliateRouter = express.Router();
 
 const authenticate = require('../middlewares/auth');
 const authorize = require('../middlewares/authorize');
+const tutorSurface = require('../middlewares/tutorSurface');
 const affiliate = require('../controllers/affiliateController');
 const adminAffiliate = require('../controllers/adminAffiliateController');
 const { TUTOR_ROLES, TUTOR_ONLY } = require('../utils/roles.js');
@@ -35,24 +36,34 @@ affiliateRouter.post('/attribute', generalLimiter, affiliate.attribute);
 // -----------------------------------------------------------------------------
 // Provider routes — the commission settings the training provider controls
 // (requirement 2). Reached with the tutor family's session, not an affiliate's.
+//
+// None of these names a team privilege, and that is deliberate rather than an
+// omission: the team catalogue has no grant for setting what affiliates are
+// paid, because the rate is the provider's own commercial decision. A team
+// member therefore reaches them only in their own account, and naming a
+// provider in the acting header is refused — `tutorSurface` treats a route with
+// no privilege behind it as closed to acting members rather than guessing at
+// one. If a provider should be able to delegate this, it needs a privilege of
+// its own in the catalogue first.
 // -----------------------------------------------------------------------------
 
-affiliateRouter.get('/settings', authenticate, authorize(...TUTOR_ROLES), affiliate.getSettings);
-affiliateRouter.put('/settings', authenticate, authorize(...TUTOR_ONLY), affiliate.updateSettings);
+affiliateRouter.get('/settings', authenticate, tutorSurface(TUTOR_ROLES), affiliate.getSettings);
+affiliateRouter.put('/settings', authenticate, tutorSurface(TUTOR_ONLY), affiliate.updateSettings);
 
-// What affiliates have earned on this provider's own courses.
+// What affiliates have earned on this provider's own courses. Reading money, so
+// it is the same "View Payments" grant that opens the payment records.
 affiliateRouter.get(
   '/course-commissions',
   authenticate,
-  authorize(...TUTOR_ROLES),
+  tutorSurface(TUTOR_ROLES, 'View Payments'),
   generalLimiter,
   affiliate.listCourseCommissions
 );
-affiliateRouter.get('/courses', authenticate, authorize(...TUTOR_ONLY), adminAffiliate.listProviderCourses);
+affiliateRouter.get('/courses', authenticate, tutorSurface(TUTOR_ONLY), adminAffiliate.listProviderCourses);
 affiliateRouter.put(
   '/courses/:courseId/commission',
   authenticate,
-  authorize(...TUTOR_ONLY),
+  tutorSurface(TUTOR_ONLY),
   adminAffiliate.updateCourseCommission
 );
 

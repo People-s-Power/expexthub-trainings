@@ -2,6 +2,7 @@ const express = require('express');
 const courseController = require('../controllers/courseController.js');
 const authenticate = require('../middlewares/auth.js');
 const authorize = require('../middlewares/authorize.js');
+const tutorSurface = require('../middlewares/tutorSurface.js');
 const { TUTOR_ROLES, TUTOR_ONLY } = require('../utils/roles.js');
 const { validateObjectId } = require('../middlewares/validateRequest.js');
 const { generalLimiter } = require('../middlewares/rateLimiter.js');
@@ -29,22 +30,28 @@ courseRouter.post("/get-zoom-signature", authenticate, courseController.getZoomS
 courseRouter.post("/enroll/:courseId", authenticate, authorize('student', 'client'), validateObjectId('courseId'), courseController.enrollCourse);
 courseRouter.get("/enrolled-courses/:userId", authenticate, validateObjectId('userId'), courseController.getEnrolledCourses);
 
-// Instructor/admin course management
-courseRouter.post("/add-course/:userId", authenticate, authorize(...TUTOR_ONLY), validateObjectId('userId'), courseController.addCourse);
-courseRouter.get("/admissions/:courseId", authenticate, authorize(...TUTOR_ONLY), validateObjectId('courseId'), courseController.getEnrolledStudents);
+// Instructor/admin course management.
+//
+// Each route names the team privilege that opens it, so a provider's team
+// member reaches exactly the screens the provider ticked for them and no
+// others. A caller with no acting owner is decided by role alone, unchanged.
+courseRouter.post("/add-course/:userId", authenticate, tutorSurface(TUTOR_ONLY, 'Create course'), validateObjectId('userId'), courseController.addCourse);
+courseRouter.get("/admissions/:courseId", authenticate, tutorSurface(TUTOR_ONLY, 'View Course Participant and send email reminder'), validateObjectId('courseId'), courseController.getEnrolledStudents);
 // Enrolling somebody else needs its own endpoint: /enroll deliberately ignores
 // any student id in the body so a student cannot enroll another account.
-courseRouter.post("/enroll-student/:courseId", authenticate, authorize(...TUTOR_ROLES), validateObjectId('courseId'), courseController.enrollStudentByInstructor);
+courseRouter.post("/enroll-student/:courseId", authenticate, tutorSurface(TUTOR_ROLES, 'Enroll students'), validateObjectId('courseId'), courseController.enrollStudentByInstructor);
 // Force-release a student's in-flight payment attempt so the tutor can start a
 // fresh one without waiting out the checkout reuse window.
-courseRouter.post("/enroll-student/:courseId/cancel-attempt", authenticate, authorize(...TUTOR_ROLES), validateObjectId('courseId'), courseController.cancelStudentPaymentAttempt);
-courseRouter.post("/assign/:courseId", authenticate, authorize(...TUTOR_ONLY), validateObjectId('courseId'), courseController.assignTutor);
-courseRouter.delete("/delete/:id", authenticate, authorize(...TUTOR_ONLY), validateObjectId('id'), courseController.deleteCourse);
-courseRouter.put("/edit/:id", authenticate, authorize(...TUTOR_ONLY), validateObjectId('id'), courseController.editCourse);
-courseRouter.get("/notify-live/:id", authenticate, authorize(...TUTOR_ONLY), validateObjectId('id'), courseController.notifyLive);
-courseRouter.post("/upload/:courseId", authenticate, authorize(...TUTOR_ONLY), validateObjectId('courseId'), courseController.videoUpload);
-courseRouter.get("/cloudinary/signed-url", authenticate, authorize(...TUTOR_ONLY), courseController.getSignedURL);
-courseRouter.put('/update-status/:courseId', authenticate, authorize(...TUTOR_ONLY), validateObjectId('courseId', 'id'), courseController.updateStatus);
+courseRouter.post("/enroll-student/:courseId/cancel-attempt", authenticate, tutorSurface(TUTOR_ROLES, 'Enroll students'), validateObjectId('courseId'), courseController.cancelStudentPaymentAttempt);
+courseRouter.post("/assign/:courseId", authenticate, tutorSurface(TUTOR_ONLY, 'Assign course to a Tutor'), validateObjectId('courseId'), courseController.assignTutor);
+courseRouter.delete("/delete/:id", authenticate, tutorSurface(TUTOR_ONLY, 'Delete Course'), validateObjectId('id'), courseController.deleteCourse);
+courseRouter.put("/edit/:id", authenticate, tutorSurface(TUTOR_ONLY, 'Edit Course'), validateObjectId('id'), courseController.editCourse);
+courseRouter.get("/notify-live/:id", authenticate, tutorSurface(TUTOR_ONLY, 'Send Course Participant Email Reminder'), validateObjectId('id'), courseController.notifyLive);
+courseRouter.post("/upload/:courseId", authenticate, tutorSurface(TUTOR_ONLY, 'Edit Course'), validateObjectId('courseId'), courseController.videoUpload);
+courseRouter.get("/cloudinary/signed-url", authenticate, tutorSurface(TUTOR_ONLY, 'Edit Course'), courseController.getSignedURL);
+// Marking one student's place on a course, so it is the enrol grant that opens
+// it rather than the course-editing one.
+courseRouter.put('/update-status/:courseId', authenticate, tutorSurface(TUTOR_ONLY, 'Enroll students'), validateObjectId('courseId', 'id'), courseController.updateStatus);
 
 // Admin-only operations
 courseRouter.get("/unapproved", authenticate, authorize('admin'), courseController.getUnaproved);
@@ -56,6 +63,6 @@ courseRouter.get('/renew/:courseId/:id', authenticate, authorize('admin'), valid
 // because it is their own course's revenue they are waiving; team_member is
 // admitted because the controller enforces the "Enroll students" privilege, so
 // neither a tutor nor a member can grant on a course they do not manage.
-courseRouter.post('/give-scholarship/:courseId', authenticate, authorize(...TUTOR_ROLES), validateObjectId('courseId'), courseController.giveScholarship);
+courseRouter.post('/give-scholarship/:courseId', authenticate, tutorSurface(TUTOR_ROLES, 'Enroll students'), validateObjectId('courseId'), courseController.giveScholarship);
 
 module.exports = courseRouter;

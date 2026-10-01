@@ -17,6 +17,7 @@ const LearningEvent = require("../models/event.js");
 const { createGoogleMeet } = require("../utils/createGoogleMeeting.js");
 const { default: mongoose } = require("mongoose");
 const crypto = require("crypto");
+const { scopeIdOf } = require("../utils/actingOwner.js");
 const {
     creditInstructor,
     initializeGatewayCheckout,
@@ -322,6 +323,16 @@ const courseController = {
         // Get user ID from the request headers
         const userId = req.params.userId;
 
+        // The course is created in the account the request is working in, and
+        // nowhere else. The id arrives in the path, so without this any tutor
+        // could create a course inside another tutor's account — and, now that
+        // a provider's team member can reach this route, a delegated member
+        // could name a third party the provider never added them to. While
+        // acting, `scopeIdOf` is the provider's id, which is exactly the id the
+        // dashboard sends in the path, so the ordinary flow is unaffected.
+        if (String(userId) !== String(scopeIdOf(req))) {
+            return res.status(403).json({ message: 'You can only create courses in your own account' });
+        }
 
         // Query the user database to get the user's role
         const user = await User.findById(userId);
@@ -333,8 +344,14 @@ const courseController = {
         coursesByUser = [...coursesByUser, ...(await LearningEvent.find({
             authorId: userId,
         }))]
-        // Check if the user has the necessary role to add a course
-        const allowedRoles = ['tutor', 'admin', 'super admin', 'super-admin'];
+        // Check if the user has the necessary role to add a course.
+        //
+        // `provider` is the same persona as `tutor` and is what the sign-up form
+        // actually stores (see utils/roles.js), so leaving it out refused every
+        // form-registered provider. `super admin`/`super-admin` never matched a
+        // stored role either — the platform has only `admin` — and are kept only
+        // so this list keeps reading as the historical set.
+        const allowedRoles = ['tutor', 'provider', 'admin', 'super admin', 'super-admin'];
         if (!user || !allowedRoles.includes(user.role)) {
             return res.status(403).json({ message: 'Permission denied. Only tutors and admins can add courses' });
         }
@@ -1241,6 +1258,15 @@ const courseController = {
             if (!course) {
                 return res.status(404).json({ message: 'Course not found' });
             }
+
+            // `assignedTutors` is one of the two things `canManageCourse` reads,
+            // so this endpoint hands out course management. Both ids come from
+            // outside the caller — the course from the path, the tutor from the
+            // body — so being able to reach the route must not be enough.
+            const caller = await User.findById(scopeIdOf(req));
+            if (!canPerformCourseAction(course, caller, 'Assign course to a Tutor')) {
+                return res.status(403).json({ message: 'You can only assign tutors to courses you own or manage' });
+            }
             console.log(course);
             // Check if the student is already enrolled
             if (course.assignedTutors.includes(id)) {
@@ -1310,6 +1336,16 @@ const courseController = {
 
             if (!course) {
                 return res.status(404).json({ message: 'Course not found' });
+            }
+
+            // The response is the students' names, emails, phone numbers and
+            // home addresses, so the course has to be one this caller manages.
+            // The id arrives in the path, so the check cannot be left to the
+            // route: a team member's grant is scoped to one provider, and
+            // without this it would answer for any course on the platform.
+            const caller = await User.findById(scopeIdOf(req));
+            if (!canPerformCourseAction(course, caller, 'View Course Participant and send email reminder')) {
+                return res.status(403).json({ message: 'You can only view students on courses you own or manage' });
             }
 
             // Fetch details of enrolled students
@@ -1398,6 +1434,15 @@ const courseController = {
             const course = await Course.findById(courseId);
             if (!course) return res.status(404).json({ message: 'Course not found' });
 
+            // The whole body is applied below, so `instructorId` among it is
+            // writable — an unauthorised edit is not only a rewrite of another
+            // provider's course, it is a takeover of it, since ownership is what
+            // every other check in this file reads.
+            const caller = await User.findById(scopeIdOf(req));
+            if (!canPerformCourseAction(course, caller, 'Edit Course')) {
+                return res.status(403).json({ message: 'You can only edit courses you own or manage' });
+            }
+
             let videos = req.body.videos.map(video => {
                 return {
                     title: video.title,
@@ -1473,6 +1518,13 @@ const courseController = {
             if (!course) {
                 return res.status(404).json({ message: 'Course not found' });
             }
+
+            // Notifying everyone enrolled mails the whole cohort, so it is an
+            // action on a course this caller manages. The id comes from the path.
+            const caller = await User.findById(scopeIdOf(req));
+            if (!canPerformCourseAction(course, caller, 'Send Course Participant Email Reminder')) {
+                return res.status(403).json({ message: 'You can only notify students on courses you own or manage' });
+            }
             course.enrolledStudents.map(async userId => {
                 await Notification.create({
                     title: "Course live",
@@ -1490,10 +1542,23 @@ const courseController = {
 
     deleteCourse: async (req, res) => {
         try {
-            const course = await Course.deleteOne({
-                _id: req.params.id
-            })
-            res.json(course);
+            // Resolved and authorised before the delete, because `deleteOne`
+            // reports only how many rows went: by the time it answers, the course
+            // and its enrollments are already gone and there is nothing left to
+            // check. The id comes from the path, so without this any caller the
+            // route admits — including a provider's team member — could destroy
+            // a course belonging to somebody else.
+            const course = await Course.findById(req.params.id);
+            if (!course) {
+                return res.status(404).json({ message: 'Course not found' });
+            }
+            const caller = await User.findById(scopeIdOf(req));
+            if (!canPerformCourseAction(course, caller, 'Delete Course')) {
+                return res.status(403).json({ message: 'You can only delete courses you own or manage' });
+            }
+
+            const result = await Course.deleteOne({ _id: req.params.id });
+            res.json(result);
         } catch (error) {
             console.error(error);
             res.status(400).json(error);
@@ -1505,6 +1570,14 @@ const courseController = {
 
         try {
             const course = await Course.findById(courseId);
+
+            // Appending lessons rewrites the course, so it needs the same
+            // authorisation the edit screen does. The id comes from the path.
+            const caller = await User.findById(scopeIdOf(req));
+            if (!course || !canPerformCourseAction(course, caller, 'Edit Course')) {
+                return res.status(403).json({ message: 'You can only add lessons to courses you own or manage' });
+            }
+
             const videos = req.body.videos
             await Promise.all(videos.map(async video => {
                 try {
@@ -1538,6 +1611,14 @@ const courseController = {
 
             if (!course) {
                 return res.status(404).json({ message: 'Course not found' });
+            }
+
+            // Expiring a place revokes a student's access, so it is an action on
+            // a course this caller manages. The course id comes from the path
+            // and the student id from the body, and neither is the caller's.
+            const caller = await User.findById(scopeIdOf(req));
+            if (!canPerformCourseAction(course, caller, 'Enroll students')) {
+                return res.status(403).json({ message: 'You can only change places on courses you own or manage' });
             }
 
             // Find the student in the enrolledStudents array
