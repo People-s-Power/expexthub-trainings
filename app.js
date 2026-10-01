@@ -9,6 +9,7 @@ const Notification = require("./models/notifications.js");
 
 const { upload } = require("./config/cloudinary.js");
 const { cloudinaryVidUpload } = require("./config/cloudinary.js");
+const { ACTING_OWNER_HEADER } = require("./utils/actingOwner.js");
 
 const authRoute = require("./routes/authRoute");
 const userRouter = require("./routes/userRoute");
@@ -67,7 +68,16 @@ const corsOptions = allowedOrigins.length
       },
       credentials: true,
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-      allowedHeaders: ["Content-Type", "Authorization", "verif-hash"],
+      // Every header the browser is allowed to send. A header missing from this
+      // list is not merely ignored — the preflight fails, and the browser reports
+      // it as a CORS error without the request ever being made. `Authorization`
+      // already puts every authenticated call through a preflight, so this list
+      // is the only thing standing between a custom header and a working one.
+      // (`verif-hash` is here for the Flutterwave webhook; `ACTING_OWNER_HEADER`
+      // is the one a team member's client sends while inside a provider's
+      // workspace. Browser header names are case-insensitive, and so is this
+      // match, so the constant's lower-case spelling is what arrives.)
+      allowedHeaders: ["Content-Type", "Authorization", "verif-hash", ACTING_OWNER_HEADER],
       maxAge: 86400,
     }
   : { origin: "*", credentials: false };
