@@ -19,6 +19,7 @@ const {
   summarizeEnrollmentPaid,
 } = require('../services/coursePaymentService.js');
 const { resolveForOwner, actingOwnerHeader } = require('../utils/actingOwner.js');
+const { ownershipMatch } = require('../utils/courseOwnership.js');
 
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
@@ -78,18 +79,12 @@ function courseScopeFor(caller, courseId) {
   const scope = {};
   if (courseId) scope._id = new mongoose.Types.ObjectId(String(courseId));
   if (caller.role === 'admin') return scope;
-  // instructorId/assignedTutors are typed ObjectId, but some legacy course
-  // documents stored them as plain strings. Course.aggregate does NOT cast
-  // $match values the way Course.find does, so matching only the ObjectId form
-  // silently returns zero rows for those string-stored courses — which is
-  // exactly how a tutor's whole payments view goes blank. Match both forms.
-  return {
-    ...scope,
-    $or: [
-      { instructorId: { $in: [caller._id, String(caller._id)] } },
-      { assignedTutors: { $in: [caller._id, String(caller._id)] } },
-    ],
-  };
+  // The ownership condition now comes from utils/courseOwnership, so the ledger
+  // and the mailing audience cannot scope the same provider's courses
+  // differently. It keeps both id spellings, which is what this aggregate needs:
+  // `$match` is the one place Mongoose never casts, so unlike `Course.find` it
+  // can still reach a course whose owner was stored as a plain string.
+  return { ...scope, ...ownershipMatch(caller._id) };
 }
 
 function parsePagination(query) {

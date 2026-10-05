@@ -14,6 +14,7 @@ const { hasPaidPlan, planCatalogue, planNameForId } = require("../utils/plans.js
 const { DEACTIVATED_STATUSES } = require("../utils/affiliateStatus.js");
 const { LEARNER_ROLES, isLearnerRole } = require("../utils/roles.js");
 const { scopeIdOf } = require("../utils/actingOwner.js");
+const { ownedCourseFilter, HEX_ID } = require("../utils/courseOwnership.js");
 const { evaluateGraduation } = require("../services/graduationService.js");
 // The same ceiling the affiliate commission is bounded by. Both carve a share
 // out of one payment, so both have to agree on how much of it may leave —
@@ -476,7 +477,11 @@ const userControllers = {
       if (!callerId) {
         return res.status(401).json({ message: 'Authentication required' });
       }
-      if (!mongoose.Types.ObjectId.isValid(requested)) {
+      // The same strict test the shared ownership rule applies, so a body id it
+      // would refuse is reported as a bad request here rather than reaching the
+      // rule and surfacing as a 500. `mongoose.Types.ObjectId.isValid` also
+      // accepts a 12-character string, which no stored id ever is.
+      if (!HEX_ID.test(requested)) {
         return res.status(400).json({ message: 'Invalid user id' });
       }
 
@@ -503,17 +508,16 @@ const userControllers = {
       // admins). Without this an admin saw only courses they personally own,
       // which is normally none — the courses belong to the provider accounts —
       // so the mailing list came back empty for them.
+      //
+      // Everyone else scopes through utils/courseOwnership, which is the same
+      // rule the admissions ledger uses. Writing the ownership condition out here
+      // instead is what made the two lists disagree: this used to name both id
+      // spellings in a `Course.find` filter, which Mongoose casts back into a
+      // single ObjectId, so every course whose owner was stored as a string was
+      // silently dropped from the mailing audience and nowhere else.
       const courseFilter = caller.role === 'admin' && requested === callerId
         ? {}
-        : {
-          $or: [
-            // Match both id forms: prod stores course ownership as strings on
-            // some documents and ObjectIds on others, and $in against a single
-            // form hides whichever half does not match.
-            { instructorId: { $in: [requested, new mongoose.Types.ObjectId(requested)] } },
-            { assignedTutors: { $in: [requested, new mongoose.Types.ObjectId(requested)] } },
-          ],
-        };
+        : await ownedCourseFilter(requested);
 
       const courses = await Course.find(courseFilter)
         .select('title enrollments enrolledStudents')
@@ -1081,15 +1085,18 @@ const userControllers = {
 
       // A tutor may only graduate a student enrolled on one of that tutor's
       // courses. The UI privilege check is not a security boundary.
+      //
+      // Scoped through the shared ownership rule rather than a `Course.exists`
+      // filter naming `instructorId: actorId` directly: that spelling is cast to
+      // an ObjectId, so for a course whose owner was stored as a string this
+      // returned false and the tutor was refused with "you can only graduate
+      // students enrolled on your courses" about a student who is enrolled on
+      // exactly that course. The gate that decides whether the request is even
+      // looked at cannot be the thing that is wrong.
       if (req.user.role !== 'admin') {
         const hasEnrollment = await Course.exists({
           $and: [
-            {
-              $or: [
-                { instructorId: actorId },
-                { assignedTutors: actorId },
-              ],
-            },
+            await ownedCourseFilter(actorId),
             {
               $or: [
                 { enrolledStudents: studentId },
@@ -1160,14 +1167,17 @@ const userControllers = {
       // Students". Without this the endpoint toggles `blocked` on whichever
       // account the path names — another provider, an administrator, a student
       // of somebody else — so one grant is a platform-wide denial of access.
-      // The enrollment test is the one makeGraduate already uses, for the same
-      // reason, and it is what the route's own audience was always assumed to
-      // imply.
+      // The enrollment test is the one makeGraduate uses, for the same reason,
+      // and it is what the route's own audience was always assumed to imply —
+      // which is why it reads the courses the same way, through the shared
+      // ownership rule. Naming `instructorId` here directly would cast it to an
+      // ObjectId, and a course whose owner was stored as a string would then look
+      // like somebody else's: the tutor refused on their own student.
       if (req.user?.role !== 'admin') {
         const scoperId = scopeIdOf(req);
         const managesStudent = await Course.exists({
           $and: [
-            { $or: [{ instructorId: scoperId }, { assignedTutors: scoperId }] },
+            await ownedCourseFilter(scoperId),
             { $or: [{ enrolledStudents: userId }, { 'enrollments.user': userId }] },
           ],
         });

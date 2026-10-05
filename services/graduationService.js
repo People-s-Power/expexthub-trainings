@@ -14,6 +14,7 @@ const Course = require('../models/courses.js');
 const Transaction = require('../models/transactions.js');
 const CoursePaymentPlan = require('../models/coursePaymentPlans.js');
 const Assessment = require('../models/assessment.js');
+const { ownedCourseFilter } = require('../utils/courseOwnership.js');
 const {
   FULL_PAYMENT_TYPES,
   summarizeEnrollmentPaid,
@@ -102,14 +103,17 @@ async function evaluateGraduation({ studentId, actorId, isAdmin = false }) {
   }
 
   // An admin graduates platform-wide; a provider graduates for their own
-  // courses. `$and` rather than a spread, because both halves carry their own
-  // `$or` and the second would silently replace the first.
-  const ownership = isAdmin ? {} : {
-    $or: [
-      { instructorId: { $in: [actorId, String(actorId)] } },
-      { assignedTutors: { $in: [actorId, String(actorId)] } },
-    ],
-  };
+  // courses. Two conditions that must both hold, so `$and` — a spread would do
+  // today, since the ownership half is a single `_id` clause, but it stopped
+  // doing so when that half was an `$or` and it will again.
+  //
+  // The ownership half comes from the shared rule, not a locally written
+  // `instructorId`/`assignedTutors` filter. Written locally it went through
+  // `Course.find`, which casts both id spellings into one ObjectId, so a course
+  // whose owner was stored as a string disappeared from the verdict entirely —
+  // and with no courses to be short on, a student who still owed money read as
+  // eligible. The gate has to see the same courses the admissions ledger does.
+  const ownership = isAdmin ? {} : await ownedCourseFilter(actorId);
 
   const courses = await Course.find({
     $and: [
