@@ -14,6 +14,11 @@ const { hasPaidPlan, planCatalogue, planNameForId } = require("../utils/plans.js
 const { DEACTIVATED_STATUSES } = require("../utils/affiliateStatus.js");
 const { LEARNER_ROLES, isLearnerRole } = require("../utils/roles.js");
 const { scopeIdOf } = require("../utils/actingOwner.js");
+const { evaluateGraduation } = require("../services/graduationService.js");
+// The same ceiling the affiliate commission is bounded by. Both carve a share
+// out of one payment, so both have to agree on how much of it may leave —
+// importing it here rather than restating it is what keeps them agreeing.
+const { MAX_SHARE_PERCENT } = require("../utils/revenueShare.js");
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
 const flutterwavePublicKey = process.env.FLUTTERWAVE_PUBLIC_KEY;
 
@@ -524,17 +529,29 @@ const userControllers = {
 
       const uniqueUsersMap = new Map();
       const add = (student, courseTitle) => {
-        if (!student || !student._id || !student.email) return;
+        // Rows are kept even without an email or while blocked. This used to drop
+        // both, which made the mailing audience quietly disagree with what the
+        // provider sees in Admissions → My Students, where the same student does
+        // appear: a student with only a phone number on file, or one who was
+        // blocked, was simply missing with nothing to explain it. The row is
+        // returned with the reason attached instead, and the caller decides
+        // whether it can be mailed.
+        if (!student || !student._id) return;
         const key = String(student._id);
         const existing = uniqueUsersMap.get(key);
         if (existing) {
           if (courseTitle && !existing.courses.includes(courseTitle)) existing.courses.push(courseTitle);
+          // A student reached through two sources can have the field populated on
+          // one path and not the other (an enrollment stub with no email, a
+          // populated plan user with one), so never let the emptier row win.
+          if (!existing.email && student.email) existing.email = student.email;
           return;
         }
         uniqueUsersMap.set(key, {
           _id: student._id,
           fullname: student.fullname,
-          email: student.email,
+          email: student.email || '',
+          hasEmail: Boolean(student.email),
           phone: student.phone,
           gender: student.gender,
           age: student.age,
@@ -544,7 +561,7 @@ const userControllers = {
           address: student.address,
           profilePicture: student.profilePicture,
           graduate: student.graduate,
-          blocked: student.blocked,
+          blocked: student.blocked === true,
           contact: student.contact,
           courses: courseTitle ? [courseTitle] : [],
         });
@@ -577,10 +594,11 @@ const userControllers = {
         plans.forEach((plan) => add(plan?.userId, titleByCourse.get(String(plan.courseId))));
       }
 
-      // Blocked accounts are excluded: they cannot sign in, so mailing them is
-      // sending a campaign nobody can act on.
+      // Blocked accounts are returned rather than filtered out — they cannot sign
+      // in, so mailing them is sending a campaign nobody can act on, but the
+      // provider is the one who blocked them and hiding the row only made the
+      // audience look wrong. `blocked` is on the row for the caller to disable.
       const students = Array.from(uniqueUsersMap.values())
-        .filter((student) => student.blocked !== true)
         .sort((a, b) => String(a.fullname || '').localeCompare(String(b.fullname || '')));
 
       return res.status(200).json({
@@ -1088,6 +1106,31 @@ const userControllers = {
 
       if (student.graduate === true) {
         return res.status(200).json({ message: 'Student is already a graduate', alreadyGraduated: true });
+      }
+
+      // Graduation is what unlocks the certificate, so it is the last gate
+      // rather than an honour granted on enrolment: the balance has to be
+      // settled and every assessment assigned to the student passed. Checked
+      // after the already-graduate branch, so re-clicking on someone who
+      // graduated before this rule existed still answers "already a graduate"
+      // instead of refusing them.
+      const eligibility = await evaluateGraduation({
+        studentId,
+        actorId,
+        isAdmin: req.user.role === 'admin',
+      });
+
+      if (!eligibility.eligible) {
+        // 409 rather than 400: nothing about the request is malformed — the
+        // student is simply not there yet, and the same request will succeed
+        // once they are. The message names what is missing because the two
+        // shortfalls have completely different fixes.
+        return res.status(409).json({
+          message: eligibility.message,
+          code: 'GRADUATION_REQUIREMENTS',
+          unpaidCourses: eligibility.unpaidCourses,
+          assessments: eligibility.assessments.outstanding,
+        });
       }
 
       student.graduate = true;
@@ -1673,7 +1716,109 @@ const userControllers = {
       console.error('Error in sendMail:', error);
       return res.status(500).json({ message: 'Unexpected error during email sending' });
     }
-  }
+  },
+
+  // ---------------------------------------------------------------------------
+  // Tutor revenue share
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The revenue share this provider pays the tutors they assign to their courses.
+   *
+   * Held on the provider's own account, exactly as `affiliateSettings` is, and
+   * read with `scopeIdOf(req)`: a team member acting for the provider reads the
+   * provider's terms, and no request can name somebody else's account.
+   */
+  getTutorRevenueShare: async (req, res) => {
+    try {
+      const account = await User.findById(scopeIdOf(req)).select('tutorRevenueShare');
+      if (!account) return res.status(404).json({ message: 'Account not found' });
+
+      const settings = account.tutorRevenueShare || {};
+
+      return res.json({
+        settings: {
+          enabled: settings.enabled === true,
+          percentage: Number(settings.percentage) || 0,
+          updatedAt: settings.updatedAt || null,
+        },
+        limits: { maxSharePercent: MAX_SHARE_PERCENT },
+      });
+    } catch (error) {
+      console.error('Tutor revenue share read failed:', error);
+      return res.status(500).json({ message: 'Could not load your tutor revenue share' });
+    }
+  },
+
+  /**
+   * Saves the share.
+   *
+   * An out-of-range percentage is refused with its own message rather than
+   * clamped. This is what the provider pays their tutors; a figure quietly
+   * adjusted behind them is a figure they will believe they set, and the tutor
+   * is the one who finds out otherwise.
+   */
+  updateTutorRevenueShare: async (req, res) => {
+    try {
+      const account = await User.findById(scopeIdOf(req)).select('tutorRevenueShare');
+      if (!account) return res.status(404).json({ message: 'Account not found' });
+
+      const { enabled, percentage } = req.body || {};
+      const update = { 'tutorRevenueShare.updatedAt': new Date() };
+
+      if (enabled !== undefined) {
+        if (typeof enabled !== 'boolean') {
+          return res.status(400).json({ message: 'Enabled must be true or false' });
+        }
+        update['tutorRevenueShare.enabled'] = enabled;
+      }
+
+      if (percentage !== undefined) {
+        const rate = Number(percentage);
+        if (!Number.isFinite(rate) || rate < 0) {
+          return res.status(400).json({ message: 'The revenue share must be a percentage of 0 or more' });
+        }
+        if (rate > MAX_SHARE_PERCENT) {
+          return res.status(400).json({
+            message: `The revenue share cannot exceed ${MAX_SHARE_PERCENT}%`,
+          });
+        }
+        update['tutorRevenueShare.percentage'] = rate;
+      }
+
+      // Merged against what is stored, because either field can arrive alone.
+      // Switching the share on while the rate sits at 0% is the exact failure
+      // this screen exists to prevent — the provider believes their tutors are
+      // being paid, and nothing moves.
+      const current = account.tutorRevenueShare || {};
+      const nextEnabled = update['tutorRevenueShare.enabled'] !== undefined
+        ? update['tutorRevenueShare.enabled']
+        : current.enabled === true;
+      const nextPercentage = update['tutorRevenueShare.percentage'] !== undefined
+        ? update['tutorRevenueShare.percentage']
+        : Number(current.percentage) || 0;
+
+      if (nextEnabled && nextPercentage <= 0) {
+        return res.status(400).json({
+          message: 'Enter a revenue share above 0% before switching it on',
+        });
+      }
+
+      await User.updateOne({ _id: account._id }, { $set: update });
+
+      return res.json({
+        message: 'Tutor revenue share saved',
+        settings: {
+          enabled: nextEnabled,
+          percentage: nextPercentage,
+          updatedAt: update['tutorRevenueShare.updatedAt'],
+        },
+      });
+    } catch (error) {
+      console.error('Tutor revenue share update failed:', error);
+      return res.status(500).json({ message: 'Could not save your tutor revenue share' });
+    }
+  },
 
 };
 

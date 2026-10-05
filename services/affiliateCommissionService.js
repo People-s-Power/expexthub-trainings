@@ -5,15 +5,21 @@ const Notification = require('../models/notifications');
 const AffiliateCommission = require('../models/affiliateCommission');
 const CoursePaymentPlan = require('../models/coursePaymentPlans');
 const { isAffiliateActive } = require('../utils/affiliateStatus.js');
-
-const MINOR_UNIT = 100;
+const {
+  MINOR_UNIT,
+  MAX_SHARE_PERCENT,
+  clampPercentage,
+} = require('../utils/revenueShare.js');
 
 // All three are read with sane defaults so a deploy that has not set them still
 // starts and behaves predictably, matching how CHECKOUT_REUSE_WINDOW_MS and the
 // other tunables in the payment service are handled.
 const DEFAULT_HOLD_DAYS = Number(process.env.AFFILIATE_HOLD_DAYS) || 14;
 const PLATFORM_DEFAULT_RATE = Number(process.env.AFFILIATE_DEFAULT_COMMISSION_RATE) || 0;
-const MAX_COMMISSION_RATE = Number(process.env.AFFILIATE_MAX_COMMISSION_RATE) || 50;
+// The ceiling is shared with the tutor revenue share — see utils/revenueShare.js.
+// Two different ceilings on the same naira would let a provider pay out more in
+// total than either setting suggests it allows.
+const MAX_COMMISSION_RATE = MAX_SHARE_PERCENT;
 
 const toMinor = (major) => Math.round(Number(major || 0) * MINOR_UNIT);
 const toMajor = (minor) => Number((Number(minor || 0) / MINOR_UNIT).toFixed(2));
@@ -79,11 +85,15 @@ function resolveCommissionRate({ course, provider, affiliateId }) {
  * to compute would silently withhold money the affiliate has already earned. The
  * settings endpoint is where an over-ceiling rate is refused outright, so the only
  * way to reach this branch is a ceiling lowered *after* a rate was saved.
+ *
+ * The clamp itself is shared with the tutor revenue share
+ * (utils/revenueShare.js) so the two cannot end up enforcing different ceilings.
  */
 function clampRate(rate) {
   if (rate.type !== 'percentage') return rate;
-  if (rate.value <= MAX_COMMISSION_RATE) return rate;
-  return { ...rate, value: MAX_COMMISSION_RATE };
+  const value = clampPercentage(rate.value, MAX_COMMISSION_RATE);
+  if (value === rate.value) return rate;
+  return { ...rate, value };
 }
 
 /**
@@ -380,6 +390,117 @@ async function releaseMaturedCommissions({ now = new Date(), limit = 200 } = {})
 }
 
 /**
+ * Chooses which available commissions a withdrawal consumes.
+ *
+ * Pure, and exported, so the arithmetic can be tested without a database — the
+ * same reason `resolveCommissionRate` and `computeCommissionMinor` are.
+ *
+ * Takes the affiliate's available commission amounts in **minor units**, in the
+ * order they should be consumed (oldest first), and the withdrawal in minor
+ * units. Returns the indexes that are fully covered, plus whatever the
+ * commissions could not cover.
+ *
+ * A row the withdrawal only *partly* covers is deliberately left out, and
+ * consumption stops there. It stays `available`, because the rest of it is still
+ * withdrawable and marking it withdrawn would hide money the affiliate can still
+ * claim — and an affiliate withdrawing part of a single commission is the
+ * ordinary case, not an edge one. Leaving it available is also what keeps
+ * `availableEarnings` on the wallet honest: it goes on meaning "still
+ * withdrawable", not "not yet paid out in full".
+ */
+function allocateWithdrawal(availableMinor, withdrawMinor) {
+  const coveredIndexes = [];
+  let remaining = Math.max(0, Number(withdrawMinor) || 0);
+
+  for (let index = 0; index < availableMinor.length && remaining > 0; index += 1) {
+    const amount = Math.max(0, Number(availableMinor[index]) || 0);
+    if (amount === 0) continue;
+    if (amount > remaining) {
+      // Partly covered, so not consumed: this row absorbs the rest of the
+      // withdrawal, but it stays `available` and is not listed.
+      remaining = 0;
+      break;
+    }
+    coveredIndexes.push(index);
+    remaining -= amount;
+  }
+
+  // Whatever a commission could not absorb came from balance that was never
+  // commission — a manual credit, or earnings from another role. Normal, and not
+  // an error. Only an amount no row could cover at all is reported here; a
+  // part-consumed row still absorbed its share.
+  return { coveredIndexes, uncoveredMinor: remaining };
+}
+
+/**
+ * Marks the earnings a confirmed withdrawal consumed as withdrawn.
+ *
+ * Oldest first, and only rows the payout covers in full (see allocateWithdrawal).
+ * Called once the payout is *confirmed*, never when it is merely requested: a
+ * queued transfer has paid nobody yet, and marking on request would show the
+ * money as gone while it was still in flight — and would have to be undone on
+ * every refund.
+ *
+ * Idempotent by the `status: 'available'` guard on the update, so a replayed
+ * webhook, the redirect path and the reconciliation sweep can all call it and
+ * only the first one moves anything.
+ *
+ * Without this the wallet was simply wrong: the payout debited `User.balance`
+ * and wrote its ledger row, but nothing ever moved the commissions behind it, so
+ * "Available to withdraw" never fell and no row ever read Withdrawn.
+ */
+async function applyWithdrawalToCommissions({ affiliateId, amountMajor, withdrawalRef, now = new Date() }) {
+  if (!affiliateId || !withdrawalRef) return { withdrawn: 0 };
+
+  const amountMinor = toMinor(amountMajor);
+  if (!(amountMinor > 0)) return { withdrawn: 0 };
+
+  // Ordered by when the earning became withdrawable, so the oldest money is
+  // spent first. `_id` breaks ties, since two rows released in the same
+  // millisecond would otherwise be consumed in an arbitrary order.
+  const rows = await AffiliateCommission.find({ affiliateId, status: 'available' })
+    .sort({ releasedAt: 1, createdAt: 1, _id: 1 })
+    .select('_id amount')
+    .lean();
+
+  const { coveredIndexes } = allocateWithdrawal(
+    rows.map((row) => Number(row.amount) || 0),
+    amountMinor,
+  );
+  if (!coveredIndexes.length) return { withdrawn: 0 };
+
+  const result = await AffiliateCommission.updateMany(
+    { _id: { $in: coveredIndexes.map((index) => rows[index]._id) }, status: 'available' },
+    { $set: { status: 'withdrawn', withdrawnAt: now, withdrawnByRef: withdrawalRef } },
+  );
+
+  return { withdrawn: result.modifiedCount || 0 };
+}
+
+/**
+ * Puts back the earnings a refunded withdrawal had consumed.
+ *
+ * A payout that failed or was reversed never reached the bank, so its hold is
+ * credited back to the balance and the earnings behind it have to read as
+ * available again. Without this a failed withdrawal would consume them for good
+ * and the affiliate could never withdraw that money a second time.
+ *
+ * Keyed on `withdrawnByRef`, which is why the withdrawal reference is recorded
+ * on the row rather than inferred — a later withdrawal of the same size must not
+ * have its rows mistaken for this one's.
+ */
+async function restoreCommissionsForWithdrawal(withdrawalRef) {
+  if (!withdrawalRef) return { restored: 0 };
+
+  const result = await AffiliateCommission.updateMany(
+    { withdrawnByRef: withdrawalRef, status: 'withdrawn' },
+    { $set: { status: 'available' }, $unset: { withdrawnAt: 1, withdrawnByRef: 1 } },
+  );
+
+  return { restored: result.modifiedCount || 0 };
+}
+
+/**
  * Reverses a commission that has already been recorded.
  *
  * Nothing is ever deleted — the spec requires the financial record to survive —
@@ -481,6 +602,9 @@ module.exports = {
   generateCommissionForPayment,
   releaseMaturedCommissions,
   reverseCommission,
+  applyWithdrawalToCommissions,
+  restoreCommissionsForWithdrawal,
+  allocateWithdrawal,
   resolveCommissionRate,
   computeCommissionMinor,
   clampRate,

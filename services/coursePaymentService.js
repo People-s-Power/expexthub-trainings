@@ -7,13 +7,19 @@ const Notification = require('../models/notifications.js');
 const CoursePaymentPlan = require('../models/coursePaymentPlans.js');
 const { sendPaymentReceiptOnce } = require('../utils/emails/receiptDispatcher.js');
 const { generateCommissionForPayment } = require('./affiliateCommissionService.js');
+const {
+  MINOR_UNIT,
+  MAX_SHARE_PERCENT,
+  clampPercentage,
+  percentageOf,
+  roundMoney,
+} = require('../utils/revenueShare.js');
 
 const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
 const flwHeaders = { Authorization: `Bearer ${flutterwaveSecretKey}` };
 const GATEWAY_TIMEOUT_MS = 20000;
 
-const MINOR_UNIT = 100;
 const PLATFORM_FEE_RATE = 0.05;
 const GRACE_PERIOD_DAYS = 7;
 
@@ -106,6 +112,41 @@ function planOutstandingMinor(plan) {
   const total = Number(plan?.totalAmountMinor) || 0;
   const paid = Number(plan?.amountPaidMinor) || 0;
   return Math.max(0, total - paid);
+}
+
+/**
+ * What one enrollment was expected to pay, what landed, and what is left.
+ *
+ * The single implementation of the owed calculation. The admissions payment
+ * table reads it off an aggregate row and the graduation gate reads it off
+ * documents; both have to answer the same question the same way, or a provider
+ * is refused graduation for a student whose row on screen shows as settled.
+ *
+ * `expected` is the plan's snapshot when there is one — the fee the student
+ * actually agreed to, so a later fee edit cannot change a balance they are
+ * being held to — and the course fee otherwise. A scholarship place expects
+ * nothing by definition, which is what keeps waived seats out of the owed
+ * column.
+ *
+ * Amounts are major units (naira) except the plan's own `*Minor` fields, which
+ * are kobo; mixing the two is what makes a balance look 100× wrong.
+ */
+function summarizeEnrollmentPaid({
+  scholarship = false,
+  planTotalMinor = 0,
+  planPaidMinor = 0,
+  fullPaidMajor = 0,
+  feeMajor = 0,
+} = {}) {
+  if (scholarship) return { expected: 0, paid: 0, owed: 0, settled: true };
+
+  const expected = Number(planTotalMinor) > 0
+    ? Number(planTotalMinor) / MINOR_UNIT
+    : Number(feeMajor) || 0;
+  const paid = Number((Number(fullPaidMajor) + Number(planPaidMinor) / MINOR_UNIT).toFixed(2));
+  const owed = Number(Math.max(0, expected - paid).toFixed(2));
+
+  return { expected, paid, owed, settled: owed <= 0 };
 }
 
 /** The next free slot in the payment ledger. */
@@ -464,41 +505,119 @@ async function grantCourseAccess({ userId, courseId, plan, session, renewal = fa
 }
 
 /**
- * Credits the instructor their net share exactly once per source payment.
+ * How one settled payment is divided between the provider and their tutors.
  *
- * Idempotency is enforced by the unique txRef derived from the originating
- * transaction: a replayed webhook hits the duplicate-key error and returns
- * without touching the balance.
+ * Pure, and exported, because this is the whole of the money rule and it should
+ * be checkable without a database. Returns `[{ userId, amount, role, refSuffix }]`
+ * in the order the credits should be written, always with the provider first.
+ *
+ * The order of operations is what makes the split fair:
+ *
+ *   1. the platform takes its fee off the gross, as it always has
+ *   2. the tutor share is a percentage of what is *left* — the provider's own net
+ *   3. the provider keeps the remainder
+ *
+ * Taking the share off the gross instead would pay the platform fee twice: once
+ * out of the provider's side and once out of the tutor's.
+ *
+ * Several tutors on one course divide the one share equally rather than each
+ * taking it. "20% to my tutors" is a statement about how much of the course
+ * revenue leaves the provider, so two tutors on a course must not turn it into
+ * 40%. The provider is skipped as a recipient: they are already the remainder,
+ * and paying them a share would write two rows moving the same money.
  */
-async function creditInstructor(transaction, amountMajor) {
-  const course = await Course.findById(transaction.courseId).select('instructorId');
-  if (!course?.instructorId || !(amountMajor > 0)) return false;
+function splitCourseEarnings({
+  amountMajor,
+  instructorId,
+  assignedTutors = [],
+  revenueShare = {},
+}) {
+  const gross = Number(amountMajor);
+  if (!(gross > 0)) return [];
 
-  const netAmount = Number((amountMajor * (1 - PLATFORM_FEE_RATE)).toFixed(2));
-  const creditRef = `course-credit-${transaction.txRef}`;
+  const net = roundMoney(gross * (1 - PLATFORM_FEE_RATE));
+  const share = revenueShare?.enabled
+    ? clampPercentage(revenueShare.percentage, MAX_SHARE_PERCENT)
+    : 0;
 
-  // The instructor's pre-credit balance, captured so the ledger row records the
-  // running balance after the credit — this is what makes the wallet ledger
-  // reconcilable line-by-line.
-  const instructor = await User.findById(course.instructorId).select('balance');
-  const balanceAfter = (Number(instructor?.balance) || 0) + netAmount;
+  const tutorIds = [...new Set((assignedTutors || []).filter(Boolean).map((id) => String(id)))]
+    .filter((id) => id !== String(instructorId));
+
+  const shares = [];
+  if (!tutorIds.length || share <= 0) {
+    if (instructorId) shares.push({ userId: instructorId, amount: net, role: 'provider', refSuffix: '' });
+    return shares;
+  }
+
+  // Kobo-rounded per tutor, and the *provider's* remainder is derived from what
+  // the tutors actually receive rather than from the nominal percentage. That is
+  // the only way the parts add up to the whole: three tutors on a 10% share of
+  // ₦100.01 each round to a different kobo than 10% of the total, and the extra
+  // kobo has to come out of somebody's side or the credits will not sum back to
+  // the net. It comes out of the provider's, whose cut is the residual here.
+  const perTutor = roundMoney(percentageOf(net, share) / tutorIds.length);
+  const tutorTotal = roundMoney(perTutor * tutorIds.length);
+
+  // The provider's row is written first and keeps the unsuffixed reference it
+  // has always had, so anything reading a course credit by its txRef still finds
+  // the provider's.
+  const providerAmount = roundMoney(net - tutorTotal);
+  // A share that consumed the whole net leaves the provider nothing to receive.
+  // A zero-value ledger row would be noise, so none is written.
+  if (instructorId && providerAmount > 0) {
+    shares.push({ userId: instructorId, amount: providerAmount, role: 'provider', refSuffix: '' });
+  }
+
+  let paidToTutors = 0;
+  tutorIds.forEach((id, index) => {
+    // The last tutor absorbs the division remainder, so the tutor credits sum to
+    // exactly `tutorTotal` and no kobo is created or lost by rounding.
+    const amount = index === tutorIds.length - 1
+      ? roundMoney(tutorTotal - paidToTutors)
+      : perTutor;
+    paidToTutors = roundMoney(paidToTutors + amount);
+    if (amount > 0) {
+      shares.push({ userId: id, amount, role: 'tutor', refSuffix: `-tutor-${id}` });
+    }
+  });
+
+  return shares;
+}
+
+/**
+ * Writes one credit and moves the balance behind it, exactly once.
+ *
+ * Idempotency is the unique txRef: a replayed webhook hits the duplicate-key
+ * error and returns false without touching the balance. Each share carries its
+ * own suffix, so the provider's row and a tutor's row are separately idempotent
+ * — which is what lets a first run that died between the two be completed by the
+ * replay rather than being abandoned as "already credited".
+ */
+async function creditShare(transaction, share, platformFee) {
+  // Read fresh for each share: the credits are written in sequence, so the
+  // running balance on each ledger row has to include the ones before it or the
+  // wallet ledger stops reconciling line by line.
+  const recipient = await User.findById(share.userId).select('balance');
+  const balanceAfter = roundMoney((Number(recipient?.balance) || 0) + share.amount);
 
   try {
-    // The ledger row records the net amount actually credited, so the sum of an
-    // instructor's credit transactions reconciles against their balance.
     await Transaction.create({
-      userId: course.instructorId,
+      userId: share.userId,
       courseId: transaction.courseId,
-      amount: netAmount,
+      amount: share.amount,
       type: 'credit',
       direction: 'credit',
       balanceAfter,
       status: 'successful',
-      txRef: creditRef,
+      txRef: `course-credit-${transaction.txRef}${share.refSuffix}`,
       metadata: {
         sourceTransaction: transaction.txRef,
-        grossAmount: amountMajor,
-        platformFee: Number((amountMajor * PLATFORM_FEE_RATE).toFixed(2)),
+        grossAmount: Number(transaction.amount),
+        platformFee,
+        // Named so the wallet shows a tutor why the credit is smaller than the
+        // course fee, and so support can tell a split from a whole credit.
+        earningsRole: share.role,
+        revenueSharePercent: share.role === 'tutor' ? share.percent : undefined,
       },
     });
   } catch (error) {
@@ -506,8 +625,50 @@ async function creditInstructor(transaction, amountMajor) {
     throw error;
   }
 
-  await User.findByIdAndUpdate(course.instructorId, { $inc: { balance: netAmount } });
+  await User.findByIdAndUpdate(share.userId, { $inc: { balance: share.amount } });
   return true;
+}
+
+/**
+ * Credits everyone who earned on this payment, exactly once per source payment.
+ *
+ * The provider receives their net minus the tutors' share; each assigned tutor
+ * receives their cut. Every credit is independently idempotent, so a replay
+ * completes a run that was interrupted part-way instead of skipping the rest.
+ */
+async function creditInstructor(transaction, amountMajor) {
+  const course = await Course.findById(transaction.courseId)
+    .select('instructorId assignedTutors');
+  if (!course?.instructorId || !(amountMajor > 0)) return false;
+
+  const provider = await User.findById(course.instructorId)
+    .select('tutorRevenueShare');
+  const revenueShare = provider?.tutorRevenueShare || {};
+
+  const shares = splitCourseEarnings({
+    amountMajor,
+    instructorId: course.instructorId,
+    assignedTutors: course.assignedTutors,
+    revenueShare,
+  });
+  if (!shares.length) return false;
+
+  const percent = revenueShare?.enabled
+    ? clampPercentage(revenueShare.percentage, MAX_SHARE_PERCENT)
+    : 0;
+  const platformFee = roundMoney(Number(amountMajor) * PLATFORM_FEE_RATE);
+
+  let creditedAny = false;
+  for (const share of shares) {
+    const written = await creditShare(
+      transaction,
+      { ...share, percent },
+      platformFee,
+    );
+    creditedAny = creditedAny || written;
+  }
+
+  return creditedAny;
 }
 
 async function finalizeFullCoursePayment(transaction, gatewayPayment) {
@@ -796,6 +957,7 @@ module.exports = {
   serializePlan,
   normalizePlan,
   refreshDueStatus,
+  summarizeEnrollmentPaid,
   resolvePartPaymentPolicy,
   planOutstandingMinor,
   planInFlightMinor,
@@ -807,6 +969,7 @@ module.exports = {
   openPlanForStudent,
   grantCourseAccess,
   creditInstructor,
+  splitCourseEarnings,
   finalizeFullCoursePayment,
   finalizeInstallmentPayment,
   hasActiveCourseAccess,

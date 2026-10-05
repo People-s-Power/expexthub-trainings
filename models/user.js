@@ -203,6 +203,27 @@ const userSchema = new mongoose.Schema({
     updatedAt: Date,
   },
 
+  // The revenue share paid to tutors this provider assigns to their courses.
+  // Held on the provider's own account, exactly as affiliateSettings is, so the
+  // terms travel with the account and cannot be orphaned from it.
+  //
+  // One rate for the whole account rather than a rate per course: it is the same
+  // deal a provider offers every tutor they work with, and a per-course rate is
+  // one more place for the figure the provider believes they set to drift from
+  // the figure that is paid. A course with several assigned tutors divides this
+  // one share between them rather than paying it to each — see
+  // splitCourseEarnings in services/coursePaymentService.js.
+  tutorRevenueShare: {
+    // Defaults to off. This one moves real money out of a provider's balance, so
+    // no account starts paying a share it did not ask for.
+    enabled: { type: Boolean, default: false },
+    // A percentage of the provider's own net (after the platform fee), which is
+    // what they actually receive — not of the gross the student paid. A share of
+    // the gross would take the platform fee out of the provider's side twice.
+    percentage: { type: Number, min: 0, max: 100, default: 0 },
+    updatedAt: Date,
+  },
+
   // Who referred this student. Deliberately separate from `registeredBy`:
   // `registeredBy` records who *created* the account (a provider enrolling a
   // student), while this records who *referred* them. Conflating the two would

@@ -16,6 +16,7 @@ const {
   refreshDueStatus,
   grantCourseAccess,
   creditInstructor,
+  summarizeEnrollmentPaid,
 } = require('../services/coursePaymentService.js');
 const { resolveForOwner, actingOwnerHeader } = require('../utils/actingOwner.js');
 
@@ -191,13 +192,16 @@ function buildRecord(row) {
   const planTotalMinor = Number(plan?.totalAmountMinor || 0);
   const planPaidMinor = Number(plan?.amountPaidMinor || 0);
 
-  const expected = scholarship
-    ? 0
-    : planTotalMinor > 0
-      ? planTotalMinor / MINOR_UNIT
-      : Number(row.fee || 0);
-  const paid = scholarship ? 0 : Number((fullPaid + planPaidMinor / MINOR_UNIT).toFixed(2));
-  const owed = Number(Math.max(0, expected - paid).toFixed(2));
+  // The owed calculation lives in the service, shared with the graduation gate,
+  // so the row a provider sees and the reason they are refused graduation are
+  // computed from the same rule rather than from two copies of it.
+  const { expected, paid, owed, settled } = summarizeEnrollmentPaid({
+    scholarship,
+    planTotalMinor,
+    planPaidMinor,
+    fullPaidMajor: fullPaid,
+    feeMajor: row.fee,
+  });
 
   const method = scholarship
     ? 'scholarship'
@@ -233,7 +237,7 @@ function buildRecord(row) {
     expected,
     paid,
     owed,
-    settled: owed <= 0,
+    settled,
     payments: paidEvents.length,
     timeline,
     planStatus: plan?.status || null,

@@ -32,7 +32,11 @@ const Chat = require("./models/chat");
 const User = require("./models/user");
 
 const { sendEmail } = require("./utils/sendEmail");
-const { startCronJobs } = require("./utils/ReminderSetupEmail");
+// Replaces utils/ReminderSetupEmail.js, whose two daily jobs looked for records
+// starting at an exact instant (comparing a String date to a Date, so they
+// matched nothing) and emailed only. This sweep resolves the real start of every
+// session and announces it in the app, by email, and on the calendar.
+const { startSessionReminderSweep } = require("./services/sessionReminderService");
 const { startWithdrawalReconciliation } = require("./utils/withdrawalReconciler");
 const { startPaymentReconciliation } = require("./utils/paymentReconciler");
 const { startAutoPayouts } = require("./services/autoPayoutService");
@@ -90,7 +94,7 @@ const io = new Server(server, {
 });
 
 const PORT = process.env.PORT || 3002;
-startCronJobs();
+startSessionReminderSweep(io);
 startWithdrawalReconciliation();
 startPaymentReconciliation();
 startAutoPayouts();

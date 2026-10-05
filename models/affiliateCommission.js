@@ -50,6 +50,11 @@ const affiliateCommissionSchema = new mongoose.Schema(
     holdUntil: { type: Date, index: true },
     releasedAt: { type: Date },
     withdrawnAt: { type: Date },
+    // The withdrawal whose payout consumed this earning. Recorded because a
+    // payout can still fail after it was requested, and putting the rows back
+    // means knowing which ones that withdrawal took — without this the only
+    // option would be to guess, or to leave a failed payout looking withdrawn.
+    withdrawnByRef: { type: String, index: true },
     reversedAt: { type: Date },
     reversalReason: String,
     // The commission row this one compensates, on a reversal.

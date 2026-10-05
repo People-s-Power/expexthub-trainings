@@ -16,6 +16,10 @@ const crypto = require('crypto');
 const Transaction = require('../models/transactions.js');
 const User = require('../models/user.js');
 const PaymentWebhookEvent = require('../models/paymentWebhookEvents.js');
+const {
+  applyWithdrawalToCommissions,
+  restoreCommissionsForWithdrawal,
+} = require('./affiliateCommissionService.js');
 
 const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
@@ -53,6 +57,70 @@ function isWithdrawal(transaction) {
     && transaction.type === 'debit'
     && transaction.metadata?.purpose === 'withdrawal',
   );
+}
+
+/** The reference a withdrawal and its commissions are matched on. */
+function withdrawalRefOf(transaction) {
+  return transaction?.reference || transaction?.txRef || null;
+}
+
+/**
+ * Whether a withdrawal has to move the commission rows behind it.
+ *
+ * This deliberately does *not* key off the recorded `source`. A payout reaches
+ * an affiliate's commissions by more than one route: the wallet's own Withdraw
+ * button records `source: 'affiliate'`, but the scheduled sweep
+ * (`services/autoPayoutService.js`) is offered to every wallet and records
+ * `source: 'auto_payout'`, and `transactionController` records `'manual'`. A
+ * source check would have left scheduled affiliate payouts unmarked — the same
+ * bug this fixes, one route over.
+ *
+ * The ledger itself is the authority instead: `applyWithdrawalToCommissions`
+ * looks up this account's `available` rows and returns immediately when there
+ * are none, so an ordinary wallet belongs to no commission ledger by
+ * construction rather than by guesswork about its source.
+ */
+function mayHaveAffiliateCommissions(transaction) {
+  return Boolean(transaction?.userId) && Boolean(withdrawalRefOf(transaction));
+}
+
+/**
+ * Moves the earnings behind a confirmed affiliate payout to `withdrawn`.
+ *
+ * Deliberately non-fatal. The payout is already settled by its ledger row, and
+ * throwing here would fail the webhook and have Flutterwave retry a transfer the
+ * bank has already paid. A missed write is recoverable — the update is guarded on
+ * `status: 'available'` — so it is logged and left for the next run rather than
+ * allowed to break settlement.
+ */
+async function markAffiliateCommissionsWithdrawn(transaction) {
+  if (!mayHaveAffiliateCommissions(transaction)) return;
+
+  try {
+    await applyWithdrawalToCommissions({
+      affiliateId: transaction.userId,
+      amountMajor: Number(transaction.amount),
+      withdrawalRef: withdrawalRefOf(transaction),
+    });
+  } catch (error) {
+    console.error('Could not mark affiliate commissions withdrawn:', error.message);
+  }
+}
+
+/**
+ * Puts back the earnings behind a refunded affiliate payout.
+ *
+ * The mirror of the above, and non-fatal for the same reason: the refund itself
+ * is the money event and has already been applied to the wallet.
+ */
+async function restoreAffiliateCommissions(transaction) {
+  if (!mayHaveAffiliateCommissions(transaction)) return;
+
+  try {
+    await restoreCommissionsForWithdrawal(withdrawalRefOf(transaction));
+  } catch (error) {
+    console.error('Could not restore affiliate commissions after a refund:', error.message);
+  }
 }
 
 // How long after requesting a withdrawal a second one is refused. Deliberately
@@ -124,6 +192,10 @@ async function failAndRefundWithdrawal(transaction, { reason, gatewayStatus } = 
   );
   if (failed) {
     await User.findByIdAndUpdate(transaction.userId, { $inc: { balance: Number(transaction.amount) } });
+    // The payout never reached the bank, so the earnings it had consumed are
+    // available again. Only the caller that won the pending->failed transition
+    // gets here, so this cannot run twice for one withdrawal.
+    await restoreAffiliateCommissions(transaction);
   }
   return Boolean(failed);
 }
@@ -144,7 +216,16 @@ async function reconcileWithdrawalOutcome(transaction, status, data, reason) {
   const normalized = String(status || '').toUpperCase();
 
   if (normalized === TRANSFER_SUCCESS) {
-    await Transaction.updateOne(
+    // Conditional on `pending`, and the winner is the only caller that moves the
+    // affiliate's commission rows. Marking unconditionally would let a replayed
+    // webhook for an old withdrawal consume commissions that a later withdrawal
+    // had since made available.
+    //
+    // The cost of that choice is that a crash between this write and the
+    // bookkeeping below leaves the rows unmarked — money gone, earnings still
+    // reading available. That is the rarer failure and the recoverable one, so it
+    // is accepted rather than fixed by a rule that would corrupt later payouts.
+    const confirmed = await Transaction.findOneAndUpdate(
       { _id: transaction._id, status: 'pending' },
       {
         $set: {
@@ -153,7 +234,11 @@ async function reconcileWithdrawalOutcome(transaction, status, data, reason) {
           ...(data?.id ? { gatewayTransactionId: String(data.id) } : {}),
         },
       },
+      { new: true },
     );
+
+    if (confirmed) await markAffiliateCommissionsWithdrawn(confirmed);
+
     return 'successful';
   }
 
@@ -408,11 +493,11 @@ async function executeWithdrawal({ user, amount, source = 'manual', narration = 
 
     const transferStatus = String(transfer?.status || '').toUpperCase();
     if (transferStatus === TRANSFER_SUCCESS) {
-      // Some rails settle instantly and report it right in the response.
-      await Transaction.updateOne(
-        { _id: transaction._id, status: 'pending' },
-        { $set: { status: 'successful', paidAt: new Date() } },
-      );
+      // Some rails settle instantly and report it right in the response. Routed
+      // through reconcileWithdrawalOutcome rather than writing the ledger row
+      // here, so the success path has exactly one caller and the affiliate
+      // commission bookkeeping cannot be skipped by the instant-settle route.
+      await reconcileWithdrawalOutcome(transaction, TRANSFER_SUCCESS, transfer);
       return { outcome: 'successful', message: 'Withdrawal successful', transactionId: transaction._id };
     }
     if (TRANSFER_FAILURES.includes(transferStatus)) {

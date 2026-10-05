@@ -108,5 +108,17 @@ userRouter.post('/send-mail', auth, tutorSurface(TUTOR_ROLES, 'Send Email'), mai
 // current password, so this only ever changes the caller's own credentials.
 userRouter.put('/change-password', auth, generalLimiter, userControllers.changePassword);
 
+// The revenue share the provider pays the tutors they assign. Scoped to the
+// caller's own account by the controller, so there is no id in the path — the
+// account is always the caller's.
+//
+// Guarded with the same pair the affiliate commission settings use, and for the
+// same reason: no privilege is named, so a team member acting for the provider
+// is refused on both. Changing what every tutor is paid is not the same decision
+// as assigning one to a course, and it must not ride in on the privilege that
+// allows the second.
+userRouter.get('/revenue-share', auth, tutorSurface(TUTOR_ROLES), userControllers.getTutorRevenueShare);
+userRouter.put('/revenue-share', auth, tutorSurface(TUTOR_ONLY), userControllers.updateTutorRevenueShare);
+
 
 module.exports = userRouter;
