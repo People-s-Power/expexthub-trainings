@@ -316,6 +316,30 @@ async function main() {
     // the last, so someone who books late still gets it.
     expect(problems, sent.created - baseline.created, 2, 'created');
     expect(problems, sent.patched - baseline.patched, 0, 'patched');
+
+    // The entry has to be identifiable from the calendar alone. `bookAppointment`
+    // never stores a title, so a summary built from `record.title` alone comes
+    // out as the bare label "Appointment" — a block on someone's phone that says
+    // nothing about who they are meeting, which is the whole difference between
+    // this and a class entry carrying its course title.
+    const entries = calendarCreated.slice(-2);
+    const forAdaEntry = entries.find((entry) => entry.email === USERS[A].email);
+    const forDeleEntry = entries.find((entry) => entry.email === USERS[D].email);
+
+    if (!forAdaEntry || forAdaEntry.summary !== 'Appointment with Bola') {
+      problems.push(`the host entry is not named for them: ${forAdaEntry?.summary}`);
+    }
+    if (!forDeleEntry || forDeleEntry.summary !== 'Appointment with Ada') {
+      problems.push(`the guest entry is not named for them: ${forDeleEntry?.summary}`);
+    }
+    if (!forDeleEntry || !String(forDeleEntry.description).includes('Ada')) {
+      problems.push('the guest entry does not say who it is with');
+    }
+    // Each side is named for the OTHER person. An entry carrying its own owner's
+    // name would pass a looser check and be useless in a calendar.
+    if (forAdaEntry && forAdaEntry.summary.includes('Ada')) {
+      problems.push('the host entry names the host rather than the person they are meeting');
+    }
     return problems;
   });
 

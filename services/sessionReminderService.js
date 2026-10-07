@@ -248,6 +248,49 @@ function sessionOwners(record) {
 }
 
 /**
+ * The other side of an appointment, seen from one of them.
+ *
+ * `from` and `to` are populated with `fullname` by the sweep's query, so either
+ * may be a document or a bare id — `idOf` reads both, and the name is only
+ * available on the populated form.
+ *
+ * Returns null when the recipient is neither party. That cannot happen through
+ * the audience, and naming the wrong person is worse than naming nobody.
+ */
+function counterpartOf(record, recipientId) {
+  if (!record || !recipientId) return null;
+
+  const from = idOf(record.from);
+  const to = idOf(record.to);
+  if (from !== recipientId && to !== recipientId) return null;
+
+  return from === recipientId ? record.to : record.from;
+}
+
+/**
+ * What an appointment is called, to one side of it.
+ *
+ * One rule for both channels — the reminder text and the Google Calendar entry —
+ * because they are read side by side, and a reminder saying "Appointment with
+ * Ada" sitting over a calendar block labelled "Appointment" reads as two
+ * unrelated things.
+ *
+ * The `title || category` fallback is the convention the rest of the codebase
+ * already uses (`listAppointments` in `controllers/affiliateController.js`).
+ * It matters more than it looks: `bookAppointment` never reads a `title` off the
+ * request, so every appointment booked through the ordinary form carries only a
+ * `category`, and without the fallback the whole of them would be anonymous.
+ */
+function appointmentName(record, recipientId) {
+  const subject = String(record.title || record.category || '').trim();
+  const other = counterpartOf(record, recipientId);
+  const otherName = other && other.fullname;
+
+  if (otherName) return subject ? `${subject} with ${otherName}` : `Appointment with ${otherName}`;
+  return subject || 'Appointment';
+}
+
+/**
  * What to say, for one recipient.
  *
  * The recipient is needed as well as the session because an appointment has two
@@ -257,18 +300,10 @@ function reminderCopy(kind, record, occurrence, offset, recipientId) {
   const source = SOURCES.find((entry) => entry.kind === kind);
   const label = source ? source.label : 'Session';
 
-  let name = record.title || label;
-  if (kind === 'appointment') {
-    const from = idOf(record.from);
-    const to = idOf(record.to);
-    // Each side is told about the other: "appointment with Ada" is a reminder,
-    // "Appointment in 30 minutes" is a notification nobody can act on.
-    const counterpart = recipientId && from === recipientId ? record.to : record.from;
-    const other = counterpart && counterpart.fullname;
-    name = other
-      ? `${record.title ? `${record.title} — ` : ''}appointment with ${other}`
-      : record.title || 'Appointment';
-  }
+  // Each side is told about the other: "Appointment with Ada" is a reminder,
+  // "Appointment in 30 minutes" is a notification nobody can act on.
+  const name =
+    kind === 'appointment' ? appointmentName(record, recipientId) : record.title || label;
 
   const when = dayjs(occurrence.start)
     .tz(platformTimezone())
@@ -408,12 +443,59 @@ async function writeCalendar({ source, record, occurrence, userId, user }) {
   const end = occurrence.end || new Date(start.getTime() + ASSUMED_DURATION_MINUTES * 60000);
 
   await createSessionEvent(user, {
-    summary: record.title || source.label,
-    description: record.about || `${source.label} on ExpertHub`,
+    summary: calendarSummary(source, record, userId),
+    description: calendarDescription(source, record, userId),
     start,
     end,
     recurrence: seriesRecurrence(record, source.kind, start),
   });
+}
+
+/**
+ * What the calendar block is called, to this recipient.
+ *
+ * A class already carries its own title. An appointment does not — see
+ * `appointmentName`, which is why both channels go through one rule rather than
+ * this file naming an appointment "Appointment" while the reminder beside it
+ * names the person.
+ */
+function calendarSummary(source, record, recipientId) {
+  if (source.kind === 'appointment') return appointmentName(record, recipientId);
+  return record.title || source.label;
+}
+
+/**
+ * The body under the calendar block.
+ *
+ * A class contributes its own blurb. An appointment contributes the four things
+ * a reader wants when the block comes up on their phone: who it is with, why, and
+ * how to get in — the Zoom numbers the booking already stored, or the room, when
+ * they are there. Nothing is derived: `createZoomMeeting` keeps the meeting id
+ * and password and no join URL, so no link is invented from them.
+ */
+function calendarDescription(source, record, recipientId) {
+  if (source.kind !== 'appointment') {
+    return record.about || `${source.label} on ExpertHub`;
+  }
+
+  const other = counterpartOf(record, recipientId);
+  const otherName = other && other.fullname;
+  const lines = [];
+
+  if (otherName) lines.push(`With ${otherName}.`);
+  if (record.reason) lines.push(String(record.reason));
+
+  const place = [record.location, record.room].filter(Boolean).join(', ');
+  if (place) lines.push(place);
+
+  if (record.meetingId) {
+    lines.push(
+      `Zoom meeting ID: ${record.meetingId}` +
+        (record.meetingPassword ? ` (passcode ${record.meetingPassword})` : ''),
+    );
+  }
+
+  return lines.join('\n') || 'Appointment on ExpertHub';
 }
 
 /**
@@ -561,6 +643,8 @@ module.exports = {
   providerCalendarWatchers,
   sessionOwners,
   deliveryAudience,
+  appointmentName,
+  counterpartOf,
   reminderCopy,
   seriesRecurrence,
   sweepOnce,
