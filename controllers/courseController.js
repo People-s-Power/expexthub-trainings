@@ -17,7 +17,7 @@ const LearningEvent = require("../models/event.js");
 const { createGoogleMeet } = require("../utils/createGoogleMeeting.js");
 const { default: mongoose } = require("mongoose");
 const crypto = require("crypto");
-const { scopeIdOf } = require("../utils/actingOwner.js");
+const { scopeIdOf, resolveForOwner, ANY_MEMBERSHIP } = require("../utils/actingOwner.js");
 const {
     creditInstructor,
     initializeGatewayCheckout,
@@ -213,14 +213,40 @@ const courseController = {
     },
 
     getAuthorCourse: async (req, res) => {
-        const userId = req.body.id;
+        const requested = req.body.id;
 
         try {
+            // This route used to answer any id to anyone: it carries no auth
+            // middleware in front of it, and the id arrived in the body, so a
+            // stranger could POST a provider's id and read their whole course
+            // list with every enrolled student on it. The account is now resolved
+            // rather than trusted — the caller's own, one they hold an accepted
+            // membership of, or an admin naming anybody.
+            //
+            // `ANY_MEMBERSHIP`, not a named grant, because this one response
+            // backs three surfaces with three different grants: the courses
+            // screens, the calendar, and the dashboard, whose menu entry is
+            // deliberately visible to every member. Naming any single privilege
+            // would refuse a member the product means to serve.
+            const authz = await resolveForOwner(
+                req.user?.id,
+                requested,
+                ANY_MEMBERSHIP,
+                'You do not have permission to view these courses',
+            );
+            if (!authz.ok) return res.status(authz.status).json({ message: authz.message });
 
+            const userId = String(authz.scoper._id);
 
             const courses = await Course.find().populate({ path: 'enrolledStudents', select: "profilePicture fullname _id" }).lean();
 
-            return res.status(200).json({ courses: courses.filter(course => (course.instructorId.toString() === userId) || course.assignedTutors?.map(id => id.toString()).includes(userId)) });
+            // Matched by string on purpose: `instructorId` is stored in both the
+            // ObjectId and the plain-string spelling in production, and comparing
+            // the raw values would let a course's owner fail to match their own
+            // course. `String(...)` rather than `.toString()` because a course
+            // with no instructor at all would throw on the latter and take the
+            // whole response down with it.
+            return res.status(200).json({ courses: courses.filter(course => (String(course.instructorId) === userId) || course.assignedTutors?.map(id => String(id)).includes(userId)) });
         } catch (error) {
             console.error(error);
             return res.status(500).json({ message: 'Unexpected error while fetching courses' });

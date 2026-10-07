@@ -183,6 +183,71 @@ function reminderAudience(record, kind) {
 }
 
 /**
+ * The stored grant that opens a provider's calendar, historical typo and all.
+ *
+ * Written here rather than imported from the frontend catalogue because the
+ * backend has never shared that module, and the string is the contract between
+ * them: it is what is stored on saved grants, so a "corrected" spelling here
+ * would match nothing and silently stop reminding every member already holding
+ * it. The team screens display it as "View Calendar" while storing this.
+ */
+const CALENDAR_PRIVILEGE = 'View Calender';
+
+/**
+ * The provider's team members who hold Calendar Access.
+ *
+ * A member granted the calendar works with the provider's sessions — the same
+ * ones they can see in the calendar itself — so they are reminded of them the
+ * way the provider is. Reading it here rather than from anything the member's
+ * session carries means a grant revoked, or a membership removed, takes effect
+ * on the next sweep.
+ *
+ * Resolved from the OWNER's stored record, which is the copy that carries the
+ * entry when the invitation is accepted, and matched on the owner's own id in
+ * the same shape `getTeamMembers` and the delete path use.
+ *
+ * Async and separate from `reminderAudience` on purpose: that function is pure,
+ * is called in a tight loop over every occurrence, and is the unit-testable core
+ * of who gets told. This is one query per session, so it is awaited once in
+ * `deliver` and merged, not evaluated per recipient.
+ */
+async function providerCalendarWatchers(providerId) {
+  const id = idOf(providerId);
+  if (!id) return [];
+
+  const owner = await User.findById(id).select('teamMembers');
+  if (!owner) return [];
+
+  return (owner.teamMembers || [])
+    .filter((entry) => entry && entry.status === 'accepted')
+    .filter(
+      (entry) =>
+        Array.isArray(entry.privileges) &&
+        entry.privileges.some(
+          (flag) => flag.value === CALENDAR_PRIVILEGE && flag.checked,
+        ),
+    )
+    .map((entry) => idOf(entry.tutorId))
+    .filter(Boolean);
+}
+
+/**
+ * Whose calendar a session belongs to, for the purpose of finding watchers.
+ *
+ * Deliberately the accounts that *own or run* the session, and deliberately not
+ * the participants of an appointment. An appointment is a private two-party
+ * meeting: a member with calendar access can see it inside the provider's
+ * workspace, which is what the grant is for, but pushing it out to that member's
+ * inbox and their own Google Calendar would carry the provider's meeting with
+ * somebody else off the platform and into a personal account — an act the
+ * provider never agreed to when granting a view. Course and event sessions, by
+ * contrast, are the provider's own teaching schedule.
+ */
+function sessionOwners(record) {
+  return [idOf(record.instructorId), idOf(record.authorId)].filter(Boolean);
+}
+
+/**
  * What to say, for one recipient.
  *
  * The recipient is needed as well as the session because an appointment has two
@@ -351,12 +416,38 @@ async function writeCalendar({ source, record, occurrence, userId, user }) {
   });
 }
 
+/**
+ * Who a session actually reminds: its own audience, plus the provider's watchers.
+ *
+ * Pure, and separate from `deliver` so the merge is checkable without standing up
+ * notifications, mail and Google. The dedupe is the point of it — a member who is
+ * also the course's assigned tutor, or the provider's own account appearing in
+ * both lists, must produce one recipient, because one recipient is one claim and
+ * therefore one popup, one email and one calendar entry.
+ */
+function deliveryAudience(record, kind, watchers = []) {
+  return [...new Set([...reminderAudience(record, kind), ...watchers])];
+}
+
 /** Tell everyone who has to be there about one due session. */
 async function deliver({ source, record, occurrence, offset, io }) {
   const startAt = occurrence.start;
   const sessionId = occurrenceKey(source.kind, record._id, startAt);
 
-  for (const userId of reminderAudience(record, source.kind)) {
+  // The provider's calendar members, resolved once per session rather than per
+  // recipient. An appointment has no owner in this sense and contributes none —
+  // see `sessionOwners`.
+  const watchers = [];
+  if (source.kind !== 'appointment') {
+    for (const ownerId of sessionOwners(record)) {
+      watchers.push(...(await providerCalendarWatchers(ownerId)));
+    }
+  }
+
+  // Merged into the audience before the loop, so `claim` covers them too.
+  const audience = deliveryAudience(record, source.kind, watchers);
+
+  for (const userId of audience) {
     // Claimed before the recipient is even loaded, so the repeated passes over
     // an already-announced session cost one failed insert each and nothing else.
     const first = await claim({
@@ -463,9 +554,13 @@ function startSessionReminderSweep(io) {
 
 module.exports = {
   ASSUMED_DURATION_MINUTES,
+  CALENDAR_PRIVILEGE,
   SOURCES,
   occurrenceKey,
   reminderAudience,
+  providerCalendarWatchers,
+  sessionOwners,
+  deliveryAudience,
   reminderCopy,
   seriesRecurrence,
   sweepOnce,

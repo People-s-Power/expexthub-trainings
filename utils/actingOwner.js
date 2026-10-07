@@ -37,6 +37,25 @@ const ACTING_OWNER_HEADER = 'x-acting-owner';
 /** The default refusal, for routes that have nothing more specific to say. */
 const DENIED = 'You do not have permission to perform this action';
 
+/**
+ * The grant meaning "any accepted membership opens this route".
+ *
+ * For the few read routes the product deliberately leaves open to every member.
+ * The account's course list is the one that matters: it backs the dashboard,
+ * whose menu entry is visible to all of them (`MENU_PRIVILEGES["/tutor"]` is an
+ * empty list in `SideNav.tsx`), so naming a privilege there would be a fiction —
+ * whichever was picked, a member the product means to serve would be refused a
+ * page they can see. Membership is still required and still verified against the
+ * actor's own stored record, so a request naming a stranger is refused exactly
+ * as it is anywhere else.
+ *
+ * A Symbol because no stored privilege can ever equal one: it can only be
+ * reached by a caller naming it deliberately. It is NOT the default — omitting
+ * the argument still refuses an acting member, so a route that forgets to name
+ * its grant closes rather than opens.
+ */
+const ANY_MEMBERSHIP = Symbol('any-membership');
+
 /** The header's value as a plain string, or '' when it is absent. */
 function actingOwnerHeader(req) {
   const raw = req.headers?.[ACTING_OWNER_HEADER];
@@ -59,7 +78,9 @@ function requestsActingOwner(req) {
  * `ownerId` the payment screens send — reach the same decision by the same
  * code. `privilege` is a string from the team privilege catalogue, or null for
  * a route that has no privilege behind it; see `resolveActingOwner` for why
- * null refuses an acting member rather than allowing one.
+ * null refuses an acting member rather than allowing one. `ANY_MEMBERSHIP` is
+ * the third answer, for the routes the product opens to every member — read its
+ * own comment before using it.
  *
  * Returns `{ ok, status, message, caller, scoper, acting }`. `caller` is the
  * actor's stored record and `scoper` is the account whose data may be touched —
@@ -115,10 +136,11 @@ async function resolveForOwner(actorId, requestedOwnerId, privilege, denialMessa
   // nobody has decided what grant opens a route, a member holding some other
   // grant must not be able to reach it by naming an owner.
   const granted =
-    typeof privilege === 'string' &&
-    privilege !== '' &&
-    Array.isArray(entry.privileges) &&
-    entry.privileges.some((flag) => flag.value === privilege && flag.checked);
+    privilege === ANY_MEMBERSHIP ||
+    (typeof privilege === 'string' &&
+      privilege !== '' &&
+      Array.isArray(entry.privileges) &&
+      entry.privileges.some((flag) => flag.value === privilege && flag.checked));
   if (!granted) {
     return { ok: false, status: 403, message: denial };
   }
@@ -161,6 +183,7 @@ const scopeIdOf = (req) => req.scopeUserId || req.user?.id || req.user?._id;
 
 module.exports = {
   ACTING_OWNER_HEADER,
+  ANY_MEMBERSHIP,
   actingOwnerHeader,
   requestsActingOwner,
   resolveForOwner,

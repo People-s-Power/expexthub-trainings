@@ -69,6 +69,23 @@ const courseSchema = new mongoose.Schema({
         type: { type: String, enum: ['percentage', 'fixed', null], default: null },
         value: { type: Number, min: 0, default: null },
     },
+    // Per-course revenue-share override for the tutors assigned to this course.
+    // Sits above the provider's general `tutorRevenueShare` in the resolution
+    // order — see services/tutorShareService.js — so a provider can pay a
+    // different rate on one course without moving their baseline everywhere.
+    //
+    // Percentage-only, unlike `affiliateCommission` above: the tutor share is
+    // always a proportion of the provider's net, and a fixed amount would have to
+    // be divided across however many tutors the course happens to have.
+    //
+    // `enabled: false` is a deliberate opt-out for this course while the
+    // provider's programme stays on. Both fields default to null, which means
+    // "inherit the general rate" — so a course untouched by this setting behaves
+    // exactly as it did before the setting existed.
+    tutorShare: {
+        enabled: { type: Boolean, default: null },
+        value: { type: Number, min: 0, max: 100, default: null },
+    },
     target: Number,
     assignedTutors: [{
         type: mongoose.Schema.Types.ObjectId,

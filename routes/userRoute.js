@@ -43,6 +43,16 @@ userRouter.put("/myinstructors", userControllers.getMyInstructors);
 // The email-marketing audience. Authenticated: the response is a provider's
 // whole student list with contact details, which is not public data.
 userRouter.put("/mystudents", auth, userControllers.getMyStudents);
+// The same audience for the provider's tutors — the sibling of /mystudents, so
+// it carries the same guard the composer's Send Email action does: a caller
+// without the mailing privilege has no use for a recipient list of contact
+// details.
+userRouter.put(
+  "/mytutors",
+  auth,
+  tutorSurface(TUTOR_ROLES, 'Send Email'),
+  userControllers.getMyTutors,
+);
 userRouter.get("/tutorstudents/:id", userControllers.getTutorStudents);
 
 userRouter.put("/mymentees", userControllers.getMyMentees);
@@ -119,6 +129,17 @@ userRouter.put('/change-password', auth, generalLimiter, userControllers.changeP
 // allows the second.
 userRouter.get('/revenue-share', auth, tutorSurface(TUTOR_ROLES), userControllers.getTutorRevenueShare);
 userRouter.put('/revenue-share', auth, tutorSurface(TUTOR_ONLY), userControllers.updateTutorRevenueShare);
+
+// The per-course half of the same setting. Guarded identically: an override on
+// one course is the same money decision as the general rate, so it must not be
+// reachable through a narrower privilege than the rate it overrides.
+userRouter.get('/courses', auth, tutorSurface(TUTOR_ONLY), userControllers.listCourseTutorShares);
+userRouter.put(
+  '/courses/:courseId/tutor-share',
+  auth,
+  tutorSurface(TUTOR_ONLY),
+  userControllers.updateCourseTutorShare,
+);
 
 
 module.exports = userRouter;

@@ -15,13 +15,19 @@ courseRouter.get("/", (req, res) => {
 
 // Public course browsing
 courseRouter.put("/category", generalLimiter, courseController.getCourseByCategory);
-courseRouter.put("/category/author", generalLimiter, courseController.getAuthorCourse);
 courseRouter.get("/author/:userId", generalLimiter, validateObjectId('userId'), courseController.getPlatformCOurses);
 courseRouter.get("/all", generalLimiter, courseController.getAllCourses);
 courseRouter.get("/live", generalLimiter, courseController.getLive);
 courseRouter.get("/single-course/:courseId", generalLimiter, validateObjectId('courseId'), courseController.getCourseById);
 courseRouter.get("/all/category", generalLimiter, courseController.getAllCategory);
 courseRouter.get("/recommended-courses/:userId", generalLimiter, validateObjectId('userId'), courseController.getRecommendedCourses);
+
+// One account's own courses, with the enrolled students on each. NOT public, and
+// deliberately not in the block above with the browsing routes: the id arrives in
+// the body, so without a session this answered any provider's course and student
+// list to anyone who asked. The controller resolves the id — the caller's own, an
+// account they hold an accepted membership of, or an admin naming anybody.
+courseRouter.put("/category/author", authenticate, generalLimiter, courseController.getAuthorCourse);
 
 // Zoom signature (authenticated)
 courseRouter.post("/get-zoom-signature", authenticate, courseController.getZoomSignature);

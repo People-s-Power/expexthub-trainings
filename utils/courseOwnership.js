@@ -1,8 +1,9 @@
 // Which courses an account owns or is assigned to.
 //
-// One rule, four readers: the mailing audience, the admissions ledger, the
-// graduation verdict, and the check that a tutor may only graduate a student on
-// their own course. They must all answer it the same way, and they did not.
+// One rule, many readers: the mailing audiences, the admissions ledger, the
+// graduation verdict, the check that a tutor may only graduate a student on their
+// own course, and the provider's per-course settings. They must all answer it the
+// same way, and they did not.
 //
 // Ownership ids drifted between ObjectId and String in production — some course
 // documents store `instructorId` as a plain string. `Course.aggregate` does not
@@ -81,9 +82,43 @@ async function ownedCourseFilter(ownerId) {
   return { _id: { $in: await ownedCourseIds(ownerId) } };
 }
 
+/**
+ * The same two-spelling condition, narrowed to the courses the account *owns* —
+ * `instructorId` alone, without the courses they are merely assigned to teach.
+ *
+ * The distinction matters wherever the question is "may this account set the
+ * terms on this course" rather than "may it see the students on it". An assigned
+ * tutor reads a course's roster; only the provider who owns it decides what its
+ * tutors are paid. `ownershipMatch` answers the wider question and would let a
+ * tutor configure the rate on a course belonging to somebody else.
+ *
+ * Still read through the native driver for the reason above: through
+ * `Course.find` the two spellings collapse into one ObjectId and every course
+ * whose owner was stored as a string disappears — which, for a settings screen,
+ * means a provider cannot see or edit the rate on their own course.
+ */
+function authoredCourseMatch(ownerId) {
+  const hex = String(ownerId || '');
+  if (!HEX_ID.test(hex)) {
+    throw new Error('Invalid owner id');
+  }
+  return { instructorId: { $in: [hex, new mongoose.Types.ObjectId(hex)] } };
+}
+
+async function authoredCourseIds(ownerId) {
+  return Course.collection.distinct('_id', authoredCourseMatch(ownerId));
+}
+
+async function authoredCourseFilter(ownerId) {
+  return { _id: { $in: await authoredCourseIds(ownerId) } };
+}
+
 module.exports = {
   HEX_ID,
   ownershipMatch,
   ownedCourseIds,
   ownedCourseFilter,
+  authoredCourseMatch,
+  authoredCourseIds,
+  authoredCourseFilter,
 };

@@ -207,15 +207,21 @@ const userSchema = new mongoose.Schema({
   // Held on the provider's own account, exactly as affiliateSettings is, so the
   // terms travel with the account and cannot be orphaned from it.
   //
-  // One rate for the whole account rather than a rate per course: it is the same
-  // deal a provider offers every tutor they work with, and a per-course rate is
-  // one more place for the figure the provider believes they set to drift from
-  // the figure that is paid. A course with several assigned tutors divides this
-  // one share between them rather than paying it to each — see
-  // splitCourseEarnings in services/coursePaymentService.js.
+  // This is the *general* rate: the baseline the provider offers every tutor
+  // they work with. A single course can carry its own rate in
+  // `Course.tutorShare`, which overrides this one — the same two-tier shape the
+  // affiliate commission uses (`affiliateSettings.defaultCommissionRate` with a
+  // per-course `affiliateCommission` above it), resolved in one place by
+  // services/tutorShareService.js.
+  //
+  // A course with several assigned tutors divides whichever rate applies between
+  // them rather than paying it to each — see splitCourseEarnings in
+  // services/coursePaymentService.js.
   tutorRevenueShare: {
     // Defaults to off. This one moves real money out of a provider's balance, so
-    // no account starts paying a share it did not ask for.
+    // no account starts paying a share it did not ask for. A per-course rate is
+    // still gated on this switch: it is a provider's programme, and a course
+    // entry left behind after the programme was turned off must not keep paying.
     enabled: { type: Boolean, default: false },
     // A percentage of the provider's own net (after the platform fee), which is
     // what they actually receive — not of the gross the student paid. A share of

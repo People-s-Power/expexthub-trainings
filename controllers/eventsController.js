@@ -8,6 +8,7 @@ const Notification = require("../models/notifications.js");
 const { sendEmailReminder } = require("../utils/sendEmailReminder.js");
 const dayjs = require("dayjs");
 const { createGoogleMeet } = require("../utils/createGoogleMeeting.js");
+const { resolveForOwner } = require("../utils/actingOwner.js");
 
 const eventsController = {
   createEvent: async (req, res) => {
@@ -351,10 +352,26 @@ const eventsController = {
     const userId = req.params.userId;
 
     try {
+      // The route carries no auth middleware, so this used to answer any id to
+      // anyone — and the response populates `enrolledStudents`, making it a way
+      // to read a provider's participant list from outside. The account is
+      // resolved now: the caller's own, an admin naming anybody, or a team member
+      // acting for a provider they hold an accepted membership of with
+      // `View Calender` — which is the grant that opens the calendar this backs.
+      const authz = await resolveForOwner(
+        req.user?.id,
+        userId,
+        'View Calender',
+        'You do not have permission to view these events',
+      );
+      if (!authz.ok) return res.status(authz.status).json({ message: authz.message });
+
+      const ownerId = String(authz.scoper._id);
+
       // `enrolledStudents` is an array of ObjectIds, so the match is a plain
       // equality on the field — not `{ _id: userId }` which never matches and
       // silently emptied the calendar's events section.
-      const enrolledCourses = await LearningEvent.find({ enrolledStudents: userId })
+      const enrolledCourses = await LearningEvent.find({ enrolledStudents: ownerId })
         .populate({ path: 'enrolledStudents', select: "profilePicture fullname _id" })
         .lean();
 

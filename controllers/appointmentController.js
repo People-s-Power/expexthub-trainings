@@ -4,6 +4,7 @@ const User = require("../models/user.js");
 const createZoomMeeting = require("../utils/createZoomMeeting.js");
 const mongoose = require('mongoose'); // Ensure mongoose is imported
 const { sendEmailReminder } = require("../utils/sendEmailReminder.js");
+const { resolveForOwner, resolveActingOwner } = require("../utils/actingOwner.js");
 
 const appointmentControllers = {
   bookAppointment: async (req, res) => {
@@ -56,12 +57,28 @@ const appointmentControllers = {
   getAppointments: async (req, res) => {
     try {
       const id = req.params.id
-      if (String(req.user?.id) !== String(id) && req.user?.role !== 'admin') {
-        return res.status(403).json({ message: 'You do not have permission to view these appointments' });
-      }
+      // The id in the path is the account whose calendar is being opened, which
+      // is not always the caller: a team member granted Calendar Access works
+      // inside the provider's workspace, so their own token names the member
+      // while the request asks for the provider's diary. The delegation resolver
+      // is the one place that difference is decided — it honours the request only
+      // when the member's own record carries an accepted membership granting
+      // `View Calender`, and otherwise resolves to the caller acting for
+      // themselves, which is exactly the check this replaced.
+      const authz = await resolveForOwner(
+        req.user?.id,
+        id,
+        'View Calender',
+        'You do not have permission to view these appointments',
+      )
+      if (!authz.ok) return res.status(authz.status).json({ message: authz.message })
+
+      // Read from the resolved account rather than the raw path value, so a member
+      // cannot widen this by naming somebody the resolver refused.
+      const ownerId = String(authz.scoper._id)
 
       const appointment = await Appointment.find({
-        $or: [{ from: id }, { to: id }]
+        $or: [{ from: ownerId }, { to: ownerId }]
       }).populate({ path: 'from to', select: "profilePicture fullname _id" }).lean();;
 
       return res.status(200).json({ appointment: appointment.reverse() });
@@ -76,9 +93,23 @@ const appointmentControllers = {
     try {
       const id = req.params.id
 
+      // Here the path names the appointment, not an account, so the account being
+      // acted for can only come from the acting-owner header the client sets
+      // while a member is inside a provider's workspace. With no header — every
+      // ordinary request — this resolves to the caller and the participant test
+      // below is the one that was here before.
+      const authz = await resolveActingOwner(req, 'View Calender')
+      if (!authz.ok) return res.status(authz.status).json({ message: authz.message })
+
       const appointment = await Appointment.findById(id).populate({ path: 'from to', select: "profilePicture fullname _id" }).lean();;
       if (!appointment) return res.status(404).json({ message: 'Appointment not found' });
-      if (req.user?.role !== 'admin' && String(appointment.from?._id) !== String(req.user?.id) && String(appointment.to?._id) !== String(req.user?.id)) {
+
+      // Either the caller or the account they are acting for has to be on the
+      // appointment. A member granted Calendar Access sees the provider's diary
+      // because the provider is a participant; an appointment between two other
+      // people is not opened by holding the privilege.
+      const allowed = [String(authz.caller._id), String(authz.scoper._id)]
+      if (!allowed.includes(String(appointment.from?._id)) && !allowed.includes(String(appointment.to?._id))) {
         return res.status(403).json({ message: 'You do not have permission to view this appointment' });
       }
 

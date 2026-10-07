@@ -14,7 +14,7 @@ const { hasPaidPlan, planCatalogue, planNameForId } = require("../utils/plans.js
 const { DEACTIVATED_STATUSES } = require("../utils/affiliateStatus.js");
 const { LEARNER_ROLES, isLearnerRole } = require("../utils/roles.js");
 const { scopeIdOf } = require("../utils/actingOwner.js");
-const { ownedCourseFilter, HEX_ID } = require("../utils/courseOwnership.js");
+const { ownedCourseFilter, authoredCourseFilter, authoredCourseIds, HEX_ID } = require("../utils/courseOwnership.js");
 const { evaluateGraduation } = require("../services/graduationService.js");
 // The same ceiling the affiliate commission is bounded by. Both carve a share
 // out of one payment, so both have to agree on how much of it may leave —
@@ -613,6 +613,135 @@ const userControllers = {
     } catch (error) {
       console.error(error);
       return res.status(500).json({ message: 'Unexpected error during student retrieval' });
+    }
+  },
+
+  /**
+   * Who a provider may mail as "their tutors" — the counterpart of
+   * `getMyStudents`, and shaped identically so the composer treats both lists
+   * the same way.
+   *
+   * This is a new read rather than a reuse: `getInstructors` returns every
+   * `role: 'tutor'` account on the platform and `getMyInstructors` filters on
+   * the tutor's own self-declared `assignedCourse` field. Neither is scoped to
+   * the caller, so neither can back a recipient list — mailing from either would
+   * put the whole platform's tutors in a provider's composer.
+   *
+   * The audience is the union of two relationships, because a provider thinks of
+   * both as "my tutors" and either alone is wrong: a tutor assigned to one of
+   * their courses may never have been invited to the team, and a team member may
+   * hold no course at all. Deduplicated by id — someone who is both is one row.
+   *
+   * Ownership of the courses is read through `utils/courseOwnership`, the same
+   * rule the admissions ledger and the student audience use. Writing the
+   * condition out here is what made the two student lists disagree: Mongoose
+   * casts both id spellings in a `Course.find` filter back into one ObjectId, so
+   * a course whose owner was stored as a string disappears from the audience and
+   * nowhere else.
+   */
+  getMyTutors: async (req, res) => {
+    try {
+      const callerId = String(req.user?.id || req.user?._id || '');
+      const requested = String(req.body?.id || req.body?.ownerId || callerId || '');
+      if (!callerId) {
+        return res.status(401).json({ message: 'Authentication required' });
+      }
+      if (!HEX_ID.test(requested)) {
+        return res.status(400).json({ message: 'Invalid user id' });
+      }
+
+      const caller = await User.findById(callerId).select('role teamMembers').lean();
+      if (!caller) {
+        return res.status(401).json({ message: 'Authentication required' });
+      }
+
+      // Reading someone else's audience is only for an admin or an accepted team
+      // member of that provider — a body-supplied id can never widen the scope.
+      if (requested !== callerId && caller.role !== 'admin') {
+        const isMember = (caller.teamMembers || []).some(
+          (entry) => String(entry.ownerId) === requested && entry.status === 'accepted',
+        );
+        if (!isMember) {
+          return res.status(403).json({ message: 'You can only view your own tutors' });
+        }
+      }
+
+      // An admin's audience is the whole platform, matching getMyStudents and
+      // how the payments and admissions views scope.
+      const courseFilter = caller.role === 'admin' && requested === callerId
+        ? {}
+        : await ownedCourseFilter(requested);
+
+      const courses = await Course.find(courseFilter)
+        .select('title assignedTutors')
+        .lean();
+
+      // id -> the titles that put them in the audience. A tutor reachable two
+      // ways has one row listing both reasons, which is also what the composer's
+      // search reads.
+      const audience = new Map();
+      const remember = (value, courseTitle) => {
+        // `assignedTutors` is stored unpopulated here, but the same drift that
+        // affects instructorId means the entry may be an id or a document.
+        const id = String(value?._id || value || '');
+        if (!HEX_ID.test(id)) return;
+        if (!audience.has(id)) audience.set(id, new Set());
+        if (courseTitle) audience.get(id).add(courseTitle);
+      };
+
+      courses.forEach((course) => {
+        (course.assignedTutors || []).forEach((tutor) => remember(tutor, course.title));
+      });
+
+      // The second source. The invite entry is written to both parties' records,
+      // so the provider's own document is the one that lists their members, and
+      // an accepted entry names the member in `tutorId`. Pending invitations are
+      // excluded: an unaccepted invite is not yet someone the provider works
+      // with, and mailing it would be mail to a stranger about a team they have
+      // not joined.
+      const owner = await User.findById(requested).select('teamMembers').lean();
+      (owner?.teamMembers || []).forEach((entry) => {
+        if (entry?.status !== 'accepted') return;
+        remember(entry.tutorId);
+      });
+
+      const ids = Array.from(audience.keys());
+      const tutors = ids.length
+        ? await User.find({ _id: { $in: ids } })
+          .select('fullname email phone gender age skillLevel country state address profilePicture blocked')
+          .lean()
+        : [];
+
+      // Rows are kept without an email or while blocked, exactly as the student
+      // audience does, so the composer can show why a row cannot be mailed
+      // instead of the row being missing with nothing to explain it.
+      const rows = tutors
+        .map((tutor) => ({
+          _id: tutor._id,
+          fullname: tutor.fullname,
+          email: tutor.email || '',
+          hasEmail: Boolean(tutor.email),
+          phone: tutor.phone,
+          gender: tutor.gender,
+          age: tutor.age,
+          skillLevel: tutor.skillLevel,
+          country: tutor.country,
+          state: tutor.state,
+          address: tutor.address,
+          profilePicture: tutor.profilePicture,
+          blocked: tutor.blocked === true,
+          courses: Array.from(audience.get(String(tutor._id)) || []),
+        }))
+        .sort((a, b) => String(a.fullname || '').localeCompare(String(b.fullname || '')));
+
+      return res.status(200).json({
+        message: 'Tutors retrieved successfully',
+        tutors: rows,
+        courses: courses.length,
+      });
+    } catch (error) {
+      console.error(error);
+      return res.status(500).json({ message: 'Unexpected error during tutor retrieval' });
     }
   },
 
@@ -1827,6 +1956,116 @@ const userControllers = {
     } catch (error) {
       console.error('Tutor revenue share update failed:', error);
       return res.status(500).json({ message: 'Could not save your tutor revenue share' });
+    }
+  },
+
+  /**
+   * The provider's own courses with the share each one pays.
+   *
+   * The per-course half of the tutor split. Scoped to the courses the provider
+   * *owns* through the shared two-spelling rule: a tutor assigned to a course can
+   * read its roster, but only the owner decides what its tutors are paid — and
+   * `Course.find({ instructorId })` would silently hide the courses whose owner
+   * was stored as a string, so the provider could not see or edit the rate on
+   * their own course.
+   */
+  listCourseTutorShares: async (req, res) => {
+    try {
+      const owned = await authoredCourseFilter(scopeIdOf(req));
+
+      const courses = await Course.find(owned)
+        .select('title fee tutorShare')
+        .sort({ title: 1 })
+        .limit(200)
+        .lean();
+
+      return res.json({
+        courses: courses.map((row) => ({
+          id: row._id,
+          title: row.title,
+          fee: row.fee,
+          tutorShare: row.tutorShare || null,
+        })),
+        limits: { maxSharePercent: MAX_SHARE_PERCENT },
+      });
+    } catch (error) {
+      console.error('Course tutor share list failed:', error);
+      return res.status(500).json({ message: 'Could not load your courses' });
+    }
+  },
+
+  /**
+   * Sets or clears the share one course pays, above the provider's general rate.
+   *
+   * `{ enabled: null }` clears the override and returns the course to the general
+   * rate. `{ enabled: false }` is the deliberate opt-out — this course pays no
+   * share while the provider's programme stays on for every other course. The two
+   * are different answers and the UI offers both, so they must not be conflated.
+   *
+   * An out-of-range rate is refused with its own message rather than clamped, the
+   * same as the general rate above: a figure quietly adjusted behind the provider
+   * is a figure they will believe they set.
+   */
+  updateCourseTutorShare: async (req, res) => {
+    try {
+      const courseId = String(req.params.courseId || '');
+      if (!HEX_ID.test(courseId)) {
+        return res.status(400).json({ message: 'Invalid course id' });
+      }
+
+      const { enabled, value } = req.body || {};
+      const update = {};
+
+      if (enabled === null || enabled === undefined) {
+        // Clearing the override returns the course to the provider's general rate.
+        update.tutorShare = { enabled: null, value: null };
+      } else {
+        if (typeof enabled !== 'boolean') {
+          return res.status(400).json({ message: 'Enabled must be true or false' });
+        }
+        update['tutorShare.enabled'] = enabled;
+
+        if (enabled && value !== undefined && value !== null) {
+          const rate = Number(value);
+          if (!Number.isFinite(rate) || rate < 0) {
+            return res.status(400).json({
+              message: 'The revenue share must be a percentage of 0 or more',
+            });
+          }
+          if (rate > MAX_SHARE_PERCENT) {
+            return res.status(400).json({
+              message: `The revenue share cannot exceed ${MAX_SHARE_PERCENT}%`,
+            });
+          }
+          update['tutorShare.value'] = rate;
+        }
+      }
+
+      // Ownership is checked against the rule rather than in the update filter, so
+      // the same two-spelling helper decides here as everywhere else. A course the
+      // provider does not own is reported as missing rather than forbidden — its
+      // existence is not theirs to learn.
+      const ownsIt = (await authoredCourseIds(scopeIdOf(req)))
+        .some((id) => String(id) === courseId);
+      if (!ownsIt) {
+        return res.status(404).json({ message: 'Course not found' });
+      }
+
+      const course = await Course.findByIdAndUpdate(
+        courseId,
+        { $set: update },
+        { new: true },
+      ).select('title tutorShare');
+
+      if (!course) return res.status(404).json({ message: 'Course not found' });
+
+      return res.json({
+        message: 'Course revenue share updated',
+        tutorShare: course.tutorShare || null,
+      });
+    } catch (error) {
+      console.error('Course tutor share update failed:', error);
+      return res.status(500).json({ message: 'Could not update this course' });
     }
   },
 

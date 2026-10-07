@@ -7,10 +7,12 @@ const Notification = require('../models/notifications.js');
 const CoursePaymentPlan = require('../models/coursePaymentPlans.js');
 const { sendPaymentReceiptOnce } = require('../utils/emails/receiptDispatcher.js');
 const { generateCommissionForPayment } = require('./affiliateCommissionService.js');
+const { resolveTutorSharePercent } = require('./tutorShareService.js');
+// `clampPercentage` and `MAX_SHARE_PERCENT` were destructured here until the rate
+// became two-tier: clamping now happens inside `resolveTutorSharePercent`, which
+// is the single place the effective percentage is decided.
 const {
   MINOR_UNIT,
-  MAX_SHARE_PERCENT,
-  clampPercentage,
   percentageOf,
   roundMoney,
 } = require('../utils/revenueShare.js');
@@ -525,20 +527,23 @@ async function grantCourseAccess({ userId, courseId, plan, session, renewal = fa
  * revenue leaves the provider, so two tutors on a course must not turn it into
  * 40%. The provider is skipped as a recipient: they are already the remainder,
  * and paying them a share would write two rows moving the same money.
+ *
+ * The rate itself is not decided here — `resolveTutorSharePercent` owns the
+ * per-course-overrides-general rule, and this reads it so the amount paid and the
+ * percentage recorded on the ledger row can never disagree.
  */
 function splitCourseEarnings({
   amountMajor,
   instructorId,
   assignedTutors = [],
   revenueShare = {},
+  courseTutorShare = null,
 }) {
   const gross = Number(amountMajor);
   if (!(gross > 0)) return [];
 
   const net = roundMoney(gross * (1 - PLATFORM_FEE_RATE));
-  const share = revenueShare?.enabled
-    ? clampPercentage(revenueShare.percentage, MAX_SHARE_PERCENT)
-    : 0;
+  const share = resolveTutorSharePercent({ courseTutorShare, revenueShare });
 
   const tutorIds = [...new Set((assignedTutors || []).filter(Boolean).map((id) => String(id)))]
     .filter((id) => id !== String(instructorId));
@@ -638,24 +643,30 @@ async function creditShare(transaction, share, platformFee) {
  */
 async function creditInstructor(transaction, amountMajor) {
   const course = await Course.findById(transaction.courseId)
-    .select('instructorId assignedTutors');
+    .select('instructorId assignedTutors tutorShare');
   if (!course?.instructorId || !(amountMajor > 0)) return false;
 
   const provider = await User.findById(course.instructorId)
     .select('tutorRevenueShare');
   const revenueShare = provider?.tutorRevenueShare || {};
 
+  // The effective rate, which may be the course's own rather than the provider's
+  // general one. Resolved once and used for both the split and the figure written
+  // onto each tutor's ledger row, so what is recorded is what was actually paid.
+  const percent = resolveTutorSharePercent({
+    courseTutorShare: course.tutorShare,
+    revenueShare,
+  });
+
   const shares = splitCourseEarnings({
     amountMajor,
     instructorId: course.instructorId,
     assignedTutors: course.assignedTutors,
     revenueShare,
+    courseTutorShare: course.tutorShare,
   });
   if (!shares.length) return false;
 
-  const percent = revenueShare?.enabled
-    ? clampPercentage(revenueShare.percentage, MAX_SHARE_PERCENT)
-    : 0;
   const platformFee = roundMoney(Number(amountMajor) * PLATFORM_FEE_RATE);
 
   let creditedAny = false;
