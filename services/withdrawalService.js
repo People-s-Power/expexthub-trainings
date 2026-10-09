@@ -20,6 +20,10 @@ const {
   applyWithdrawalToCommissions,
   restoreCommissionsForWithdrawal,
 } = require('./affiliateCommissionService.js');
+const {
+  applyWithdrawalToEarnings,
+  restoreEarningsForWithdrawal,
+} = require('./tutorEarningService.js');
 
 const flutterwaveBaseURL = 'https://api.flutterwave.com/v3/';
 const flutterwaveSecretKey = process.env.FLUTTERWAVE_SECRET;
@@ -65,27 +69,33 @@ function withdrawalRefOf(transaction) {
 }
 
 /**
- * Whether a withdrawal has to move the commission rows behind it.
+ * Whether a withdrawal has to move the ledger rows behind it.
  *
  * This deliberately does *not* key off the recorded `source`. A payout reaches
- * an affiliate's commissions by more than one route: the wallet's own Withdraw
- * button records `source: 'affiliate'`, but the scheduled sweep
+ * an account's earnings by more than one route: the wallet's own Withdraw button
+ * records `source: 'affiliate'`, but the scheduled sweep
  * (`services/autoPayoutService.js`) is offered to every wallet and records
  * `source: 'auto_payout'`, and `transactionController` records `'manual'`. A
- * source check would have left scheduled affiliate payouts unmarked — the same
- * bug this fixes, one route over.
+ * source check would have left scheduled payouts unmarked — the same bug this
+ * fixes, one route over.
  *
- * The ledger itself is the authority instead: `applyWithdrawalToCommissions`
- * looks up this account's `available` rows and returns immediately when there
- * are none, so an ordinary wallet belongs to no commission ledger by
- * construction rather than by guesswork about its source.
+ * The ledgers themselves are the authority instead: `applyWithdrawalToCommissions`
+ * and `applyWithdrawalToEarnings` each look up this account's `available` rows and
+ * return immediately when there are none, so an ordinary wallet belongs to no
+ * earnings ledger by construction rather than by guesswork about its source.
  */
-function mayHaveAffiliateCommissions(transaction) {
+function mayHaveLedgerEarnings(transaction) {
   return Boolean(transaction?.userId) && Boolean(withdrawalRefOf(transaction));
 }
 
 /**
- * Moves the earnings behind a confirmed affiliate payout to `withdrawn`.
+ * Moves the earnings behind a confirmed payout to `withdrawn`.
+ *
+ * Two ledgers can hold this account's money — affiliate commissions and tutor
+ * earnings — and a payout consumes both, so both are written here. Neither is
+ * told which the other is: each looks up its own `available` rows for this
+ * account and returns immediately when there are none, so an account that holds
+ * only one kind is handled by the other as a no-op rather than by a source test.
  *
  * Deliberately non-fatal. The payout is already settled by its ledger row, and
  * throwing here would fail the webhook and have Flutterwave retry a transfer the
@@ -93,8 +103,8 @@ function mayHaveAffiliateCommissions(transaction) {
  * `status: 'available'` — so it is logged and left for the next run rather than
  * allowed to break settlement.
  */
-async function markAffiliateCommissionsWithdrawn(transaction) {
-  if (!mayHaveAffiliateCommissions(transaction)) return;
+async function markLedgerEarningsWithdrawn(transaction) {
+  if (!mayHaveLedgerEarnings(transaction)) return;
 
   try {
     await applyWithdrawalToCommissions({
@@ -105,21 +115,42 @@ async function markAffiliateCommissionsWithdrawn(transaction) {
   } catch (error) {
     console.error('Could not mark affiliate commissions withdrawn:', error.message);
   }
+
+  // Its own try/catch, so a failure on one ledger cannot stop the other from
+  // being written — they are independent records of the same payout.
+  try {
+    await applyWithdrawalToEarnings({
+      tutorId: transaction.userId,
+      amountMajor: Number(transaction.amount),
+      withdrawalRef: withdrawalRefOf(transaction),
+    });
+  } catch (error) {
+    console.error('Could not mark tutor earnings withdrawn:', error.message);
+  }
 }
 
 /**
- * Puts back the earnings behind a refunded affiliate payout.
+ * Puts back the earnings behind a refunded payout.
  *
- * The mirror of the above, and non-fatal for the same reason: the refund itself
- * is the money event and has already been applied to the wallet.
+ * The mirror of the above, across both ledgers, and non-fatal for the same
+ * reason: the refund itself is the money event and has already been applied to
+ * the wallet.
  */
-async function restoreAffiliateCommissions(transaction) {
-  if (!mayHaveAffiliateCommissions(transaction)) return;
+async function restoreLedgerEarnings(transaction) {
+  if (!mayHaveLedgerEarnings(transaction)) return;
+
+  const withdrawalRef = withdrawalRefOf(transaction);
 
   try {
-    await restoreCommissionsForWithdrawal(withdrawalRefOf(transaction));
+    await restoreCommissionsForWithdrawal(withdrawalRef);
   } catch (error) {
     console.error('Could not restore affiliate commissions after a refund:', error.message);
+  }
+
+  try {
+    await restoreEarningsForWithdrawal(withdrawalRef);
+  } catch (error) {
+    console.error('Could not restore tutor earnings after a refund:', error.message);
   }
 }
 
@@ -195,7 +226,7 @@ async function failAndRefundWithdrawal(transaction, { reason, gatewayStatus } = 
     // The payout never reached the bank, so the earnings it had consumed are
     // available again. Only the caller that won the pending->failed transition
     // gets here, so this cannot run twice for one withdrawal.
-    await restoreAffiliateCommissions(transaction);
+    await restoreLedgerEarnings(transaction);
   }
   return Boolean(failed);
 }
@@ -237,7 +268,7 @@ async function reconcileWithdrawalOutcome(transaction, status, data, reason) {
       { new: true },
     );
 
-    if (confirmed) await markAffiliateCommissionsWithdrawn(confirmed);
+    if (confirmed) await markLedgerEarningsWithdrawn(confirmed);
 
     return 'successful';
   }

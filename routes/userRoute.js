@@ -130,6 +130,17 @@ userRouter.put('/change-password', auth, generalLimiter, userControllers.changeP
 userRouter.get('/revenue-share', auth, tutorSurface(TUTOR_ROLES), userControllers.getTutorRevenueShare);
 userRouter.put('/revenue-share', auth, tutorSurface(TUTOR_ONLY), userControllers.updateTutorRevenueShare);
 
+// What the provider has actually earned across their own courses — the Total
+// Earnings card on the dashboard. Reading money, so it is the same "View
+// Payments" grant that opens the payment records, and it scopes to the acting
+// owner so a delegated member sees the figure for the account they are in.
+userRouter.get(
+  '/earnings-summary',
+  auth,
+  tutorSurface(TUTOR_ROLES, 'View Payments'),
+  userControllers.getEarningsSummary,
+);
+
 // The per-course half of the same setting. Guarded identically: an override on
 // one course is the same money decision as the general rate, so it must not be
 // reachable through a narrower privilege than the rate it overrides.

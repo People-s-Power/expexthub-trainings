@@ -1,4 +1,5 @@
 const User = require("../models/user.js");
+const Transaction = require("../models/transactions.js");
 const { upload } = require("../config/cloudinary.js");
 const Notification = require("../models/notifications.js");
 const { addCourse } = require("./courseController.js");
@@ -1879,6 +1880,14 @@ const userControllers = {
         settings: {
           enabled: settings.enabled === true,
           percentage: Number(settings.percentage) || 0,
+          // Null when unset, not the resolved platform default. The client shows
+          // "leave blank for the platform default" against a blank field, and
+          // sending the default here would render it as a number the provider had
+          // chosen — which they had not.
+          holdDays:
+            settings.holdDays === null || settings.holdDays === undefined
+              ? null
+              : Number(settings.holdDays),
           updatedAt: settings.updatedAt || null,
         },
         limits: { maxSharePercent: MAX_SHARE_PERCENT },
@@ -1902,7 +1911,7 @@ const userControllers = {
       const account = await User.findById(scopeIdOf(req)).select('tutorRevenueShare');
       if (!account) return res.status(404).json({ message: 'Account not found' });
 
-      const { enabled, percentage } = req.body || {};
+      const { enabled, percentage, holdDays } = req.body || {};
       const update = { 'tutorRevenueShare.updatedAt': new Date() };
 
       if (enabled !== undefined) {
@@ -1925,6 +1934,22 @@ const userControllers = {
         update['tutorRevenueShare.percentage'] = rate;
       }
 
+      if (holdDays !== undefined) {
+        // Explicit null clears the override and falls back to the platform
+        // default, matching the affiliate programme's field exactly.
+        if (holdDays === null || holdDays === '') {
+          update['tutorRevenueShare.holdDays'] = null;
+        } else {
+          const days = Number(holdDays);
+          if (!Number.isInteger(days) || days < 0 || days > 90) {
+            return res.status(400).json({
+              message: 'The holding period must be a whole number of days between 0 and 90',
+            });
+          }
+          update['tutorRevenueShare.holdDays'] = days;
+        }
+      }
+
       // Merged against what is stored, because either field can arrive alone.
       // Switching the share on while the rate sits at 0% is the exact failure
       // this screen exists to prevent — the provider believes their tutors are
@@ -1945,17 +1970,70 @@ const userControllers = {
 
       await User.updateOne({ _id: account._id }, { $set: update });
 
+      // Merged the same way as the two fields above, so a save that omits the
+      // holding period reports back what is actually stored rather than resetting
+      // the client's view of it.
+      const nextHoldDays = update['tutorRevenueShare.holdDays'] !== undefined
+        ? update['tutorRevenueShare.holdDays']
+        : (current.holdDays === null || current.holdDays === undefined ? null : Number(current.holdDays));
+
       return res.json({
         message: 'Tutor revenue share saved',
         settings: {
           enabled: nextEnabled,
           percentage: nextPercentage,
+          holdDays: nextHoldDays,
           updatedAt: update['tutorRevenueShare.updatedAt'],
         },
       });
     } catch (error) {
       console.error('Tutor revenue share update failed:', error);
       return res.status(500).json({ message: 'Could not save your tutor revenue share' });
+    }
+  },
+
+  /**
+   * What the provider has actually earned across their own courses.
+   *
+   * Sums the provider-role credits the course payment split has written — the
+   * amount they receive after the platform fee and after any tutor's share. Not a
+   * sum of course fees and not the gross: those are two different numbers, and
+   * only this one is money the provider has.
+   *
+   * `earningsRole: 'provider'` is what `creditShare` stamps on the provider's own
+   * row, and it is what keeps a tutor's credits out of the total — an account can
+   * be both a provider and somebody else's assigned tutor, and summing every
+   * credit they hold would report the second as earnings on their own catalogue.
+   *
+   * Read with `scopeIdOf(req)`, so a team member sees the account they are working
+   * in. `userId` is a field this backend writes itself, so there is no ownership
+   * spelling to reconcile here; the `$in` carries both anyway because this is an
+   * aggregate, whose `$match` Mongoose never casts — a string-stored id would
+   * otherwise be silently missed and the card would read low.
+   */
+  getEarningsSummary: async (req, res) => {
+    try {
+      const scope = String(scopeIdOf(req));
+      const spellings = [scope];
+      if (mongoose.Types.ObjectId.isValid(scope)) {
+        spellings.push(new mongoose.Types.ObjectId(scope));
+      }
+
+      const aggregate = await Transaction.aggregate([
+        {
+          $match: {
+            userId: { $in: spellings },
+            direction: 'credit',
+            'metadata.earningsRole': 'provider',
+          },
+        },
+        { $group: { _id: null, total: { $sum: '$amount' } } },
+      ]);
+
+      return res.json({ earnings: { total: Number(aggregate[0]?.total) || 0 } });
+    } catch (error) {
+      console.error('Earnings summary failed:', error);
+      return res.status(500).json({ message: 'Could not load your earnings' });
     }
   },
 

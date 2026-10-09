@@ -26,6 +26,7 @@ const certificateRouter = require("./routes/certificateRouter.js");
 const startUpKitRouter = require("./routes/startupkit.js");
 const workspaceRouter = require("./routes/workspaceRoute.js");
 const affiliateRouter = require("./routes/affiliateRoute.js");
+const tutorEarningRouter = require("./routes/tutorEarningRoute.js");
 const settingsRouter = require("./routes/settingsRoute.js");
 
 const Chat = require("./models/chat");
@@ -41,6 +42,7 @@ const { startWithdrawalReconciliation } = require("./utils/withdrawalReconciler"
 const { startPaymentReconciliation } = require("./utils/paymentReconciler");
 const { startAutoPayouts } = require("./services/autoPayoutService");
 const { startAffiliateCommissionRelease } = require("./utils/affiliateCommissionReleaser");
+const { startTutorEarningRelease } = require("./utils/tutorEarningReleaser");
 
 const bodyParser = require("body-parser");
 const { connect } = require("./config/connectionState");
@@ -99,6 +101,7 @@ startWithdrawalReconciliation();
 startPaymentReconciliation();
 startAutoPayouts();
 startAffiliateCommissionRelease();
+startTutorEarningRelease();
 // Middleware
 app.use(cors(corsOptions));
 
@@ -143,6 +146,9 @@ app.use("/certificate", certificateRouter);
 app.use("/start-up-kit", startUpKitRouter);
 app.use("/workspace", workspaceRouter);
 app.use("/affiliate", affiliateRouter);
+// The tutor earning ledger. Its own prefix because the tutor programme is not the
+// affiliate programme — see the router's own comment.
+app.use("/tutor-earnings", tutorEarningRouter);
 // The persona was formerly named "partner". The old prefix is kept as an alias so
 // a client build that still calls /partner keeps working; it can be dropped once
 // the renamed frontend is the only deployed client.

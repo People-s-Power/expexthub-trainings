@@ -227,6 +227,10 @@ const userSchema = new mongoose.Schema({
     // what they actually receive — not of the gross the student paid. A share of
     // the gross would take the platform fee out of the provider's side twice.
     percentage: { type: Number, min: 0, max: 100, default: 0 },
+    // Holding period before a tutor's earning becomes withdrawable, mirroring
+    // `affiliateSettings.holdDays`. Null falls back to the platform default, so an
+    // unset provider still behaves predictably rather than paying out instantly.
+    holdDays: { type: Number, min: 0, max: 90, default: null },
     updatedAt: Date,
   },
 

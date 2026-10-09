@@ -38,27 +38,45 @@ function hasCourseRate(courseTutorShare) {
  * document written before this existed, and resolves to the pre-existing
  * behaviour exactly.
  */
-function resolveTutorSharePercent({ courseTutorShare = null, revenueShare = null } = {}) {
+function resolveTutorSharePercent(options = {}) {
+  return resolveTutorSharePercentWithSource(options).value;
+}
+
+/**
+ * The same resolution, reporting which tier supplied the rate.
+ *
+ * Split out because the earning ledger records the tier alongside the amount —
+ * the `rateSource` column on `TutorEarning` — so support can answer "why did this
+ * pay 50%?" without re-deriving the settings as they were on the day. Returning it
+ * from the one resolution rather than re-deciding it at the write site is what
+ * stops the recorded reason drifting from the recorded number.
+ *
+ * `source` is `null` whenever the answer is 0: neither the master switch being off
+ * nor a course opt-out is a tier that supplied a rate, and calling either of them
+ * `course_override` would put a reason on a row that was never written.
+ */
+function resolveTutorSharePercentWithSource({ courseTutorShare = null, revenueShare = null } = {}) {
   // The master switch. `enabled` defaults to false, so an account that never
   // opted in pays nothing however its courses are configured.
-  if (!revenueShare?.enabled) return 0;
+  if (!revenueShare?.enabled) return { value: 0, source: null };
 
   if (courseTutorShare) {
     // A deliberate opt-out for this one course, even though the programme is on.
-    if (courseTutorShare.enabled === false) return 0;
+    if (courseTutorShare.enabled === false) return { value: 0, source: null };
 
     // The course's own rate decides on its own once it is set — including when
     // it is 0. Falling back to the general rate for a course the provider has
     // explicitly set to zero would pay a share they have already declined.
     if (hasCourseRate(courseTutorShare)) {
-      return clampPercentage(courseTutorShare.value);
+      return { value: clampPercentage(courseTutorShare.value), source: 'course_override' };
     }
   }
 
-  return clampPercentage(revenueShare.percentage);
+  return { value: clampPercentage(revenueShare.percentage), source: 'provider' };
 }
 
 module.exports = {
   resolveTutorSharePercent,
+  resolveTutorSharePercentWithSource,
   hasCourseRate,
 };

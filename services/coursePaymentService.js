@@ -7,7 +7,11 @@ const Notification = require('../models/notifications.js');
 const CoursePaymentPlan = require('../models/coursePaymentPlans.js');
 const { sendPaymentReceiptOnce } = require('../utils/emails/receiptDispatcher.js');
 const { generateCommissionForPayment } = require('./affiliateCommissionService.js');
-const { resolveTutorSharePercent } = require('./tutorShareService.js');
+const { generateTutorEarningsForPayment } = require('./tutorEarningService.js');
+const {
+  resolveTutorSharePercent,
+  resolveTutorSharePercentWithSource,
+} = require('./tutorShareService.js');
 // `clampPercentage` and `MAX_SHARE_PERCENT` were destructured here until the rate
 // became two-tier: clamping now happens inside `resolveTutorSharePercent`, which
 // is the single place the effective percentage is decided.
@@ -637,13 +641,17 @@ async function creditShare(transaction, share, platformFee) {
 /**
  * Credits everyone who earned on this payment, exactly once per source payment.
  *
- * The provider receives their net minus the tutors' share; each assigned tutor
- * receives their cut. Every credit is independently idempotent, so a replay
- * completes a run that was interrupted part-way instead of skipping the rest.
+ * The provider receives their net minus the tutors' share, credited straight to
+ * their wallet as it always has been. Each assigned tutor receives their cut as a
+ * `TutorEarning` ledger row rather than a wallet credit, so it sits in a holding
+ * period before it becomes withdrawable — the same lifecycle an affiliate
+ * commission has. The division itself is unchanged: the tutor slices still come
+ * out of the provider's net, so the provider's residual is the same figure it was
+ * before, and only the timing of the tutors' side has moved.
  */
 async function creditInstructor(transaction, amountMajor) {
   const course = await Course.findById(transaction.courseId)
-    .select('instructorId assignedTutors tutorShare');
+    .select('instructorId assignedTutors tutorShare title');
   if (!course?.instructorId || !(amountMajor > 0)) return false;
 
   const provider = await User.findById(course.instructorId)
@@ -651,9 +659,10 @@ async function creditInstructor(transaction, amountMajor) {
   const revenueShare = provider?.tutorRevenueShare || {};
 
   // The effective rate, which may be the course's own rather than the provider's
-  // general one. Resolved once and used for both the split and the figure written
-  // onto each tutor's ledger row, so what is recorded is what was actually paid.
-  const percent = resolveTutorSharePercent({
+  // general one. Resolved once, through the source-reporting form, so the figure
+  // written onto each tutor's ledger row and the tier it came from are decided
+  // together and cannot disagree.
+  const { value: percent, source: rateSource } = resolveTutorSharePercentWithSource({
     courseTutorShare: course.tutorShare,
     revenueShare,
   });
@@ -669,14 +678,37 @@ async function creditInstructor(transaction, amountMajor) {
 
   const platformFee = roundMoney(Number(amountMajor) * PLATFORM_FEE_RATE);
 
+  // Only the provider's own share is a wallet credit now. A tutor's share is not
+  // paid here — it is recorded and released by the holding-period sweep.
+  const providerShares = shares.filter((share) => share.role === 'provider');
+  const tutorShares = shares.filter((share) => share.role === 'tutor');
+
   let creditedAny = false;
-  for (const share of shares) {
+  for (const share of providerShares) {
     const written = await creditShare(
       transaction,
       { ...share, percent },
       platformFee,
     );
     creditedAny = creditedAny || written;
+  }
+
+  // Deliberately non-fatal, matching how `generateCommissionForPayment` is called
+  // from the finalizers: the student's access is granted and their money is taken,
+  // so a ledger failure must not turn a settled payment into an error. The write is
+  // idempotent per payment and tutor, so a replay completes what a failure missed.
+  if (tutorShares.length) {
+    try {
+      await generateTutorEarningsForPayment(transaction, {
+        course,
+        provider,
+        shares: tutorShares,
+        percent,
+        rateSource,
+      });
+    } catch (error) {
+      console.error('Tutor earning generation failed:', transaction.txRef, error.message);
+    }
   }
 
   return creditedAny;
