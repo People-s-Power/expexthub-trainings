@@ -1879,7 +1879,14 @@ const userControllers = {
       return res.json({
         settings: {
           enabled: settings.enabled === true,
-          percentage: Number(settings.percentage) || 0,
+          // `type` decides how `value` reads — a percentage of what the student
+          // pays, or a flat fee in naira for the course. The two travel together.
+          type: settings.type === 'fixed' ? 'fixed' : 'percentage',
+          value: Number(settings.value) || 0,
+          // The optional ceiling on what the tutors earn from one student on one
+          // course. 0 is the documented "no cap", so it is sent as 0 rather than
+          // null — unlike holdDays, where 0 is a real choice.
+          maxShareCap: Number(settings.maxShareCap) || 0,
           // Null when unset, not the resolved platform default. The client shows
           // "leave blank for the platform default" against a blank field, and
           // sending the default here would render it as a number the provider had
@@ -1901,17 +1908,27 @@ const userControllers = {
   /**
    * Saves the share.
    *
-   * An out-of-range percentage is refused with its own message rather than
-   * clamped. This is what the provider pays their tutors; a figure quietly
-   * adjusted behind them is a figure they will believe they set, and the tutor
-   * is the one who finds out otherwise.
+   * An out-of-range rate is refused with its own message rather than clamped.
+   * This is what the provider pays their tutors; a figure quietly adjusted behind
+   * them is a figure they will believe they set, and the tutor is the one who
+   * finds out otherwise.
+   *
+   * The percentage ceiling is applied only to a percentage. A fixed fee is not a
+   * proportion of anything, so the ceiling says nothing about it — what bounds it
+   * is the provider's net, which the split enforces.
    */
   updateTutorRevenueShare: async (req, res) => {
     try {
       const account = await User.findById(scopeIdOf(req)).select('tutorRevenueShare');
       if (!account) return res.status(404).json({ message: 'Account not found' });
 
-      const { enabled, percentage, holdDays } = req.body || {};
+      const {
+        enabled,
+        type,
+        value,
+        maxShareCap,
+        holdDays,
+      } = req.body || {};
       const update = { 'tutorRevenueShare.updatedAt': new Date() };
 
       if (enabled !== undefined) {
@@ -1921,17 +1938,39 @@ const userControllers = {
         update['tutorRevenueShare.enabled'] = enabled;
       }
 
-      if (percentage !== undefined) {
-        const rate = Number(percentage);
-        if (!Number.isFinite(rate) || rate < 0) {
-          return res.status(400).json({ message: 'The revenue share must be a percentage of 0 or more' });
+      if (type !== undefined) {
+        if (type !== 'percentage' && type !== 'fixed') {
+          return res.status(400).json({ message: 'Revenue share type must be percentage or fixed' });
         }
-        if (rate > MAX_SHARE_PERCENT) {
+        update['tutorRevenueShare.type'] = type;
+      }
+
+      // The type in force after this save, so a request that sends only the rate
+      // is still checked against the ceiling if the stored type is a percentage.
+      const current = account.tutorRevenueShare || {};
+      const effectiveType = update['tutorRevenueShare.type'] !== undefined
+        ? update['tutorRevenueShare.type']
+        : (current.type === 'fixed' ? 'fixed' : 'percentage');
+
+      if (value !== undefined) {
+        const rate = Number(value);
+        if (!Number.isFinite(rate) || rate < 0) {
+          return res.status(400).json({ message: 'The revenue share must be a number of 0 or more' });
+        }
+        if (effectiveType === 'percentage' && rate > MAX_SHARE_PERCENT) {
           return res.status(400).json({
             message: `The revenue share cannot exceed ${MAX_SHARE_PERCENT}%`,
           });
         }
-        update['tutorRevenueShare.percentage'] = rate;
+        update['tutorRevenueShare.value'] = rate;
+      }
+
+      if (maxShareCap !== undefined) {
+        const cap = Number(maxShareCap);
+        if (!Number.isFinite(cap) || cap < 0) {
+          return res.status(400).json({ message: 'The revenue share cap must be a number of 0 or more' });
+        }
+        update['tutorRevenueShare.maxShareCap'] = cap;
       }
 
       if (holdDays !== undefined) {
@@ -1951,37 +1990,44 @@ const userControllers = {
       }
 
       // Merged against what is stored, because either field can arrive alone.
-      // Switching the share on while the rate sits at 0% is the exact failure
-      // this screen exists to prevent — the provider believes their tutors are
-      // being paid, and nothing moves.
-      const current = account.tutorRevenueShare || {};
+      // Switching the share on while the rate sits at 0 is the exact failure this
+      // screen exists to prevent — the provider believes their tutors are being
+      // paid, and nothing moves. The word after "above 0" follows the type, since
+      // "0%" says nothing useful about a flat fee.
       const nextEnabled = update['tutorRevenueShare.enabled'] !== undefined
         ? update['tutorRevenueShare.enabled']
         : current.enabled === true;
-      const nextPercentage = update['tutorRevenueShare.percentage'] !== undefined
-        ? update['tutorRevenueShare.percentage']
-        : Number(current.percentage) || 0;
+      const nextValue = update['tutorRevenueShare.value'] !== undefined
+        ? update['tutorRevenueShare.value']
+        : Number(current.value) || 0;
 
-      if (nextEnabled && nextPercentage <= 0) {
+      if (nextEnabled && nextValue <= 0) {
         return res.status(400).json({
-          message: 'Enter a revenue share above 0% before switching it on',
+          message: effectiveType === 'fixed'
+            ? 'Enter a revenue share above 0 before switching it on'
+            : 'Enter a revenue share above 0% before switching it on',
         });
       }
 
       await User.updateOne({ _id: account._id }, { $set: update });
 
-      // Merged the same way as the two fields above, so a save that omits the
-      // holding period reports back what is actually stored rather than resetting
-      // the client's view of it.
+      // Merged the same way as the fields above, so a save that omits one of them
+      // reports back what is actually stored rather than resetting the client's
+      // view of it.
       const nextHoldDays = update['tutorRevenueShare.holdDays'] !== undefined
         ? update['tutorRevenueShare.holdDays']
         : (current.holdDays === null || current.holdDays === undefined ? null : Number(current.holdDays));
+      const nextCap = update['tutorRevenueShare.maxShareCap'] !== undefined
+        ? update['tutorRevenueShare.maxShareCap']
+        : Number(current.maxShareCap) || 0;
 
       return res.json({
         message: 'Tutor revenue share saved',
         settings: {
           enabled: nextEnabled,
-          percentage: nextPercentage,
+          type: effectiveType,
+          value: nextValue,
+          maxShareCap: nextCap,
           holdDays: nextHoldDays,
           updatedAt: update['tutorRevenueShare.updatedAt'],
         },
@@ -2080,6 +2126,10 @@ const userControllers = {
    * share while the provider's programme stays on for every other course. The two
    * are different answers and the UI offers both, so they must not be conflated.
    *
+   * The rate is a `{ type, value }` pair exactly as the general rate is: a
+   * percentage of what the student pays, or a flat fee for the course divided
+   * between whoever is assigned to it.
+   *
    * An out-of-range rate is refused with its own message rather than clamped, the
    * same as the general rate above: a figure quietly adjusted behind the provider
    * is a figure they will believe they set.
@@ -2091,30 +2141,51 @@ const userControllers = {
         return res.status(400).json({ message: 'Invalid course id' });
       }
 
-      const { enabled, value } = req.body || {};
+      const { enabled, type, value } = req.body || {};
       const update = {};
 
       if (enabled === null || enabled === undefined) {
         // Clearing the override returns the course to the provider's general rate.
-        update.tutorShare = { enabled: null, value: null };
+        update.tutorShare = { enabled: null, type: null, value: null };
       } else {
         if (typeof enabled !== 'boolean') {
           return res.status(400).json({ message: 'Enabled must be true or false' });
         }
         update['tutorShare.enabled'] = enabled;
 
-        if (enabled && value !== undefined && value !== null) {
+        if (enabled && type !== undefined) {
+          if (type !== 'percentage' && type !== 'fixed') {
+            return res.status(400).json({ message: 'Revenue share type must be percentage or fixed' });
+          }
+          update['tutorShare.type'] = type;
+        }
+
+        if (enabled && value !== undefined) {
           const rate = Number(value);
           if (!Number.isFinite(rate) || rate < 0) {
             return res.status(400).json({
-              message: 'The revenue share must be a percentage of 0 or more',
+              message: 'The revenue share must be a number of 0 or more',
             });
           }
-          if (rate > MAX_SHARE_PERCENT) {
+
+          // The ceiling is a percentage rule; a flat fee is not a proportion of
+          // anything and is bounded by the provider's net instead, which the split
+          // enforces. So the check needs the type in force: the one this request
+          // sets if it sets one, and otherwise whatever the course already carries.
+          // Assuming "percentage" when the type is absent would make every flat fee
+          // above the ceiling unsaveable — ₦3,000 reads as 3,000%.
+          let rateType = type;
+          if (rateType === undefined) {
+            const existing = await Course.findById(courseId).select('tutorShare').lean();
+            rateType = existing?.tutorShare?.type === 'fixed' ? 'fixed' : 'percentage';
+          }
+
+          if (rateType === 'percentage' && rate > MAX_SHARE_PERCENT) {
             return res.status(400).json({
               message: `The revenue share cannot exceed ${MAX_SHARE_PERCENT}%`,
             });
           }
+
           update['tutorShare.value'] = rate;
         }
       }

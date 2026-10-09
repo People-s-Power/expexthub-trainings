@@ -10,9 +10,10 @@
 //      or a row records a reason that is not true.
 //
 //   2. The provider's residual and the tutors' rows sum back to the net, for
-//      awkward amounts and any number of tutors. This is the invariant that a
-//      ledger which does not reconcile breaks, and it is the whole reason the
-//      tutor slices are passed *into* the ledger rather than recomputed there.
+//      awkward amounts, any number of tutors, and both rate types. This is the
+//      invariant that a ledger which does not reconcile breaks, and it is the whole
+//      reason the tutor slices are passed *into* the ledger rather than recomputed
+//      there.
 //
 //   3. An earning's reference is a function of exactly the payment and the tutor.
 //      That is what makes a replayed webhook collide instead of paying twice.
@@ -22,8 +23,8 @@
 // and the tutor service pulls the affiliate one back for `allocateWithdrawal`.
 
 const {
+  resolveTutorShare,
   resolveTutorSharePercent,
-  resolveTutorSharePercentWithSource,
 } = require('../services/tutorShareService.js');
 const { splitCourseEarnings, PLATFORM_FEE_RATE } = require('../services/coursePaymentService.js');
 const { allocateWithdrawal } = require('../services/affiliateCommissionService.js');
@@ -52,7 +53,10 @@ const TUTOR_A = 'b'.repeat(24);
 const TUTOR_B = 'c'.repeat(24);
 const TUTOR_C = 'd'.repeat(24);
 
-const general = (percentage) => ({ enabled: true, percentage });
+// A rate is a `{ type, value }` pair — a percentage of what the student pays, or a
+// flat fee for the course.
+const general = (percentage) => ({ enabled: true, type: 'percentage', value: percentage });
+const generalFixed = (fee) => ({ enabled: true, type: 'fixed', value: fee });
 
 // ---------------------------------------------------------------------------
 console.log('--- the reported source matches the reported rate ---\n');
@@ -61,21 +65,26 @@ console.log('--- the reported source matches the reported rate ---\n');
 // source]. The rate itself is checked against the plain resolution below, so no
 // arm can drift from it.
 const ARMS = [
-  ['a per-course rate', { enabled: true, value: 30 }, general(20), 'course_override'],
-  ['a per-course rate with no explicit enabled flag', { enabled: null, value: 45 }, general(20), 'course_override'],
+  ['a per-course rate', { enabled: true, type: 'percentage', value: 30 }, general(20), 'course_override'],
+  ['a per-course rate with no explicit enabled flag', { enabled: null, type: 'percentage', value: 45 }, general(20), 'course_override'],
   // A course set to zero is a real answer from the course tier, not the absence
   // of one — the provider deliberately declined to pay on this course. It carries
   // a source for that reason, and no row is ever written from it, since a split
   // that pays nothing produces no tutor slice to record.
-  ['a per-course zero', { enabled: true, value: 0 }, general(20), 'course_override'],
-  ['a per-course opt-out', { enabled: false, value: null }, general(20), null],
-  ['an untouched course inheriting the general rate', { enabled: null, value: null }, general(20), 'provider'],
+  ['a per-course zero', { enabled: true, type: 'percentage', value: 0 }, general(20), 'course_override'],
+  ['a per-course opt-out', { enabled: false, type: null, value: null }, general(20), null],
+  ['an untouched course inheriting the general rate', { enabled: null, type: null, value: null }, general(20), 'provider'],
   ['no course tier at all', null, general(20), 'provider'],
-  ['the programme switched off', { enabled: true, value: 30 }, { enabled: false, percentage: 0 }, null],
+  ['the programme switched off', { enabled: true, type: 'percentage', value: 30 }, { enabled: false, type: 'percentage', value: 0 }, null],
+  // A flat fee is a rate like any other as far as the ledger is concerned: it pays,
+  // so it has to name the tier that decided it, and `rateValue` holds naira rather
+  // than a percentage when it does.
+  ['a fixed general rate', null, generalFixed(3000), 'provider'],
+  ['a fixed per-course rate', { enabled: true, type: 'fixed', value: 3000 }, general(20), 'course_override'],
 ];
 
 for (const [name, courseTutorShare, revenueShare, expectedSource] of ARMS) {
-  const withSource = resolveTutorSharePercentWithSource({ courseTutorShare, revenueShare });
+  const withSource = resolveTutorShare({ courseTutorShare, revenueShare });
   const plain = resolveTutorSharePercent({ courseTutorShare, revenueShare });
 
   eq(`${name}: the source-reporting form agrees with the plain one`, withSource.value, plain);
@@ -90,10 +99,19 @@ const PAYING_SOURCES = ['course_override', 'provider'];
 check(
   'every arm that pays a share reports a tier the ledger will accept',
   ARMS.every(([, courseTutorShare, revenueShare]) => {
-    const { value, source } = resolveTutorSharePercentWithSource({ courseTutorShare, revenueShare });
+    const { value, source } = resolveTutorShare({ courseTutorShare, revenueShare });
     return value <= 0 || PAYING_SOURCES.includes(source);
   }),
   'a paying arm reported no source, or one the ledger would reject',
+);
+
+// The rate written onto a row is `{ rateType, rateValue }`, and the type decides
+// how the value reads. A row claiming `percentage` while its value is naira would
+// make the ledger's own explanation of a payment wrong.
+check(
+  'a fixed rate reports its type, so the naira value is not read as a percentage',
+  resolveTutorShare({ courseTutorShare: null, revenueShare: generalFixed(3000) }).type === 'fixed',
+  'a fixed rate resolved as a percentage',
 );
 
 // ---------------------------------------------------------------------------
@@ -108,37 +126,48 @@ const netOf = (gross) => Math.round(gross * (1 - PLATFORM_FEE_RATE) * 100) / 100
 // once the share does not divide evenly.
 const GROSSES = [10000, 100.01, 33333.33, 999.99, 250000, 7.77];
 const TUTOR_SETS = [[TUTOR_A], [TUTOR_A, TUTOR_B], [TUTOR_A, TUTOR_B, TUTOR_C]];
+// The rates. A percentage scales with the payment; a fixed fee does not, and the
+// hostile grosses above are exactly where that difference bites — ₦7.77 cannot
+// fund a ₦3,000 fee, so the pool has to be clamped to the net rather than the
+// provider's row going negative.
+const RATES = [
+  { type: 'percentage', value: 35 },
+  { type: 'fixed', value: 3000 },
+  { type: 'fixed', value: 50 },
+  { type: 'fixed', value: 9999.99 },
+];
 
 let reconciliations = 0;
 let drift = 0;
 
 for (const gross of GROSSES) {
   for (const tutors of TUTOR_SETS) {
-    const shares = splitCourseEarnings({
-      amountMajor: gross,
-      instructorId: PROVIDER,
-      assignedTutors: tutors,
-      revenueShare: general(20),
-      courseTutorShare: { enabled: true, value: 35 },
-    });
+    for (const rate of RATES) {
+      const shares = splitCourseEarnings({
+        amountMajor: gross,
+        instructorId: PROVIDER,
+        assignedTutors: tutors,
+        rate,
+      });
 
-    const credited = shares.reduce((sum, share) => sum + share.amount, 0);
-    const expected = netOf(gross);
-    reconciliations += 1;
-    if (Math.abs(credited - expected) > 0.005) {
-      drift += 1;
-      console.log(`      gross ${gross}, ${tutors.length} tutor(s): credited ${credited}, net ${expected}`);
-    }
+      const credited = shares.reduce((sum, share) => sum + share.amount, 0);
+      const expected = netOf(gross);
+      reconciliations += 1;
+      if (Math.abs(credited - expected) > 0.005) {
+        drift += 1;
+        console.log(`      gross ${gross}, ${tutors.length} tutor(s), ${rate.type} ${rate.value}: credited ${credited}, net ${expected}`);
+      }
 
-    // Whatever the ledger will store is the tutor slice in minor units, so it has
-    // to survive the round trip exactly — a kobo lost here is a kobo the tutor
-    // never sees, and it would not show up in the sum above.
-    const tutorsOnly = shares.filter((share) => share.role === 'tutor');
-    const roundTripped = tutorsOnly.reduce((sum, share) => sum + toMajor(toMinor(share.amount)), 0);
-    const nominal = tutorsOnly.reduce((sum, share) => sum + share.amount, 0);
-    if (Math.abs(roundTripped - nominal) > 0.005) {
-      drift += 1;
-      console.log(`      gross ${gross}: minor-unit round trip moved ${nominal} to ${roundTripped}`);
+      // Whatever the ledger will store is the tutor slice in minor units, so it has
+      // to survive the round trip exactly — a kobo lost here is a kobo the tutor
+      // never sees, and it would not show up in the sum above.
+      const tutorsOnly = shares.filter((share) => share.role === 'tutor');
+      const roundTripped = tutorsOnly.reduce((sum, share) => sum + toMajor(toMinor(share.amount)), 0);
+      const nominal = tutorsOnly.reduce((sum, share) => sum + share.amount, 0);
+      if (Math.abs(roundTripped - nominal) > 0.005) {
+        drift += 1;
+        console.log(`      gross ${gross}: minor-unit round trip moved ${nominal} to ${roundTripped}`);
+      }
     }
   }
 }
@@ -150,21 +179,65 @@ check(
 );
 
 // The specific shape the money actually takes, so the arithmetic above is pinned
-// to a number a human can check: ₦10,000 gross, 5% platform fee, 20% of the net.
+// to a number a human can check: ₦10,000 gross, 5% platform fee, 20% of the gross.
 const workedExample = splitCourseEarnings({
   amountMajor: 10000,
   instructorId: PROVIDER,
   assignedTutors: [TUTOR_A],
-  revenueShare: general(20),
-  courseTutorShare: null,
+  rate: { type: 'percentage', value: 20 },
 });
 const amountFor = (shares, id) => shares.find((share) => String(share.userId) === String(id))?.amount;
-eq('₦10,000 gross leaves the provider ₦7,600', amountFor(workedExample, PROVIDER), 7600);
-eq('and the tutor ₦1,900', amountFor(workedExample, TUTOR_A), 1900);
+eq('₦10,000 gross leaves the provider ₦7,500', amountFor(workedExample, PROVIDER), 7500);
+eq('and the tutor ₦2,000', amountFor(workedExample, TUTOR_A), 2000);
 eq(
   'which is what the ledger stores, in kobo',
   toMinor(amountFor(workedExample, TUTOR_A)),
-  190000,
+  200000,
+);
+// The share is measured against the gross, not the provider's net — the same base
+// the affiliate commission uses, so "20%" means one thing across both programmes.
+// Off the net it would have been ₦1,900, which is what this change replaced.
+check(
+  'the share is of the gross, so it costs the provider more than it would off the net',
+  amountFor(workedExample, TUTOR_A) > netOf(10000) * 0.2,
+  'the share was computed off the net',
+);
+
+// ---------------------------------------------------------------------------
+console.log('');
+console.log('--- the cap withholds money from the tutors, not from the provider ---\n');
+
+// The assertion that would have caught the residual computed *before* the cap
+// bit: when the cap withholds, the provider's cut has to grow by exactly the
+// amount the tutors did not receive. Deriving the provider's row from the nominal
+// rate instead would leave that difference paid to nobody, and the two sides would
+// stop summing to the net.
+const noCap = splitCourseEarnings({
+  amountMajor: 10000,
+  instructorId: PROVIDER,
+  assignedTutors: [TUTOR_A],
+  rate: { type: 'percentage', value: 20 },
+});
+const withCap = splitCourseEarnings({
+  amountMajor: 10000,
+  instructorId: PROVIDER,
+  assignedTutors: [TUTOR_A],
+  rate: { type: 'percentage', value: 20 },
+  capMajor: 1500,
+});
+
+let withheld = 0;
+withheld = amountFor(noCap, TUTOR_A) - amountFor(withCap, TUTOR_A);
+eq('the cap withholds the difference from the tutor', withheld, 500);
+eq(
+  "and the provider's cut grows by exactly what the cap withheld",
+  amountFor(withCap, PROVIDER) - amountFor(noCap, PROVIDER),
+  withheld,
+);
+eq(
+  'so the two sides still sum to the net after the cap bites',
+  amountFor(withCap, PROVIDER) + amountFor(withCap, TUTOR_A),
+  netOf(10000),
 );
 
 // ---------------------------------------------------------------------------

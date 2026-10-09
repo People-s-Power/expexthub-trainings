@@ -47,9 +47,13 @@ const tutorEarningSchema = new mongoose.Schema(
     sourceTransaction: { type: String, required: true, index: true },
 
     // The student fee for this payment — the figure the rate was applied to, and
-    // the "Student fee" column on the My Instructors table.
+    // the "Student fee" column on the My Instructors table. Under a percentage
+    // rate it is the gross the student paid, which is what the share is a
+    // proportion of.
     baseAmount: { type: Number, required: true, min: 0 },
-    rateType: { type: String, enum: ['percentage'], required: true },
+    // `fixed` is a flat fee for the course rather than a proportion of this
+    // payment, so `rateValue` is naira in that case and a percentage in the other.
+    rateType: { type: String, enum: ['percentage', 'fixed'], required: true },
     rateValue: { type: Number, required: true, min: 0 },
     // Signed: a reversal row carries a negative amount, so summing this field
     // yields the true net earned without special-casing reversals.
@@ -106,6 +110,11 @@ tutorEarningSchema.index({ status: 1, holdUntil: 1 });
 tutorEarningSchema.index({ tutorId: 1, createdAt: -1 });
 // The provider's My Instructors table. Same shape, scoped to the course owner.
 tutorEarningSchema.index({ providerId: 1, createdAt: -1 });
+// The accrual read: how much this student's tutoring on this course has already
+// earned, which decides the once-per-course fixed fee and the per-student cap.
+// Matched by (student, course) rather than by tutor because both rules are about
+// the course's pool of tutors, not about any one of them.
+tutorEarningSchema.index({ courseId: 1, studentId: 1, status: 1 });
 
 const TutorEarning = mongoose.model('TutorEarning', tutorEarningSchema);
 

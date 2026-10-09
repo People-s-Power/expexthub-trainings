@@ -7,14 +7,15 @@ const Notification = require('../models/notifications.js');
 const CoursePaymentPlan = require('../models/coursePaymentPlans.js');
 const { sendPaymentReceiptOnce } = require('../utils/emails/receiptDispatcher.js');
 const { generateCommissionForPayment } = require('./affiliateCommissionService.js');
-const { generateTutorEarningsForPayment } = require('./tutorEarningService.js');
 const {
-  resolveTutorSharePercent,
-  resolveTutorSharePercentWithSource,
-} = require('./tutorShareService.js');
+  generateTutorEarningsForPayment,
+  accruedTutorShareForStudentCourse,
+  toMajor,
+} = require('./tutorEarningService.js');
+const { resolveTutorShare } = require('./tutorShareService.js');
 // `clampPercentage` and `MAX_SHARE_PERCENT` were destructured here until the rate
-// became two-tier: clamping now happens inside `resolveTutorSharePercent`, which
-// is the single place the effective percentage is decided.
+// became two-tier: clamping now happens inside `resolveTutorShare`, which is the
+// single place the effective rate is decided.
 const {
   MINOR_UNIT,
   percentageOf,
@@ -517,80 +518,129 @@ async function grantCourseAccess({ userId, courseId, plan, session, renewal = fa
  * be checkable without a database. Returns `[{ userId, amount, role, refSuffix }]`
  * in the order the credits should be written, always with the provider first.
  *
- * The order of operations is what makes the split fair:
+ * The order of operations:
  *
  *   1. the platform takes its fee off the gross, as it always has
- *   2. the tutor share is a percentage of what is *left* — the provider's own net
- *   3. the provider keeps the remainder
+ *   2. the tutor share is a proportion of the *gross the student paid* — the same
+ *      base the affiliate commission is computed from, so "20%" means one thing
+ *      across both programmes
+ *   3. the provider receives the net minus whatever the tutors actually got
  *
- * Taking the share off the gross instead would pay the platform fee twice: once
- * out of the provider's side and once out of the tutor's.
+ * This inverts the earlier rule, which took the share off the provider's net.
+ * The consequence is a real one and worth stating: a 20% share costs the provider
+ * ₦2,000 on a ₦10,000 course rather than ₦1,900, because the share is now measured
+ * against money the platform has also taken a fee from. The platform's own 5% is
+ * unchanged, and the parts still sum to the gross exactly.
  *
- * Several tutors on one course divide the one share equally rather than each
+ * The rate is resolved and clamped by `resolveTutorShare` before it gets here —
+ * this function applies a rate, it does not decide one — so the amount paid and
+ * the rate recorded on the ledger row cannot disagree.
+ *
+ * Several tutors on one course divide the one pool equally rather than each
  * taking it. "20% to my tutors" is a statement about how much of the course
  * revenue leaves the provider, so two tutors on a course must not turn it into
  * 40%. The provider is skipped as a recipient: they are already the remainder,
  * and paying them a share would write two rows moving the same money.
  *
- * The rate itself is not decided here — `resolveTutorSharePercent` owns the
- * per-course-overrides-general rule, and this reads it so the amount paid and the
- * percentage recorded on the ledger row can never disagree.
+ * `capMajor` and `accruedMajor` are the provider's optional per-student ceiling
+ * and what this student's tutoring on this course has already earned. Both are in
+ * naira, matching every other figure here.
  */
 function splitCourseEarnings({
   amountMajor,
   instructorId,
   assignedTutors = [],
-  revenueShare = {},
-  courseTutorShare = null,
+  rate = null,
+  capMajor = 0,
+  accruedMajor = 0,
+  fixedAlreadyPaid = false,
 }) {
   const gross = Number(amountMajor);
   if (!(gross > 0)) return [];
 
   const net = roundMoney(gross * (1 - PLATFORM_FEE_RATE));
-  const share = resolveTutorSharePercent({ courseTutorShare, revenueShare });
 
   const tutorIds = [...new Set((assignedTutors || []).filter(Boolean).map((id) => String(id)))]
     .filter((id) => id !== String(instructorId));
 
-  const shares = [];
-  if (!tutorIds.length || share <= 0) {
-    if (instructorId) shares.push({ userId: instructorId, amount: net, role: 'provider', refSuffix: '' });
-    return shares;
+  // Every case that leaves the tutors nothing collapses to the same answer: the
+  // provider keeps the whole net, which is what they received before this
+  // programme existed.
+  const providerKeepsNet = () =>
+    (instructorId ? [{ userId: instructorId, amount: net, role: 'provider', refSuffix: '' }] : []);
+
+  if (!tutorIds.length) return providerKeepsNet();
+  if (!rate || !(Number(rate.value) > 0)) return providerKeepsNet();
+  // A flat fee is earned once per course, not once per instalment — otherwise a
+  // twelve-instalment plan would pay twelve times the agreed fee. `creditInstructor`
+  // decides this from the accrual; here it simply settles the consequence.
+  if (rate.type === 'fixed' && fixedAlreadyPaid) return providerKeepsNet();
+
+  // The pool for THIS payment. A fixed fee is a flat amount rather than a
+  // proportion, so it ignores the size of this payment entirely.
+  let pool = rate.type === 'fixed'
+    ? roundMoney(rate.value)
+    : percentageOf(gross, Number(rate.value));
+
+  // Never more than the provider's own net. Without this a fixed fee larger than
+  // the course's net would drive the provider's row negative, the `> 0` guard below
+  // would drop it, and the tutors would be paid more than the net — money created
+  // from nothing. A percentage cannot reach this while the ceiling sits below the
+  // platform's cut, but the clamp costs nothing and the fixed branch needs it today.
+  pool = Math.min(pool, net);
+
+  // The provider's ceiling, as a true running total for this student on this
+  // course rather than per instalment: the remainder of the allowance is all that
+  // can be paid, so later instalments pay less and then nothing.
+  if (Number(capMajor) > 0) {
+    pool = Math.min(pool, Math.max(0, Number(capMajor) - (Number(accruedMajor) || 0)));
   }
+  if (!(pool > 0)) return providerKeepsNet();
 
   // Kobo-rounded per tutor, and the *provider's* remainder is derived from what
-  // the tutors actually receive rather than from the nominal percentage. That is
-  // the only way the parts add up to the whole: three tutors on a 10% share of
-  // ₦100.01 each round to a different kobo than 10% of the total, and the extra
-  // kobo has to come out of somebody's side or the credits will not sum back to
-  // the net. It comes out of the provider's, whose cut is the residual here.
-  const perTutor = roundMoney(percentageOf(net, share) / tutorIds.length);
-  const tutorTotal = roundMoney(perTutor * tutorIds.length);
+  // the tutors actually receive rather than from the nominal rate. That is the only
+  // way the parts add up to the whole: three tutors on a 10% share of ₦100.01 each
+  // round to a different kobo than 10% of the total, and the extra kobo has to come
+  // out of somebody's side or the credits will not sum back to the net. It comes
+  // out of the provider's, whose cut is the residual here. Deriving it before the
+  // cap would pay the provider as though the cap had not applied, and the
+  // difference would vanish.
+  //
+  // The division is settled against `pool` itself, never against a recomputed
+  // `perTutor * n`. Rounding `perTutor` *up* (pool 95.01 split two ways is 47.505,
+  // which rounds to 47.51) makes that product 95.02 — a kobo more than the pool, and
+  // more than the net when the pool was clamped to it. The last tutor absorbing the
+  // remainder measured from the pool is what keeps the total exact.
+  const perTutor = roundMoney(pool / tutorIds.length);
 
-  // The provider's row is written first and keeps the unsuffixed reference it
-  // has always had, so anything reading a course credit by its txRef still finds
-  // the provider's.
-  const providerAmount = roundMoney(net - tutorTotal);
-  // A share that consumed the whole net leaves the provider nothing to receive.
-  // A zero-value ledger row would be noise, so none is written.
+  let paidToTutors = 0;
+  const tutorShares = [];
+  tutorIds.forEach((id, index) => {
+    // The last tutor absorbs the division remainder, so the tutor credits sum to
+    // exactly `pool` and no kobo is created or lost by rounding. Clamped at zero for
+    // the pathological case where rounding `perTutor` up has already spent the pool
+    // before the last tutor is reached — the kobo then falls to the provider's
+    // residual rather than becoming a negative credit.
+    const amount = index === tutorIds.length - 1
+      ? Math.max(0, roundMoney(pool - paidToTutors))
+      : perTutor;
+    paidToTutors = roundMoney(paidToTutors + amount);
+    if (amount > 0) {
+      tutorShares.push({ userId: id, amount, role: 'tutor', refSuffix: `-tutor-${id}` });
+    }
+  });
+
+  const shares = [];
+  // The provider's row is written first and keeps the unsuffixed reference it has
+  // always had, so anything reading a course credit by its txRef still finds the
+  // provider's. A share that consumed the whole net leaves the provider nothing to
+  // receive; a zero-value ledger row would be noise, so none is written.
+  const providerAmount = roundMoney(net - paidToTutors);
   if (instructorId && providerAmount > 0) {
     shares.push({ userId: instructorId, amount: providerAmount, role: 'provider', refSuffix: '' });
   }
 
-  let paidToTutors = 0;
-  tutorIds.forEach((id, index) => {
-    // The last tutor absorbs the division remainder, so the tutor credits sum to
-    // exactly `tutorTotal` and no kobo is created or lost by rounding.
-    const amount = index === tutorIds.length - 1
-      ? roundMoney(tutorTotal - paidToTutors)
-      : perTutor;
-    paidToTutors = roundMoney(paidToTutors + amount);
-    if (amount > 0) {
-      shares.push({ userId: id, amount, role: 'tutor', refSuffix: `-tutor-${id}` });
-    }
-  });
-
-  return shares;
+  return shares.concat(tutorShares);
 }
 
 /**
@@ -642,12 +692,14 @@ async function creditShare(transaction, share, platformFee) {
  * Credits everyone who earned on this payment, exactly once per source payment.
  *
  * The provider receives their net minus the tutors' share, credited straight to
- * their wallet as it always has been. Each assigned tutor receives their cut as a
- * `TutorEarning` ledger row rather than a wallet credit, so it sits in a holding
- * period before it becomes withdrawable — the same lifecycle an affiliate
- * commission has. The division itself is unchanged: the tutor slices still come
- * out of the provider's net, so the provider's residual is the same figure it was
- * before, and only the timing of the tutors' side has moved.
+ * their wallet. Each assigned tutor receives their cut as a `TutorEarning` ledger
+ * row rather than a wallet credit, so it sits in a holding period before it
+ * becomes withdrawable — the same lifecycle an affiliate commission has.
+ *
+ * The tutors' pool comes out of the provider's side, not the platform's: this is
+ * the provider's own programme and a share worth paying cannot be funded from a 5%
+ * platform fee. So the provider's residual is smaller than it was when the share
+ * was taken off their net — see `splitCourseEarnings`.
  */
 async function creditInstructor(transaction, amountMajor) {
   const course = await Course.findById(transaction.courseId)
@@ -659,20 +711,31 @@ async function creditInstructor(transaction, amountMajor) {
   const revenueShare = provider?.tutorRevenueShare || {};
 
   // The effective rate, which may be the course's own rather than the provider's
-  // general one. Resolved once, through the source-reporting form, so the figure
-  // written onto each tutor's ledger row and the tier it came from are decided
-  // together and cannot disagree.
-  const { value: percent, source: rateSource } = resolveTutorSharePercentWithSource({
+  // general one, and may be a flat fee rather than a proportion. Resolved once and
+  // passed into the split, so the figure written onto each tutor's ledger row, the
+  // amount actually paid and the tier it came from are all decided together and
+  // cannot disagree.
+  const { type: rateType, value: rateValue, source: rateSource } = resolveTutorShare({
     courseTutorShare: course.tutorShare,
     revenueShare,
+  });
+
+  // What this student's tutoring on this course has already earned, which decides
+  // both the once-per-course fixed fee and the remainder of the provider's cap.
+  // Read here rather than inside the split because the split is deliberately pure.
+  const { totalMinor: accruedMinor } = await accruedTutorShareForStudentCourse({
+    studentId: transaction.userId,
+    courseId: course._id,
   });
 
   const shares = splitCourseEarnings({
     amountMajor,
     instructorId: course.instructorId,
     assignedTutors: course.assignedTutors,
-    revenueShare,
-    courseTutorShare: course.tutorShare,
+    rate: { type: rateType, value: rateValue },
+    capMajor: Number(revenueShare.maxShareCap) || 0,
+    accruedMajor: toMajor(accruedMinor),
+    fixedAlreadyPaid: rateType === 'fixed' && accruedMinor > 0,
   });
   if (!shares.length) return false;
 
@@ -685,11 +748,7 @@ async function creditInstructor(transaction, amountMajor) {
 
   let creditedAny = false;
   for (const share of providerShares) {
-    const written = await creditShare(
-      transaction,
-      { ...share, percent },
-      platformFee,
-    );
+    const written = await creditShare(transaction, share, platformFee);
     creditedAny = creditedAny || written;
   }
 
@@ -703,7 +762,8 @@ async function creditInstructor(transaction, amountMajor) {
         course,
         provider,
         shares: tutorShares,
-        percent,
+        rateType,
+        value: rateValue,
         rateSource,
       });
     } catch (error) {

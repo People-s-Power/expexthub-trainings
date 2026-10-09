@@ -1712,10 +1712,20 @@ const courseController = {
                 // creditInstructor is idempotent on txRef and uses an atomic $inc, so a
                 // retried renewal cannot credit the instructor twice. The previous
                 // read-modify-write (author.balance += ...) could, and did.
+                //
+                // The synthetic transaction carries the fields the split and the tutor
+                // ledger read, not just the two the credit itself needs. Without
+                // `userId` the accrual read matches nothing, so the per-student cap
+                // never applies and a fixed fee looks unpaid on every renewal; without
+                // `amount` the provider's credit row records a NaN gross. A renewal is
+                // a real payment by the student, so it is shaped like one.
                 try {
                     await creditInstructor(
                         {
                             courseId: course._id,
+                            userId: user._id,
+                            amount: Number(course.fee),
+                            paidAt: renewedAt,
                             txRef: `renewal-${course._id}-${user._id}-${renewedAt.getTime()}`,
                         },
                         Number(course.fee),

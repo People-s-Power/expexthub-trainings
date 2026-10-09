@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const User = require('../models/user');
 const Transaction = require('../models/transactions');
 const Notification = require('../models/notifications');
@@ -35,6 +36,50 @@ const toMajor = (minor) => Number((Number(minor || 0) / MINOR_UNIT).toFixed(2));
 const earningRefFor = (txRef, tutorId) => `tutor-earning-${txRef}-${tutorId}`;
 
 /**
+ * How much this student's tutoring on this course has already earned.
+ *
+ * Two rules read this, and both are about the course's *pool* of tutors rather
+ * than about any one of them:
+ *
+ *  - the fixed fee is paid once per course, so a second payment must not pay it
+ *    again;
+ *  - the provider's optional cap is a true running total per student, so a later
+ *    instalment must see what the earlier ones spent.
+ *
+ * Keyed on (student, course) and summed in one go for exactly that reason: keying
+ * it per tutor would make a provider who set "₦5,000 per student" and assigned
+ * three tutors pay ₦15,000, which is the label-versus-code gap this replaces.
+ *
+ * Reversed rows are excluded, so a reversal genuinely un-does the accrual rather
+ * than leaving the cap consumed by money that was given back.
+ *
+ * Cast to `ObjectId` deliberately. The affiliate's equivalent matches ids that
+ * came off `findById`; this one is handed `transaction.userId`, which is a string.
+ * `aggregate` does not cast, so a string matched against ObjectId-stored rows
+ * returns nothing — the cap would never bite and the fee would be paid repeatedly,
+ * with no error anywhere to say so.
+ */
+async function accruedTutorShareForStudentCourse({ studentId, courseId } = {}) {
+  if (!studentId || !courseId) return { totalMinor: 0 };
+  if (!mongoose.Types.ObjectId.isValid(String(studentId)) || !mongoose.Types.ObjectId.isValid(String(courseId))) {
+    return { totalMinor: 0 };
+  }
+
+  const accrued = await TutorEarning.aggregate([
+    {
+      $match: {
+        studentId: new mongoose.Types.ObjectId(String(studentId)),
+        courseId: new mongoose.Types.ObjectId(String(courseId)),
+        status: { $ne: 'reversed' },
+      },
+    },
+    { $group: { _id: null, total: { $sum: '$amount' } } },
+  ]);
+
+  return { totalMinor: Number(accrued[0]?.total) || 0 };
+}
+
+/**
  * Records the tutor earnings accrued by one settled payment.
  *
  * Called from `creditInstructor` immediately after the provider is credited, from
@@ -62,7 +107,12 @@ async function generateTutorEarningsForPayment(transaction, options = {}) {
   const baseAmountMinor = toMinor(transaction.amount);
   if (!(baseAmountMinor > 0)) return { created: 0, reason: 'non_positive_amount' };
 
-  const { course, provider, percent, rateSource } = options;
+  const { course, provider, rateSource } = options;
+  // The rate the split actually used, snapshotted onto the row. `rateType` decides
+  // how `rateValue` reads — a percentage, or naira for a fixed fee — so the two
+  // have to travel together.
+  const rateType = options.rateType === 'fixed' ? 'fixed' : 'percentage';
+  const rateValue = Number(options.value) || 0;
   // Only the tutor slices are the ledger's business. The provider's own share is
   // a wallet credit, not an earning, and including it here would double-count it.
   const tutorShares = (options.shares || []).filter((share) => share?.role === 'tutor' && share.amount > 0);
@@ -102,8 +152,8 @@ async function generateTutorEarningsForPayment(transaction, options = {}) {
         installmentNumber: transaction.installmentNumber || undefined,
         sourceTransaction: transaction.txRef,
         baseAmount: baseAmountMinor,
-        rateType: 'percentage',
-        rateValue: Number(percent) || 0,
+        rateType,
+        rateValue,
         amount: toMinor(share.amount),
         status: 'pending',
         holdUntil,
@@ -396,6 +446,7 @@ async function reverseEarning(earningRef, { reason, actor } = {}) {
 
 module.exports = {
   generateTutorEarningsForPayment,
+  accruedTutorShareForStudentCourse,
   releaseMaturedEarnings,
   reverseEarning,
   applyWithdrawalToEarnings,

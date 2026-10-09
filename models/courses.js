@@ -74,17 +74,23 @@ const courseSchema = new mongoose.Schema({
     // order — see services/tutorShareService.js — so a provider can pay a
     // different rate on one course without moving their baseline everywhere.
     //
-    // Percentage-only, unlike `affiliateCommission` above: the tutor share is
-    // always a proportion of the provider's net, and a fixed amount would have to
-    // be divided across however many tutors the course happens to have.
+    // The same three-field shape as `affiliateCommission` above, including `type`:
+    // a course can pay its tutors a percentage of what the student pays or one flat
+    // fee for the course. A fixed fee is the course's whole tutor pool, divided
+    // evenly between whoever is assigned — see splitCourseEarnings in
+    // services/coursePaymentService.js.
     //
     // `enabled: false` is a deliberate opt-out for this course while the
-    // provider's programme stays on. Both fields default to null, which means
+    // provider's programme stays on. All three fields default to null, which means
     // "inherit the general rate" — so a course untouched by this setting behaves
     // exactly as it did before the setting existed.
+    //
+    // `value` carries no `max`: a percentage is bounded by MAX_SHARE_PERCENT at
+    // resolution time, and a fixed fee is not a proportion of anything.
     tutorShare: {
         enabled: { type: Boolean, default: null },
-        value: { type: Number, min: 0, max: 100, default: null },
+        type: { type: String, enum: ['percentage', 'fixed', null], default: null },
+        value: { type: Number, min: 0, default: null },
     },
     target: Number,
     assignedTutors: [{

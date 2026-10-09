@@ -223,10 +223,27 @@ const userSchema = new mongoose.Schema({
     // still gated on this switch: it is a provider's programme, and a course
     // entry left behind after the programme was turned off must not keep paying.
     enabled: { type: Boolean, default: false },
-    // A percentage of the provider's own net (after the platform fee), which is
-    // what they actually receive — not of the gross the student paid. A share of
-    // the gross would take the platform fee out of the provider's side twice.
-    percentage: { type: Number, min: 0, max: 100, default: 0 },
+    // How the tutors are paid: a proportion of each payment, or one flat fee for
+    // the course. The affiliate programme offers the same two (`defaultCommissionType`)
+    // and this mirrors it deliberately, so a provider reading either settings
+    // screen is choosing between the same two things.
+    type: { type: String, enum: ['percentage', 'fixed'], default: 'percentage' },
+    // A percentage of what the *student pays*, or a flat fee in naira when `type`
+    // is `fixed`. Named `value` rather than `percentage` because under a fixed
+    // rate this field holds money, not a proportion — and because it matches
+    // `Course.tutorShare.value`, so the two tiers of the resolution read alike.
+    //
+    // The share comes off the gross, exactly as affiliate commission does. The
+    // provider's own cut is the net minus this share, so a percentage here costs
+    // the provider more than the same percentage of their net would; the platform
+    // fee is unaffected either way.
+    value: { type: Number, min: 0, default: 0 },
+    // Optional ceiling in naira on what the tutors earn from one student on one
+    // course. 0 means "no cap". Unlike the affiliate's `maxCommissionCap`, which
+    // caps each instalment's row, this is a true running total: the lifetime sum
+    // for that student on that course never exceeds it, so later instalments pay
+    // less and then nothing once it is reached.
+    maxShareCap: { type: Number, min: 0, default: 0 },
     // Holding period before a tutor's earning becomes withdrawable, mirroring
     // `affiliateSettings.holdDays`. Null falls back to the platform default, so an
     // unset provider still behaves predictably rather than paying out instantly.

@@ -60,8 +60,10 @@ const ROWS = [
     _providerKey: OTHER_PROVIDER,
     baseAmount: 500000,
     amount: 95000,
-    rateType: 'percentage',
-    rateValue: 20,
+    // A flat fee rather than a proportion, so `rateValue` is naira here. The type
+    // decides how the value reads, and both have to reach the screen intact.
+    rateType: 'fixed',
+    rateValue: 3000,
     rateSource: 'course_override',
     status: 'pending',
     holdUntil: new Date('2026-02-01'),
@@ -266,6 +268,20 @@ async function main() {
     (providerList.body.records || []).every((row) => row.provider === undefined),
     'the provider payload was told about a provider it already knows',
   );
+
+  // A rate is written as a `{ rateType, rateValue }` pair, and the type is what
+  // says whether the value is a percentage or naira. The schema has to accept both
+  // members, and the row has to carry its own through untouched — a fixed fee
+  // shown as "3,000%" is worse than showing nothing.
+  eq(
+    'the ledger accepts a fixed rate as well as a percentage',
+    TutorEarning.schema.path('rateType').enumValues.join(','),
+    'percentage,fixed',
+  );
+  const fixedRow = (adminList.body.records || [])
+    .find((row) => row.ref === 'tutor-earning-txn-2-' + TUTOR_TWO);
+  eq('and a fixed earning carries its type through to the screen', fixedRow?.rateType, 'fixed');
+  eq('with its naira value, not a percentage', fixedRow?.rateValue, 3000);
 
   console.log('');
   console.log('--- the summary is scoped the same way ---\n');
