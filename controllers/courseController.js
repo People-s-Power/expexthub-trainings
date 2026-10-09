@@ -145,6 +145,37 @@ function canPerformCourseAction(course, caller, privilege) {
     return hasTeamPrivilege(caller, course.instructorId, privilege);
 }
 
+/**
+ * Whether the end date a request carries falls before its own start date.
+ *
+ * A course stored that way runs on no days at all. The calendar walks
+ * `startDate → endDate` a day at a time, so its loop never executes, and
+ * utils/sessionOccurrences.js — which every reminder is built from — asks the
+ * same range the same question and finds no sessions. Neither raises an error,
+ * and the course keeps its place on the dashboard, so the only symptom is a
+ * course that is scheduled everywhere except the two places that act on it.
+ *
+ * The form now refuses this (see `endsBeforeStart` in modals/AddCourse.tsx), and
+ * this is the same refusal on the side that cannot be bypassed: the API is
+ * reachable by a deployed client that predates the form's check, and by any
+ * other caller. Rows already stored this way are repaired by
+ * scripts/fixInvertedCourseEndDates.js rather than by relaxing this.
+ *
+ * Compared by calendar day, because both values are wall-clock strings — a
+ * same-day online course running 10:00 to 13:00 is valid. A request that omits
+ * either date is left alone: an edit that only changes a title must not be
+ * rejected for dates it did not mention.
+ */
+function endsBeforeStart(startDate, endDate) {
+    const start = dayjs(startDate);
+    const end = dayjs(endDate);
+    if (!start.isValid() || !end.isValid()) return false;
+    return end.startOf('day').isBefore(start.startOf('day'));
+}
+
+const END_BEFORE_START_MESSAGE =
+    'The end date cannot be before the start date. A course with no days cannot be scheduled or reminded.';
+
 /** Tells the student they were added. Never fails the enrollment it reports. */
 async function notifyEnrolledStudent(student, course, headline = 'You have been enrolled in a course') {
     try {
@@ -348,6 +379,12 @@ const courseController = {
 
         // Get user ID from the request headers
         const userId = req.params.userId;
+
+        // Refused before anything is uploaded or written — the same check the
+        // course form makes, made again where it cannot be skipped.
+        if (endsBeforeStart(startDate, endDate)) {
+            return res.status(400).json({ message: END_BEFORE_START_MESSAGE });
+        }
 
         // The course is created in the account the request is working in, and
         // nowhere else. The id arrives in the path, so without this any tutor
@@ -1467,6 +1504,14 @@ const courseController = {
             const caller = await User.findById(scopeIdOf(req));
             if (!canPerformCourseAction(course, caller, 'Edit Course')) {
                 return res.status(403).json({ message: 'You can only edit courses you own or manage' });
+            }
+
+            // The body is applied wholesale below, so a reversed pair of dates
+            // would overwrite a working course with one that has no sessions.
+            // Skipped when the request does not carry both dates, which is how a
+            // partial edit that only renames a course stays editable.
+            if (endsBeforeStart(req.body.startDate, req.body.endDate)) {
+                return res.status(400).json({ message: END_BEFORE_START_MESSAGE });
             }
 
             let videos = req.body.videos.map(video => {
