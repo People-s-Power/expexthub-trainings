@@ -13,7 +13,7 @@ const { default: axios } = require("axios");
 const crypto = require("crypto");
 const { hasPaidPlan, planCatalogue, planNameForId } = require("../utils/plans.js");
 const { DEACTIVATED_STATUSES } = require("../utils/affiliateStatus.js");
-const { LEARNER_ROLES, isLearnerRole } = require("../utils/roles.js");
+const { LEARNER_ROLES, TUTOR_PERSONAS, isLearnerRole } = require("../utils/roles.js");
 const { scopeIdOf } = require("../utils/actingOwner.js");
 const { ownedCourseFilter, authoredCourseFilter, authoredCourseIds, HEX_ID } = require("../utils/courseOwnership.js");
 const { evaluateGraduation } = require("../services/graduationService.js");
@@ -307,11 +307,19 @@ const userControllers = {
 
   getInstructors: async (req, res) => {
     try {
-      // Find all users with the role 'instructor'
-      const instructors = await User.find({ role: 'tutor' });
+      // Both tutor spellings — see TUTOR_PERSONAS. A tutor who registers through
+      // the sign-up form is stored as `provider`, so filtering on the literal
+      // 'tutor' returned everyone *except* the account the provider had just
+      // created: the assign-a-tutor picker offered no one to choose, and the
+      // admin's tutor count and admissions list silently undercounted.
+      const instructors = await User.find({ role: { $in: TUTOR_PERSONAS } });
 
+      // An empty list is a real answer, not a failure. This used to answer 404,
+      // which no caller can render: every consumer reads `data.instructors` and
+      // has no error branch, so a provider with no tutors yet got a rejected
+      // promise and an empty picker with nothing said about why.
       if (!instructors || instructors.length === 0) {
-        return res.status(404).json({ message: 'No instructors found' });
+        return res.status(200).json({ message: 'No instructors found', instructors: [] });
       }
 
       // Extract relevant instructor information
@@ -925,11 +933,19 @@ const userControllers = {
   },
   getMyInstructors: async (req, res) => {
     try {
-      // Find all users with the role 'instructor'
-      const instructors = await User.find({ role: 'tutor', assignedCourse: req.body.course });
+      // Both tutor spellings — see TUTOR_PERSONAS, and the same bug as
+      // `getInstructors`: a form-registered tutor is stored as `provider`, so
+      // filtering on the literal 'tutor' hid them from the learner's own tutor
+      // list. The `assignedCourse` half is deliberate and stays: this is "tutors
+      // who teach the course you are enrolled on", not every tutor on the
+      // platform — a tutor declares theirs under course interests.
+      const instructors = await User.find({ role: { $in: TUTOR_PERSONAS }, assignedCourse: req.body.course });
 
+      // An empty list is a real answer. See `getInstructors` — the callers have
+      // no error branch, so a 404 here surfaced as an empty list anyway, minus
+      // any way to tell "no tutors yet" from "the request failed".
       if (!instructors || instructors.length === 0) {
-        return res.status(404).json({ message: 'No instructors found' });
+        return res.status(200).json({ message: 'No instructors found', instructors: [] });
       }
 
       // Extract relevant instructor information

@@ -1315,41 +1315,63 @@ const courseController = {
         try {
 
             const course = await Course.findById(courseId);
-            const user = await User.findById(id);
 
-            console.log(user);
             if (!course) {
                 return res.status(404).json({ message: 'Course not found' });
             }
+
+            const user = await User.findById(id);
+            if (!user) {
+                return res.status(404).json({ message: 'Tutor not found' });
+            }
+
+            // `assignedTutors` holds ObjectIds while `id` arrives in the body as a
+            // string, so `assignedTutors.includes(id)` never matched a single
+            // element. The consequence was the opposite of a no-op: the remove
+            // control fell through to the assign branch and pushed a *second*
+            // copy of the tutor instead of taking the first away, so a tutor
+            // could never be unassigned and re-assigning the same person stacked
+            // duplicates. Compared as strings, which also reads a course whose
+            // assignment was stored in the other spelling.
+            const assignedId = String(id);
+            const alreadyAssigned = (course.assignedTutors || [])
+                .some((tutorId) => String(tutorId) === assignedId);
 
             // `assignedTutors` is one of the two things `canManageCourse` reads,
             // so this endpoint hands out course management. Both ids come from
             // outside the caller — the course from the path, the tutor from the
             // body — so being able to reach the route must not be enough.
+            //
+            // Checked before the toggle, and so before the removal as well as the
+            // addition. It used to sit inside the assign branch, which was safe
+            // only while the removal branch was unreachable.
             const caller = await User.findById(scopeIdOf(req));
             if (!canPerformCourseAction(course, caller, 'Assign course to a Tutor')) {
                 return res.status(403).json({ message: 'You can only assign tutors to courses you own or manage' });
             }
-            console.log(course);
-            // Check if the student is already enrolled
-            if (course.assignedTutors.includes(id)) {
-                await Course.updateOne(
-                    { _id: course._id },
-                    { $pull: { assignedTutors: id } }
-                );
-                return res.status(200).json({ message: 'Tutor is Unassigned to this course' });
-            } else {
-                course.assignedTutors.push(id);
-                course.contact = false
-                await course.save();
 
-                await Notification.create({
-                    title: "Tutor Assigned",
-                    content: `${user.fullname} was assigned to your Course ${course.title}`,
-                    contentId: course._id,
-                    userId: course.instructorId,
-                });
+            if (alreadyAssigned) {
+                // Rewritten in JS rather than with a `$pull`, for the same reason
+                // the check is a string compare: Mongoose casts a `$pull` value
+                // against this ObjectId array, so it can only ever remove the
+                // ObjectId spelling. Rewriting drops whichever spelling is
+                // stored, and saving casts the survivors back to ObjectId.
+                course.assignedTutors = (course.assignedTutors || [])
+                    .filter((tutorId) => String(tutorId) !== assignedId);
+                await course.save();
+                return res.status(200).json({ message: 'Tutor is Unassigned to this course' });
             }
+
+            course.assignedTutors.push(id);
+            course.contact = false
+            await course.save();
+
+            await Notification.create({
+                title: "Tutor Assigned",
+                content: `${user.fullname} was assigned to your Course ${course.title}`,
+                contentId: course._id,
+                userId: course.instructorId,
+            });
 
             return res.status(200).json({ message: 'Assigned successfully' });
 

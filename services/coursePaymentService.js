@@ -689,6 +689,47 @@ async function creditShare(transaction, share, platformFee) {
 }
 
 /**
+ * Why a course payment paid its tutors nothing, in words.
+ *
+ * `splitCourseEarnings` collapses every reason to one answer — the provider
+ * keeps the whole net — which is the right answer for the money and a useless
+ * one for a diagnosis. A provider who has configured a share and watched it not
+ * happen has no way to tell a switched-off programme from an unassigned tutor
+ * from a flat fee already paid, because all three leave the same trace: none.
+ * This names the branch that was taken, so the log line answers the question
+ * rather than restating it.
+ *
+ * Pure and database-free, like the split itself — the caller has already loaded
+ * everything this reads.
+ */
+function explainNoTutorShare({ assignedTutors = [], rateType = null, rateValue = 0, accruedMinor = 0, legacyRate = null }) {
+  const tutorIds = [...new Set((assignedTutors || []).filter(Boolean).map(String))];
+  if (!(Number(rateValue) > 0)) {
+    // The one cause a provider cannot see from the settings screen. This
+    // programme used to store its rate as `tutorRevenueShare.percentage`, and
+    // `services/tutorShareService.js` reads only `.value` — deliberately, with no
+    // read-through shim, so an account that predates the rename resolves to 0.
+    // The read endpoint reports `value: 0` for exactly that account, so the Share
+    // card renders as a rate that was never set and nothing anywhere says
+    // otherwise. Named here because the alternative is a provider re-entering a
+    // rate that is already on their record in the other spelling.
+    if (legacyRate !== null && legacyRate !== undefined) {
+      return 'the rate is stored as tutorRevenueShare.percentage, which is no longer read — '
+        + 'run scripts/migrateTutorShareValue.js';
+    }
+    return "no rate resolved: the provider's tutor revenue share is off, is set to 0, "
+      + 'or this course carries an opt-out';
+  }
+  if (!tutorIds.length) {
+    return 'no tutor is assigned to this course — assign one, then take another payment';
+  }
+  if (rateType === 'fixed' && accruedMinor > 0) {
+    return 'the flat fee for this course was already paid for this student';
+  }
+  return 'a rate resolved and tutors are assigned, but the share came to nothing on this payment';
+}
+
+/**
  * Credits everyone who earned on this payment, exactly once per source payment.
  *
  * The provider receives their net minus the tutors' share, credited straight to
@@ -745,6 +786,25 @@ async function creditInstructor(transaction, amountMajor) {
   // paid here — it is recorded and released by the holding-period sweep.
   const providerShares = shares.filter((share) => share.role === 'provider');
   const tutorShares = shares.filter((share) => share.role === 'tutor');
+
+  // See `explainNoTutorShare`. A configured share that reaches nobody is the one
+  // outcome of this programme that is otherwise completely silent: the provider
+  // is credited their entire net, no ledger row says otherwise, and the provider
+  // is left to guess which of four causes it was. Logged rather than thrown — a
+  // settled payment must not be turned into an error here.
+  if (!tutorShares.length) {
+    console.warn(
+      '[tutor-share] this payment paid no tutor:',
+      explainNoTutorShare({
+        assignedTutors: course.assignedTutors,
+        rateType,
+        rateValue,
+        accruedMinor,
+        legacyRate: revenueShare.percentage,
+      }),
+      { txRef: transaction.txRef, course: String(course._id), amountMajor },
+    );
+  }
 
   let creditedAny = false;
   for (const share of providerShares) {
@@ -1073,6 +1133,10 @@ module.exports = {
   grantCourseAccess,
   creditInstructor,
   splitCourseEarnings,
+  // Exported so scripts/tutorAssignment.check.js can hold each reason to the
+  // branch that produces it, the same way splitCourseEarnings is held to its
+  // arithmetic.
+  explainNoTutorShare,
   finalizeFullCoursePayment,
   finalizeInstallmentPayment,
   hasActiveCourseAccess,

@@ -17,6 +17,21 @@ const TUTOR_ROLES = ['tutor', 'provider', 'admin', 'team_member'];
 // Tutor family without team members, for owner/admin-only actions.
 const TUTOR_ONLY = ['tutor', 'provider', 'admin'];
 
+// The two spellings a *tutor account* can carry — "who is a tutor", as opposed
+// to TUTOR_ROLES above, which is "who may reach a tutor's routes".
+//
+// The distinction matters in a picker: `admin` is a platform operator who must
+// be able to reach tutor routes but is not someone a provider assigns to a
+// course, and `team_member` is a delegate working inside one provider's account
+// rather than an independent tutor on the platform. Both belong in the route
+// family and neither belongs in a list of assignable tutors.
+//
+// Filtering an assignment picker on the literal 'tutor' alone is the same trap
+// described above, one turn further out: the tutor a provider just signed up
+// through the form is stored as `provider`, so the picker offers everyone except
+// the person they are trying to add. Use this for any query about who is a tutor.
+const TUTOR_PERSONAS = ['tutor', 'provider'];
+
 // Everyone who is here to learn. `client` is the same product persona as
 // `student`, for the same reason `provider` is the same persona as `tutor`
 // above: the public sign-up form sends userType "client" for a student
@@ -34,4 +49,4 @@ const LEARNER_ROLES = ['student', 'client'];
 /** True when the role belongs to a learner, in either of its two spellings. */
 const isLearnerRole = (role) => LEARNER_ROLES.includes(role);
 
-module.exports = { TUTOR_ROLES, TUTOR_ONLY, LEARNER_ROLES, isLearnerRole };
+module.exports = { TUTOR_ROLES, TUTOR_ONLY, TUTOR_PERSONAS, LEARNER_ROLES, isLearnerRole };
